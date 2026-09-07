@@ -1,0 +1,36 @@
+name: Mercari Alert Check
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Mercari check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python check_mercari.py
+
+      - name: Save seen items back to repo
+        run: |
+          git config user.name "mercari-alert-bot"
+          git config user.email "actions@github.com"
+          git add seen_items.json
+          git diff --staged --quiet || git commit -m "update seen items"
+          git push
