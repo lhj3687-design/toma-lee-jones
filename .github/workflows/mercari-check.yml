@@ -2,7 +2,7 @@ name: Mercari Alert Check
 
 on:
   schedule:
-    - cron: "*/3 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 permissions:
