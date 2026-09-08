@@ -5,6 +5,10 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
+concurrency:
+  group: mercari-alert-group
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -33,4 +37,5 @@ jobs:
           git config user.email "actions@github.com"
           git add seen_items.json
           git diff --staged --quiet || git commit -m "update seen items"
-          git push
+          git pull --rebase origin main
+          git push origin main
