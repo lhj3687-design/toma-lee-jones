@@ -81,14 +81,24 @@ async def send_telegram(caption: str, photo_url) -> None:
             print(f"[텔레그램 전송 에러] {e}", file=sys.stderr)
 
 
+_DEBUG_PRINTED = False
+
+
 async def check_keyword(m: Mercapi, keyword: str, seen: set, new_items: list) -> None:
+    global _DEBUG_PRINTED
     try:
         results = await m.search(keyword)
     except Exception as e:
         print(f"[검색 실패: {keyword}] {e}", file=sys.stderr)
         return
 
+    print(f"[{keyword}] 검색 결과 {len(results.items)}개 (전체 {results.meta.num_found}개 중)")
+
     for item in results.items[:MAX_ITEMS_PER_KEYWORD]:
+        if not _DEBUG_PRINTED:
+            print("[디버그] 상품 원본 필드:", json.dumps(asdict(item), default=str, ensure_ascii=False)[:1500])
+            _DEBUG_PRINTED = True
+
         item_id = extract_field(item, ["id", "item_id", "itemId"])
         if not item_id or item_id in seen:
             continue
