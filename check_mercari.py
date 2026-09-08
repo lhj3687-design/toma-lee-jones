@@ -19,7 +19,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SEEN_FILE = Path("seen_items.json")
-MAX_ITEMS_PER_KEYWORD = 40  # 키워드당 확인할 최근 매물 개수
+MAX_ITEMS_PER_KEYWORD = 120  # 키워드당 확인할 최근 매물 개수 (한 번에 불러오는 개수와 동일)
 
 # 검색 키워드 목록. 영문/일본어를 함께 넣으면 놓치는 매물이 줄어듭니다.
 # 필요하면 이 리스트에 자유롭게 추가/삭제하세요.
@@ -81,25 +81,16 @@ async def send_telegram(caption: str, photo_url) -> None:
             print(f"[텔레그램 전송 에러] {e}", file=sys.stderr)
 
 
-_DEBUG_PRINTED = False
-
-
 async def check_keyword(m: Mercapi, keyword: str, seen: set, new_items: list) -> None:
-    global _DEBUG_PRINTED
     try:
         results = await m.search(keyword)
     except Exception as e:
         print(f"[검색 실패: {keyword}] {e}", file=sys.stderr)
         return
 
-    print(f"[{keyword}] 검색 결과 {len(results.items)}개 (전체 {results.meta.num_found}개 중)")
-
+    new_count = 0
     for item in results.items[:MAX_ITEMS_PER_KEYWORD]:
-        if not _DEBUG_PRINTED:
-            print("[디버그] 상품 원본 필드:", json.dumps(asdict(item), default=str, ensure_ascii=False)[:1500])
-            _DEBUG_PRINTED = True
-
-        item_id = extract_field(item, ["id", "item_id", "itemId"])
+        item_id = extract_field(item, ["id_", "id", "item_id", "itemId"])
         if not item_id or item_id in seen:
             continue
         seen.add(item_id)
@@ -118,6 +109,9 @@ async def check_keyword(m: Mercapi, keyword: str, seen: set, new_items: list) ->
 
         caption = f"[{keyword}] {name}\n💴 {price_txt}\n🔗 {item_url}"
         new_items.append((caption, photo))
+        new_count += 1
+
+    print(f"[{keyword}] 검색 {len(results.items)}개 확인 (신규 {new_count}개)")
 
 
 async def main() -> None:
