@@ -21,20 +21,22 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SEEN_FILE = Path("seen_items.json")
 MAX_ITEMS_PER_KEYWORD = 120  # 키워드당 확인할 최근 매물 개수 (한 번에 불러오는 개수와 동일)
 
-# 검색 키워드 목록. 영문/일본어를 함께 넣으면 놓치는 매물이 줄어듭니다.
-# 필요하면 이 리스트에 자유롭게 추가/삭제하세요.
-KEYWORDS = [
-    "Carol Christian Poell",
-    "Martin Margiela",
-    "マルタンマルジェラ",
-    "Hermes Margiela",
-    "Hermes",
-    "エルメス",
-    "Chrome Hearts",
-    "クロムハーツ",
-    "Richard Avedon",
-    "The Row",
-    "ザ・ロウ",
+# 검색 설정: 키워드마다 필요하면 카테고리를 지정합니다.
+# categories가 빈 리스트면 카테고리 제한 없이 전체에서 검색합니다.
+# 카테고리 ID: 멘즈=2, 멘즈>탑스=30, 레이디스>탑스=11,
+#              레이디스>재킷·아우터=12, 레이디스>팬츠=13, 패션 전체=3088
+SEARCHES = [
+    {"query": "Carol Christian Poell", "categories": []},
+    {"query": "Martin Margiela", "categories": [30]},
+    {"query": "マルタンマルジェラ", "categories": [30]},
+    {"query": "Hermes Margiela", "categories": []},
+    {"query": "Hermes", "categories": [30, 11, 12, 13]},
+    {"query": "エルメス", "categories": [30, 11, 12, 13]},
+    {"query": "Chrome Hearts", "categories": [30, 11]},
+    {"query": "クロムハーツ", "categories": [30, 11]},
+    {"query": "Richard Avedon", "categories": [3088]},
+    {"query": "The Row", "categories": [2]},
+    {"query": "ザ・ロウ", "categories": [2]},
 ]
 
 
@@ -81,9 +83,9 @@ async def send_telegram(caption: str, photo_url) -> None:
             print(f"[텔레그램 전송 에러] {e}", file=sys.stderr)
 
 
-async def check_keyword(m: Mercapi, keyword: str, seen: set, new_items: list) -> None:
+async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: set, new_items: list) -> None:
     try:
-        results = await m.search(keyword)
+        results = await m.search(keyword, categories=categories)
     except Exception as e:
         print(f"[검색 실패: {keyword}] {e}", file=sys.stderr)
         return
@@ -120,8 +122,8 @@ async def main() -> None:
     is_first_run = len(seen) == 0
     new_items: list = []
 
-    for kw in KEYWORDS:
-        await check_keyword(m, kw, seen, new_items)
+    for kw in SEARCHES:
+        await check_keyword(m, kw["query"], kw["categories"], seen, new_items)
         await asyncio.sleep(1)  # 메루카리 서버에 부담 주지 않도록 살짝 간격
 
     if is_first_run:
