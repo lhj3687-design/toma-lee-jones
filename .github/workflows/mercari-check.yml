@@ -35,6 +35,29 @@ jobs:
         run: |
           git config user.name "mercari-alert-bot"
           git config user.email "actions@github.com"
-          git add seen_items.json
-          git diff --staged --quiet || git commit -m "update seen items"
-          git push
+
+          for i in 1 2 3 4 5; do
+            git add seen_items.json
+            if git diff --staged --quiet; then
+              echo "변경 없음"
+              exit 0
+            fi
+            git commit -m "update seen items"
+
+            if git push; then
+              echo "저장 완료"
+              exit 0
+            fi
+
+            echo "[재시도 $i] 다른 실행과 충돌 -> 원격 최신본과 병합 후 재시도"
+            cp seen_items.json /tmp/mine.json
+            git fetch origin main
+            git show origin/main:seen_items.json > /tmp/theirs.json 2>/dev/null || echo '{}' > /tmp/theirs.json
+            python3 merge_seen.py
+
+            git reset --hard origin/main
+            cp /tmp/merged.json seen_items.json
+          done
+
+          echo "여러 번 재시도했지만 저장 실패"
+          exit 1
