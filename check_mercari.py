@@ -29,6 +29,8 @@ SEARCHES = [
     {"query": "Carol Christian Poell", "categories": []},
     {"query": "Martin Margiela", "categories": [30]},
     {"query": "マルタンマルジェラ", "categories": [30]},
+    {"query": "Margiela", "categories": [2, 1]},
+    {"query": "マルジェラ", "categories": [2, 1]},
     {"query": "Hermes Margiela", "categories": []},
     {"query": "Hermes", "categories": [30, 11, 12, 13]},
     {"query": "エルメス", "categories": [30, 11, 12, 13]},
@@ -165,7 +167,13 @@ async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, 
         photo = extract_field(item, ["thumbnails", "photos", "thumbnail", "image_url"])
         if isinstance(photo, (list, tuple)):
             photo = photo[0] if photo else None
-        item_url = f"https://jp.mercari.com/item/{item_id}"
+
+        # Mercari Shops(입점 상점) 상품은 /item/이 아니라 /shops/product/ 주소를 써야 함
+        item_type = str(extract_field(item, ["item_type"], "")).upper()
+        if "SHOP" in item_type:
+            item_url = f"https://jp.mercari.com/shops/product/{item_id}"
+        else:
+            item_url = f"https://jp.mercari.com/item/{item_id}"
         price_txt = f"¥{price:,}" if isinstance(price, int) else "가격 확인 필요"
 
         if item_id not in seen:
