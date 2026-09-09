@@ -1,9 +1,15 @@
 """
 메루카리(mercari.jp) 키워드 알림 봇
-지정한 키워드로 새 매물이 올라오면 텔레그램으로 알림을 보냅니다.
-GitHub Actions에서 주기적으로 이 스크립트를 실행하도록 설정되어 있습니다.
+
+GitHub Actions는 아래 순서로 이 파일을 두 번 실행합니다.
+1. collect: 새 매물/가격 인하를 찾아 상태와 대기열을 먼저 저장합니다.
+2. send: 이미 원격 저장소에 저장된 대기열만 텔레그램으로 전송합니다.
+
+이 순서 덕분에 텔레그램 전송이 오래 걸리거나 실행이 중간에 겹쳐도,
+같은 매물이나 같은 가격 인하가 다시 새 알림으로 등록되는 일을 막습니다.
 """
 
+import argparse
 import asyncio
 import json
 import os
@@ -15,11 +21,11 @@ from pathlib import Path
 import httpx
 from mercapi import Mercapi
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-
 SEEN_FILE = Path("seen_items.json")
-MAX_ITEMS_PER_KEYWORD = 120  # 키워드당 확인할 최근 매물 개수 (한 번에 불러오는 개수와 동일)
+MAX_ITEMS_PER_KEYWORD = 120  # 키워드당 확인할 최근 매물 개수
+MAX_SEEN_ITEMS = 5000
+MAX_PENDING_ALERTS = 500
+MAX_SENT_ALERTS = 5000
 
 # 검색 설정: 키워드마다 필요하면 카테고리를 지정합니다.
 # categories가 빈 리스트면 카테고리 제한 없이 전체에서 검색합니다.
@@ -42,34 +48,88 @@ SEARCHES = [
 ]
 
 
-def load_state():
-    """seen({매물ID: 마지막으로 확인한 가격})과 pending(전송 대기 중인 알림)을 불러옵니다."""
-    if SEEN_FILE.exists():
-        try:
-            data = json.loads(SEEN_FILE.read_text())
-            if isinstance(data, list):
-                return {i: None for i in data}, []  # 구버전(ID 리스트만) 호환
-            raw_seen = data.get("seen", [])
-            if isinstance(raw_seen, list):
-                seen = {i: None for i in raw_seen}  # 가격 추적 도입 전 버전 호환
-            else:
-                seen = raw_seen
-            return seen, data.get("pending", [])
-        except Exception:
-            return {}, []
-    return {}, []
+def load_state() -> tuple[dict, list, list]:
+    """seen, pending, sent_alerts를 불러오며 이전 상태 파일도 호환합니다."""
+    if not SEEN_FILE.exists():
+        return {}, [], []
+
+    try:
+        data = json.loads(SEEN_FILE.read_text())
+    except Exception as exc:
+        print(f"[상태 파일 읽기 실패] {exc}", file=sys.stderr)
+        return {}, [], []
+
+    if isinstance(data, list):
+        return {item_id: None for item_id in data}, [], []
+
+    raw_seen = data.get("seen", [])
+    seen = {item_id: None for item_id in raw_seen} if isinstance(raw_seen, list) else raw_seen
+    pending = data.get("pending", [])
+    sent_alerts = data.get("sent_alerts", [])
+
+    return (
+        seen if isinstance(seen, dict) else {},
+        pending if isinstance(pending, list) else [],
+        sent_alerts if isinstance(sent_alerts, list) else [],
+    )
 
 
-def save_state(seen: dict, pending: list) -> None:
+def alert_key(entry: dict) -> str:
+    """새 형식과 기존 대기열 형식 모두에 쓸 수 있는 알림 고유 키를 반환합니다."""
+    value = entry.get("alert_id")
+    if value:
+        return str(value)
+    return f"legacy:{entry.get('caption', '')}"
+
+
+def unique_recent(values: list[str], limit: int) -> list[str]:
+    """순서를 유지하며 중복을 제거한 최근 항목만 남깁니다."""
+    result = []
+    seen_values = set()
+    for value in values:
+        value = str(value)
+        if value and value not in seen_values:
+            result.append(value)
+            seen_values.add(value)
+    return result[-limit:]
+
+
+def deduplicate_pending(pending: list, sent_alerts: list) -> list:
+    """이미 전송됐거나 대기열에 있는 같은 알림을 한 건으로 정리합니다."""
+    sent_keys = set(sent_alerts)
+    pending_keys = set()
+    result = []
+
+    for entry in pending:
+        if not isinstance(entry, dict):
+            continue
+        key = alert_key(entry)
+        if key in sent_keys or key in pending_keys:
+            continue
+        normalized = dict(entry)
+        normalized.setdefault("alert_id", key)
+        result.append(normalized)
+        pending_keys.add(key)
+
+    return result[-MAX_PENDING_ALERTS:]
+
+
+def save_state(seen: dict, pending: list, sent_alerts: list) -> None:
+    """상태 파일을 원자적으로 교체해 실행 중간의 손상을 피합니다."""
+    sent_alerts = unique_recent(sent_alerts, MAX_SENT_ALERTS)
+    pending = deduplicate_pending(pending, sent_alerts)
     data = {
-        "seen": dict(list(seen.items())[-5000:]),  # 무한정 커지지 않도록 최근 5000개만 유지
-        "pending": pending[-500:],  # 대기열도 상한선을 둠
+        "seen": dict(list(seen.items())[-MAX_SEEN_ITEMS:]),
+        "pending": pending,
+        "sent_alerts": sent_alerts,
     }
-    SEEN_FILE.write_text(json.dumps(data, ensure_ascii=False))
+    temporary_file = SEEN_FILE.with_suffix(".tmp")
+    temporary_file.write_text(json.dumps(data, ensure_ascii=False))
+    temporary_file.replace(SEEN_FILE)
 
 
 def extract_field(item, candidates, default=None):
-    """dataclass 필드명이 라이브러리 버전마다 다를 수 있어, 후보 키를 순서대로 시도합니다."""
+    """dataclass 필드명이 라이브러리 버전마다 다를 수 있어 후보 키를 순서대로 시도합니다."""
     data = asdict(item)
     for key in candidates:
         value = data.get(key)
@@ -79,49 +139,58 @@ def extract_field(item, candidates, default=None):
 
 
 async def send_telegram(caption: str, photo_url):
-    """전송 성공 여부와, 레이트리밋일 경우 텔레그램이 알려준 대기 초를 반환합니다."""
+    """전송 성공 여부와 레이트리밋일 경우 텔레그램이 알려준 대기 초를 반환합니다."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("[텔레그램 설정 누락] TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID", file=sys.stderr)
+        return False, None
+
     async with httpx.AsyncClient(timeout=30) as client:
         try:
             if photo_url:
-                resp = await client.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-                    data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "photo": photo_url},
+                response = await client.post(
+                    f"https://api.telegram.org/bot{token}/sendPhoto",
+                    data={"chat_id": chat_id, "caption": caption, "photo": photo_url},
                 )
             else:
-                resp = await client.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                    data={"chat_id": TELEGRAM_CHAT_ID, "text": caption},
+                response = await client.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    data={"chat_id": chat_id, "text": caption},
                 )
-        except Exception as e:
-            print(f"[텔레그램 전송 에러] {e}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[텔레그램 전송 에러] {exc}", file=sys.stderr)
             return False, None
 
-        if resp.status_code == 200:
-            return True, None
+    if response.status_code == 200:
+        return True, None
 
-        retry_after = None
-        try:
-            retry_after = resp.json().get("parameters", {}).get("retry_after")
-        except Exception:
-            pass
-        print(f"[텔레그램 전송 실패 {resp.status_code}] {resp.text}", file=sys.stderr)
-        return False, retry_after
+    retry_after = None
+    try:
+        retry_after = response.json().get("parameters", {}).get("retry_after")
+    except Exception:
+        pass
+    print(f"[텔레그램 전송 실패 {response.status_code}] {response.text}", file=sys.stderr)
+    return False, retry_after
 
 
-async def flush_pending(pending: list) -> list:
-    """대기열의 알림을 순서대로 전송 시도합니다.
-    - 짧은 레이트리밋(60초 이하)이면 그만큼 기다렸다가 같은 항목을 재시도합니다.
-    - 3번 넘게 실패한 항목은 포기하고 건너뜁니다 (큐가 영구히 막히는 것 방지).
-    - 그 외 실패/긴 레이트리밋이면 이번 실행은 중단하고, 남은 항목은 다음 실행 때 자동 재시도됩니다.
-    """
+async def flush_pending(pending: list, sent_alerts: list) -> tuple[list, list]:
+    """대기열을 전송하고 성공한 알림 키를 sent_alerts에 기록합니다."""
     remaining = list(pending)
     sent = 0
 
     while remaining:
         entry = remaining[0]
-        ok, retry_after = await send_telegram(entry["caption"], entry.get("photo"))
+        key = alert_key(entry)
 
+        # 병합 재시도 중 예전 대기열이 되살아나도 재전송하지 않습니다.
+        if key in sent_alerts:
+            remaining.pop(0)
+            continue
+
+        ok, retry_after = await send_telegram(entry["caption"], entry.get("photo"))
         if ok:
+            sent_alerts.append(key)
             remaining.pop(0)
             sent += 1
             await asyncio.sleep(1.5)
@@ -138,19 +207,19 @@ async def flush_pending(pending: list) -> list:
             remaining.pop(0)
             continue
 
-        # 복구 불가능해 보이는 실패이거나 대기 시간이 김 -> 이번 실행은 중단, 다음 실행에 이어서 시도
+        # 복구 불가능해 보이는 실패이거나 대기 시간이 김 -> 다음 실행에 이어서 시도
         break
 
     if sent:
         print(f"텔레그램 알림 {sent}건 전송 완료")
-    return remaining
+    return remaining, unique_recent(sent_alerts, MAX_SENT_ALERTS)
 
 
 async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, new_items: list) -> None:
     try:
         results = await m.search(keyword, categories=categories)
-    except Exception as e:
-        print(f"[검색 실패: {keyword}] {e}", file=sys.stderr)
+    except Exception as exc:
+        print(f"[검색 실패: {keyword}] {exc}", file=sys.stderr)
         return
 
     new_count = 0
@@ -168,18 +237,21 @@ async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, 
         if isinstance(photo, (list, tuple)):
             photo = photo[0] if photo else None
 
-        # Mercari Shops(입점 상점) 상품은 /item/이 아니라 /shops/product/ 주소를 써야 함
+        # Mercari Shops(입점 상점) 상품은 /item/이 아니라 /shops/product/ 주소를 써야 합니다.
         item_type = str(extract_field(item, ["item_type"], "")).upper()
-        if "SHOP" in item_type:
-            item_url = f"https://jp.mercari.com/shops/product/{item_id}"
-        else:
-            item_url = f"https://jp.mercari.com/item/{item_id}"
+        item_url = (
+            f"https://jp.mercari.com/shops/product/{item_id}"
+            if "SHOP" in item_type
+            else f"https://jp.mercari.com/item/{item_id}"
+        )
         price_txt = f"¥{price:,}" if isinstance(price, int) else "가격 확인 필요"
 
         if item_id not in seen:
             seen[item_id] = price
             caption = f"[{keyword}] {name}\n💴 {price_txt}\n🔗 {item_url}"
-            new_items.append({"caption": caption, "photo": photo})
+            new_items.append(
+                {"alert_id": f"new:{item_id}", "caption": caption, "photo": photo}
+            )
             new_count += 1
             continue
 
@@ -189,36 +261,77 @@ async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, 
                 f"💰[가격 인하] [{keyword}] {name}\n"
                 f"¥{old_price:,} → ¥{price:,}\n🔗 {item_url}"
             )
-            new_items.append({"caption": caption, "photo": photo})
+            new_items.append(
+                {
+                    "alert_id": f"drop:{item_id}:{old_price}:{price}",
+                    "caption": caption,
+                    "photo": photo,
+                }
+            )
             drop_count += 1
-        seen[item_id] = price  # 항상 최신 가격으로 갱신 (인상이든 인하든)
+        seen[item_id] = price  # 인상·인하와 무관하게 최신 가격으로 갱신
 
     print(f"[{keyword}] 검색 {len(results.items)}개 확인 (신규 {new_count}개, 가격인하 {drop_count}개)")
 
 
-async def main() -> None:
-    m = Mercapi()
-    seen, pending = load_state()
+async def collect_updates() -> None:
+    """검색 결과와 알림 대기열을 먼저 로컬 상태 파일에 기록합니다."""
+    mercari = Mercapi()
+    seen, pending, sent_alerts = load_state()
     is_first_run = len(seen) == 0
     new_items: list = []
 
-    for kw in SEARCHES:
-        await check_keyword(m, kw["query"], kw["categories"], seen, new_items)
-        await asyncio.sleep(1)  # 메루카리 서버에 부담 주지 않도록 살짝 간격
+    for search in SEARCHES:
+        await check_keyword(mercari, search["query"], search["categories"], seen, new_items)
+        await asyncio.sleep(1)  # 메루카리 서버에 부담을 주지 않도록 간격 유지
 
     if is_first_run:
-        # 첫 실행에서는 기존 매물 전부가 "새 매물"로 오인되므로, 알림 없이 기준점만 저장
         print(f"첫 실행: 기존 매물 {len(seen)}개를 기준으로 저장했습니다 (알림 생략)")
     else:
-        pending.extend(new_items)
-        print(f"새 매물 {len(new_items)}건 발견 (대기 중 {len(pending)}건)")
+        pending = deduplicate_pending(pending + new_items, sent_alerts)
+        print(f"새 알림 {len(new_items)}건 발견 (저장될 대기열 {len(pending)}건)")
+
+    # 이 저장본은 바로 다음 Actions 단계에서 GitHub에 먼저 반영됩니다.
+    save_state(seen, pending, sent_alerts)
+
+
+async def send_pending() -> None:
+    """GitHub에 먼저 저장된 대기열만 전송하고 결과를 다시 상태 파일에 기록합니다."""
+    seen, pending, sent_alerts = load_state()
+    pending = deduplicate_pending(pending, sent_alerts)
+
+    if not pending:
+        print("전송할 대기 알림이 없습니다")
+        save_state(seen, pending, sent_alerts)
+        return
+
+    try:
+        pending, sent_alerts = await flush_pending(pending, sent_alerts)
+    finally:
+        # 전송 도중 예외가 생겨도 이미 성공한 알림은 다음 실행에 재전송하지 않도록 저장합니다.
+        save_state(seen, pending, sent_alerts)
 
     if pending:
-        pending = await flush_pending(pending)
-        if pending:
-            print(f"[대기열에 {len(pending)}건 남음 -> 다음 실행에 재시도]", file=sys.stderr)
+        print(f"[대기열에 {len(pending)}건 남음 -> 다음 실행에 재시도]", file=sys.stderr)
 
-    save_state(seen, pending)
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Mercari 알림 수집/전송")
+    parser.add_argument(
+        "--mode",
+        choices=("collect", "send"),
+        default="collect",
+        help="collect는 검색 결과를 저장하고, send는 저장된 대기열을 텔레그램으로 전송합니다.",
+    )
+    return parser.parse_args()
+
+
+async def main() -> None:
+    args = parse_args()
+    if args.mode == "collect":
+        await collect_updates()
+    else:
+        await send_pending()
 
 
 if __name__ == "__main__":
