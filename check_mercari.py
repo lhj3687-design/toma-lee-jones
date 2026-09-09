@@ -1,8 +1,7 @@
 """
 메루카리(mercari.jp) 키워드 알림 봇
-- 신규 매물 알림
-- 가격 인하 / 끌어올림 매물 감지 알림
-- GitHub Actions 동시성 제어 및 재시도 로직 포함
+지정한 키워드로 새 매물이 올라오면 텔레그램으로 알림을 보냅니다.
+GitHub Actions에서 주기적으로 이 스크립트를 실행하도록 설정되어 있습니다.
 """
 
 import asyncio
@@ -20,8 +19,12 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SEEN_FILE = Path("seen_items.json")
-MAX_ITEMS_PER_KEYWORD = 120
+MAX_ITEMS_PER_KEYWORD = 120  # 키워드당 확인할 최근 매물 개수 (한 번에 불러오는 개수와 동일)
 
+# 검색 설정: 키워드마다 필요하면 카테고리를 지정합니다.
+# categories가 빈 리스트면 카테고리 제한 없이 전체에서 검색합니다.
+# 카테고리 ID: 멘즈=2, 멘즈>탑스=30, 레이디스>탑스=11,
+#              레이디스>재킷·아우터=12, 레이디스>팬츠=13, 패션 전체=3088
 SEARCHES = [
     {"query": "Carol Christian Poell", "categories": []},
     {"query": "Martin Margiela", "categories": [30]},
@@ -38,33 +41,28 @@ SEARCHES = [
 
 
 def load_state():
-    """seen(아이디:가격 딕셔너리)과 pending(전송 실패 대기열)을 불러옵니다."""
+    """seen(중복 방지용 ID 집합)과 pending(전송 실패해서 대기 중인 알림)을 불러옵니다."""
     if SEEN_FILE.exists():
         try:
             data = json.loads(SEEN_FILE.read_text())
             if isinstance(data, list):
-                # 구버전 리스트 형태 호환 (가격은 0으로 임시 저장)
-                return {item_id: 0 for item_id in data}, []
-            seen = data.get("seen", {})
-            if isinstance(seen, list):
-                seen = {item_id: 0 for item_id in seen}
-            return seen, data.get("pending", [])
+                return set(data), []  # 구버전 파일(리스트만 저장) 호환
+            return set(data.get("seen", [])), data.get("pending", [])
         except Exception:
-            return {}, []
-    return {}, []
+            return set(), []
+    return set(), []
 
 
-def save_state(seen: dict, pending: list) -> None:
-    # 데이터가 너무 커지지 않도록 최근 5000개만 유지
-    items = list(seen.items())[-5000:]
+def save_state(seen: set, pending: list) -> None:
     data = {
-        "seen": dict(items),
-        "pending": pending[-500:],
+        "seen": list(seen)[-5000:],  # 무한정 커지지 않도록 최근 5000개만 유지
+        "pending": pending[-500:],  # 대기열도 상한선을 둠
     }
     SEEN_FILE.write_text(json.dumps(data, ensure_ascii=False))
 
 
 def extract_field(item, candidates, default=None):
+    """dataclass 필드명이 라이브러리 버전마다 다를 수 있어, 후보 키를 순서대로 시도합니다."""
     data = asdict(item)
     for key in candidates:
         value = data.get(key)
@@ -74,6 +72,7 @@ def extract_field(item, candidates, default=None):
 
 
 async def send_telegram(caption: str, photo_url):
+    """전송 성공 여부와, 레이트리밋일 경우 텔레그램이 알려준 대기 초를 반환합니다."""
     async with httpx.AsyncClient(timeout=30) as client:
         try:
             if photo_url:
@@ -103,6 +102,11 @@ async def send_telegram(caption: str, photo_url):
 
 
 async def flush_pending(pending: list) -> list:
+    """대기열의 알림을 순서대로 전송 시도합니다.
+    - 짧은 레이트리밋(60초 이하)이면 그만큼 기다렸다가 같은 항목을 재시도합니다.
+    - 3번 넘게 실패한 항목은 포기하고 건너뜁니다 (큐가 영구히 막히는 것 방지).
+    - 그 외 실패/긴 레이트리밋이면 이번 실행은 중단하고, 남은 항목은 다음 실행 때 자동 재시도됩니다.
+    """
     remaining = list(pending)
     sent = 0
 
@@ -127,6 +131,7 @@ async def flush_pending(pending: list) -> list:
             remaining.pop(0)
             continue
 
+        # 복구 불가능해 보이는 실패이거나 대기 시간이 김 -> 이번 실행은 중단, 다음 실행에 이어서 시도
         break
 
     if sent:
@@ -134,7 +139,7 @@ async def flush_pending(pending: list) -> list:
     return remaining
 
 
-async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, new_items: list) -> None:
+async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: set, new_items: list) -> None:
     try:
         results = await m.search(keyword, categories=categories)
     except Exception as e:
@@ -142,51 +147,29 @@ async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, 
         return
 
     new_count = 0
-    price_drop_count = 0
-
     for item in results.items[:MAX_ITEMS_PER_KEYWORD]:
         item_id = extract_field(item, ["id_", "id", "item_id", "itemId"])
-        if not item_id:
+        if not item_id or item_id in seen:
             continue
-
-        price = getattr(item, "price", None)
-        current_price = int(price) if isinstance(price, (int, float, Decimal)) else 0
+        seen.add(item_id)
 
         name = getattr(item, "name", None) or extract_field(item, ["name", "title"], "(제목 없음)")
+        price = getattr(item, "price", None)
         photo = extract_field(item, ["thumbnails", "photos", "thumbnail", "image_url"])
         if isinstance(photo, (list, tuple)):
             photo = photo[0] if photo else None
+
         item_url = f"https://jp.mercari.com/item/{item_id}"
-
-        # 1. 아예 처음 보는 신규 매물
-        if item_id not in seen:
-            seen[item_id] = current_price
-            price_txt = f"¥{current_price:,}" if current_price else "가격 확인 필요"
-            caption = f"[{keyword}] {name}\n💴 {price_txt}\n🔗 {item_url}"
-            new_items.append({"caption": caption, "photo": photo})
-            new_count += 1
-
-        # 2. 이미 본 매물이지만 가격이 낮아진 경우 (가격 인하 및 끌어올림)
+        if isinstance(price, (int, float, Decimal)):
+            price_txt = f"¥{int(price):,}"
         else:
-            old_price = seen[item_id]
-            
-            # 구버전에서 넘어와 가격이 0으로 저장된 경우, 현재 가격으로 갱신만 수행 (알림 X)
-            if old_price == 0 and current_price > 0:
-                seen[item_id] = current_price
-                
-            # 정상적으로 기록된 이전 가격보다 현재 가격이 낮아진 경우
-            elif old_price > 0 and current_price > 0 and current_price < old_price:
-                seen[item_id] = current_price  # 변동된 신규 가격으로 업데이트
-                caption = (
-                    f"🔻 [가격 인하/끌올] [{keyword}]\n"
-                    f"{name}\n"
-                    f"💴 ¥{old_price:,} ➔ ¥{current_price:,}\n"
-                    f"🔗 {item_url}"
-                )
-                new_items.append({"caption": caption, "photo": photo})
-                price_drop_count += 1
+            price_txt = "가격 확인 필요"
 
-    print(f"[{keyword}] 검색 {len(results.items)}개 확인 (신규 {new_count}개, 인하 {price_drop_count}개)")
+        caption = f"[{keyword}] {name}\n💴 {price_txt}\n🔗 {item_url}"
+        new_items.append({"caption": caption, "photo": photo})
+        new_count += 1
+
+    print(f"[{keyword}] 검색 {len(results.items)}개 확인 (신규 {new_count}개)")
 
 
 async def main() -> None:
@@ -197,13 +180,14 @@ async def main() -> None:
 
     for kw in SEARCHES:
         await check_keyword(m, kw["query"], kw["categories"], seen, new_items)
-        await asyncio.sleep(1)
+        await asyncio.sleep(1)  # 메루카리 서버에 부담 주지 않도록 살짝 간격
 
     if is_first_run:
+        # 첫 실행에서는 기존 매물 전부가 "새 매물"로 오인되므로, 알림 없이 기준점만 저장
         print(f"첫 실행: 기존 매물 {len(seen)}개를 기준으로 저장했습니다 (알림 생략)")
     else:
         pending.extend(new_items)
-        print(f"새 매물/인하 {len(new_items)}건 발견 (대기 중 {len(pending)}건)")
+        print(f"새 매물 {len(new_items)}건 발견 (대기 중 {len(pending)}건)")
 
     if pending:
         pending = await flush_pending(pending)
