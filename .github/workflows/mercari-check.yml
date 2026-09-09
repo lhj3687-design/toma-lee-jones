@@ -9,10 +9,6 @@ concurrency:
   group: mercari-check
   cancel-in-progress: false
 
-concurrency:
-  group: mercari-check
-  cancel-in-progress: false
-
 permissions:
   contents: write
 
