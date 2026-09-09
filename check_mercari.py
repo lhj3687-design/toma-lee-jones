@@ -41,21 +41,26 @@ SEARCHES = [
 
 
 def load_state():
-    """seen(중복 방지용 ID 집합)과 pending(전송 실패해서 대기 중인 알림)을 불러옵니다."""
+    """seen({매물ID: 마지막으로 확인한 가격})과 pending(전송 대기 중인 알림)을 불러옵니다."""
     if SEEN_FILE.exists():
         try:
             data = json.loads(SEEN_FILE.read_text())
             if isinstance(data, list):
-                return set(data), []  # 구버전 파일(리스트만 저장) 호환
-            return set(data.get("seen", [])), data.get("pending", [])
+                return {i: None for i in data}, []  # 구버전(ID 리스트만) 호환
+            raw_seen = data.get("seen", [])
+            if isinstance(raw_seen, list):
+                seen = {i: None for i in raw_seen}  # 가격 추적 도입 전 버전 호환
+            else:
+                seen = raw_seen
+            return seen, data.get("pending", [])
         except Exception:
-            return set(), []
-    return set(), []
+            return {}, []
+    return {}, []
 
 
-def save_state(seen: set, pending: list) -> None:
+def save_state(seen: dict, pending: list) -> None:
     data = {
-        "seen": list(seen)[-5000:],  # 무한정 커지지 않도록 최근 5000개만 유지
+        "seen": dict(list(seen.items())[-5000:]),  # 무한정 커지지 않도록 최근 5000개만 유지
         "pending": pending[-500:],  # 대기열도 상한선을 둠
     }
     SEEN_FILE.write_text(json.dumps(data, ensure_ascii=False))
@@ -139,7 +144,7 @@ async def flush_pending(pending: list) -> list:
     return remaining
 
 
-async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: set, new_items: list) -> None:
+async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, new_items: list) -> None:
     try:
         results = await m.search(keyword, categories=categories)
     except Exception as e:
@@ -147,29 +152,40 @@ async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: set, n
         return
 
     new_count = 0
+    drop_count = 0
     for item in results.items[:MAX_ITEMS_PER_KEYWORD]:
         item_id = extract_field(item, ["id_", "id", "item_id", "itemId"])
-        if not item_id or item_id in seen:
+        if not item_id:
             continue
-        seen.add(item_id)
 
         name = getattr(item, "name", None) or extract_field(item, ["name", "title"], "(제목 없음)")
         price = getattr(item, "price", None)
+        if isinstance(price, Decimal):
+            price = int(price)
         photo = extract_field(item, ["thumbnails", "photos", "thumbnail", "image_url"])
         if isinstance(photo, (list, tuple)):
             photo = photo[0] if photo else None
-
         item_url = f"https://jp.mercari.com/item/{item_id}"
-        if isinstance(price, (int, float, Decimal)):
-            price_txt = f"¥{int(price):,}"
-        else:
-            price_txt = "가격 확인 필요"
+        price_txt = f"¥{price:,}" if isinstance(price, int) else "가격 확인 필요"
 
-        caption = f"[{keyword}] {name}\n💴 {price_txt}\n🔗 {item_url}"
-        new_items.append({"caption": caption, "photo": photo})
-        new_count += 1
+        if item_id not in seen:
+            seen[item_id] = price
+            caption = f"[{keyword}] {name}\n💴 {price_txt}\n🔗 {item_url}"
+            new_items.append({"caption": caption, "photo": photo})
+            new_count += 1
+            continue
 
-    print(f"[{keyword}] 검색 {len(results.items)}개 확인 (신규 {new_count}개)")
+        old_price = seen.get(item_id)
+        if isinstance(old_price, int) and isinstance(price, int) and price < old_price:
+            caption = (
+                f"💰[가격 인하] [{keyword}] {name}\n"
+                f"¥{old_price:,} → ¥{price:,}\n🔗 {item_url}"
+            )
+            new_items.append({"caption": caption, "photo": photo})
+            drop_count += 1
+        seen[item_id] = price  # 항상 최신 가격으로 갱신 (인상이든 인하든)
+
+    print(f"[{keyword}] 검색 {len(results.items)}개 확인 (신규 {new_count}개, 가격인하 {drop_count}개)")
 
 
 async def main() -> None:
