@@ -1,10 +1,9 @@
-"""GitHub push 충돌 때 seen_items.json의 상태를 안전하게 병합합니다.
+"""GitHub push가 충돌났을 때 seen_items.json의 상태를 안전하게 병합합니다.
 
 - seen: 두 실행이 확인한 매물/가격을 모두 유지합니다.
 - sent_alerts: 합집합으로 보존해 이미 전송된 알림이 대기열에 되살아나도 재전송하지 않습니다.
 - pending: 고유 alert_id(구버전은 caption) 기준으로 합치되 sent_alerts에 있는 항목은 제거합니다.
 """
-
 import json
 
 
@@ -39,7 +38,6 @@ def merge_pending(theirs: list, mine: list, sent_alerts: list) -> list:
     sent_keys = set(sent_alerts)
     pending_keys = set()
     result = []
-
     for entry in theirs + mine:
         if not isinstance(entry, dict):
             continue
@@ -50,7 +48,6 @@ def merge_pending(theirs: list, mine: list, sent_alerts: list) -> list:
         normalized.setdefault("alert_id", key)
         result.append(normalized)
         pending_keys.add(key)
-
     return result[-500:]
 
 
