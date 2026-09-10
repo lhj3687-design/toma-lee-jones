@@ -27,10 +27,6 @@ MAX_SEEN_ITEMS = 5000
 MAX_PENDING_ALERTS = 500
 MAX_SENT_ALERTS = 5000
 
-# 검색 설정: 키워드마다 필요하면 카테고리를 지정합니다.
-# categories가 빈 리스트면 카테고리 제한 없이 전체에서 검색합니다.
-# 카테고리 ID: 멘즈=2, 멘즈>탑스=30, 레이디스>탑스=11,
-#              레이디스>재킷·아우터=12, 레이디스>팬츠=13, 패션 전체=3088
 SEARCHES = [
     {"query": "Carol Christian Poell", "categories": []},
     {"query": "Martin Margiela", "categories": [30]},
@@ -49,10 +45,8 @@ SEARCHES = [
 
 
 def load_state() -> tuple[dict, list, list]:
-    """seen, pending, sent_alerts를 불러오며 이전 상태 파일도 호환합니다."""
     if not SEEN_FILE.exists():
         return {}, [], []
-
     try:
         data = json.loads(SEEN_FILE.read_text())
     except Exception as exc:
@@ -75,7 +69,6 @@ def load_state() -> tuple[dict, list, list]:
 
 
 def alert_key(entry: dict) -> str:
-    """새 형식과 기존 대기열 형식 모두에 쓸 수 있는 알림 고유 키를 반환합니다."""
     value = entry.get("alert_id")
     if value:
         return str(value)
@@ -83,7 +76,6 @@ def alert_key(entry: dict) -> str:
 
 
 def unique_recent(values: list[str], limit: int) -> list[str]:
-    """순서를 유지하며 중복을 제거한 최근 항목만 남깁니다."""
     result = []
     seen_values = set()
     for value in values:
@@ -95,11 +87,9 @@ def unique_recent(values: list[str], limit: int) -> list[str]:
 
 
 def deduplicate_pending(pending: list, sent_alerts: list) -> list:
-    """이미 전송됐거나 대기열에 있는 같은 알림을 한 건으로 정리합니다."""
     sent_keys = set(sent_alerts)
     pending_keys = set()
     result = []
-
     for entry in pending:
         if not isinstance(entry, dict):
             continue
@@ -110,12 +100,10 @@ def deduplicate_pending(pending: list, sent_alerts: list) -> list:
         normalized.setdefault("alert_id", key)
         result.append(normalized)
         pending_keys.add(key)
-
     return result[-MAX_PENDING_ALERTS:]
 
 
 def save_state(seen: dict, pending: list, sent_alerts: list) -> None:
-    """상태 파일을 원자적으로 교체해 실행 중간의 손상을 피합니다."""
     sent_alerts = unique_recent(sent_alerts, MAX_SENT_ALERTS)
     pending = deduplicate_pending(pending, sent_alerts)
     data = {
@@ -129,7 +117,6 @@ def save_state(seen: dict, pending: list, sent_alerts: list) -> None:
 
 
 def extract_field(item, candidates, default=None):
-    """dataclass 필드명이 라이브러리 버전마다 다를 수 있어 후보 키를 순서대로 시도합니다."""
     data = asdict(item)
     for key in candidates:
         value = data.get(key)
@@ -139,7 +126,6 @@ def extract_field(item, candidates, default=None):
 
 
 async def send_telegram(caption: str, photo_url):
-    """전송 성공 여부와 레이트리밋일 경우 텔레그램이 알려준 대기 초를 반환합니다."""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
@@ -175,19 +161,14 @@ async def send_telegram(caption: str, photo_url):
 
 
 async def flush_pending(pending: list, sent_alerts: list) -> tuple[list, list]:
-    """대기열을 전송하고 성공한 알림 키를 sent_alerts에 기록합니다."""
     remaining = list(pending)
     sent = 0
-
     while remaining:
         entry = remaining[0]
         key = alert_key(entry)
-
-        # 병합 재시도 중 예전 대기열이 되살아나도 재전송하지 않습니다.
         if key in sent_alerts:
             remaining.pop(0)
             continue
-
         ok, retry_after = await send_telegram(entry["caption"], entry.get("photo"))
         if ok:
             sent_alerts.append(key)
@@ -195,21 +176,16 @@ async def flush_pending(pending: list, sent_alerts: list) -> tuple[list, list]:
             sent += 1
             await asyncio.sleep(1.5)
             continue
-
         if retry_after and retry_after <= 60:
             print(f"[레이트리밋] {retry_after}초 대기 후 재시도", file=sys.stderr)
             await asyncio.sleep(retry_after + 1)
             continue
-
         entry["attempts"] = entry.get("attempts", 0) + 1
         if entry["attempts"] >= 3:
             print(f"[알림 포기: 3회 실패] {entry['caption'][:50]}", file=sys.stderr)
             remaining.pop(0)
             continue
-
-        # 복구 불가능해 보이는 실패이거나 대기 시간이 김 -> 다음 실행에 이어서 시도
         break
-
     if sent:
         print(f"텔레그램 알림 {sent}건 전송 완료")
     return remaining, unique_recent(sent_alerts, MAX_SENT_ALERTS)
@@ -228,7 +204,6 @@ async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, 
         item_id = extract_field(item, ["id_", "id", "item_id", "itemId"])
         if not item_id:
             continue
-
         name = getattr(item, "name", None) or extract_field(item, ["name", "title"], "(제목 없음)")
         price = getattr(item, "price", None)
         if isinstance(price, Decimal):
@@ -237,7 +212,6 @@ async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, 
         if isinstance(photo, (list, tuple)):
             photo = photo[0] if photo else None
 
-        # Mercari Shops(입점 상점) 상품은 /item/이 아니라 /shops/product/ 주소를 써야 합니다.
         item_type = str(extract_field(item, ["item_type"], "")).upper()
         item_url = (
             f"https://jp.mercari.com/shops/product/{item_id}"
@@ -249,9 +223,7 @@ async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, 
         if item_id not in seen:
             seen[item_id] = price
             caption = f"[{keyword}] {name}\n💴 {price_txt}\n🔗 {item_url}"
-            new_items.append(
-                {"alert_id": f"new:{item_id}", "caption": caption, "photo": photo}
-            )
+            new_items.append({"alert_id": f"new:{item_id}", "caption": caption, "photo": photo})
             new_count += 1
             continue
 
@@ -262,20 +234,15 @@ async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, 
                 f"¥{old_price:,} → ¥{price:,}\n🔗 {item_url}"
             )
             new_items.append(
-                {
-                    "alert_id": f"drop:{item_id}:{old_price}:{price}",
-                    "caption": caption,
-                    "photo": photo,
-                }
+                {"alert_id": f"drop:{item_id}:{old_price}:{price}", "caption": caption, "photo": photo}
             )
             drop_count += 1
-        seen[item_id] = price  # 인상·인하와 무관하게 최신 가격으로 갱신
+        seen[item_id] = price
 
     print(f"[{keyword}] 검색 {len(results.items)}개 확인 (신규 {new_count}개, 가격인하 {drop_count}개)")
 
 
 async def collect_updates() -> None:
-    """검색 결과와 알림 대기열을 먼저 로컬 상태 파일에 기록합니다."""
     mercari = Mercapi()
     seen, pending, sent_alerts = load_state()
     is_first_run = len(seen) == 0
@@ -283,7 +250,7 @@ async def collect_updates() -> None:
 
     for search in SEARCHES:
         await check_keyword(mercari, search["query"], search["categories"], seen, new_items)
-        await asyncio.sleep(1)  # 메루카리 서버에 부담을 주지 않도록 간격 유지
+        await asyncio.sleep(1)
 
     if is_first_run:
         print(f"첫 실행: 기존 매물 {len(seen)}개를 기준으로 저장했습니다 (알림 생략)")
@@ -291,12 +258,10 @@ async def collect_updates() -> None:
         pending = deduplicate_pending(pending + new_items, sent_alerts)
         print(f"새 알림 {len(new_items)}건 발견 (저장될 대기열 {len(pending)}건)")
 
-    # 이 저장본은 바로 다음 Actions 단계에서 GitHub에 먼저 반영됩니다.
     save_state(seen, pending, sent_alerts)
 
 
 async def send_pending() -> None:
-    """GitHub에 먼저 저장된 대기열만 전송하고 결과를 다시 상태 파일에 기록합니다."""
     seen, pending, sent_alerts = load_state()
     pending = deduplicate_pending(pending, sent_alerts)
 
@@ -308,7 +273,6 @@ async def send_pending() -> None:
     try:
         pending, sent_alerts = await flush_pending(pending, sent_alerts)
     finally:
-        # 전송 도중 예외가 생겨도 이미 성공한 알림은 다음 실행에 재전송하지 않도록 저장합니다.
         save_state(seen, pending, sent_alerts)
 
     if pending:
