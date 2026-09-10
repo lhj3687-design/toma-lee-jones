@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from dataclasses import asdict
 from decimal import Decimal
@@ -20,6 +21,11 @@ from pathlib import Path
 
 import httpx
 from mercapi import Mercapi
+
+# 일반 메루카리 개인 매물 ID는 항상 "m" + 숫자 형식입니다 (예: m90925725213).
+# 이 형식이 아니면 메루카리 숍스(기업 판매자) 상품이므로 /shops/product/ 링크를 써야 합니다.
+# item_type 필드만으로는 라이브러리가 숍스 여부를 늘 정확히 채워주지 않아 ID 형식을 보조 판단 기준으로 씁니다.
+MERCARI_ITEM_ID_PATTERN = re.compile(r"^m\d+$")
 
 SEEN_FILE = Path("seen_items.json")
 MAX_ITEMS_PER_KEYWORD = 120  # 키워드당 확인할 최근 매물 개수
@@ -212,10 +218,12 @@ async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, 
         if isinstance(photo, (list, tuple)):
             photo = photo[0] if photo else None
 
+        # item_type에 "SHOP"이 찍히거나, ID가 일반 매물 형식(m+숫자)이 아니면 숍스 상품으로 간주합니다.
         item_type = str(extract_field(item, ["item_type"], "")).upper()
+        is_shop_item = "SHOP" in item_type or not MERCARI_ITEM_ID_PATTERN.match(str(item_id))
         item_url = (
             f"https://jp.mercari.com/shops/product/{item_id}"
-            if "SHOP" in item_type
+            if is_shop_item
             else f"https://jp.mercari.com/item/{item_id}"
         )
         price_txt = f"¥{price:,}" if isinstance(price, int) else "가격 확인 필요"
