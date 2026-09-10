@@ -8,7 +8,7 @@ import unittest
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 mercapi_stub = types.ModuleType("mercapi")
 mercapi_stub.Mercapi = object
@@ -126,8 +126,8 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(collected["seen"], {"old-item": 9000, "new-item": 15000})
 
         with patch.object(mercari, "send_telegram", new=AsyncMock(return_value=(True, None))), patch.object(
-            mercari.asyncio, "sleep", new=AsyncMock()
-        ):
+            mercari, "push_state", return_value=True
+        ), patch.object(mercari.asyncio, "sleep", new=AsyncMock()):
             await mercari.send_pending()
 
         delivered = json.loads(mercari.SEEN_FILE.read_text())
@@ -138,7 +138,9 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         )
 
         send_mock = AsyncMock(return_value=(True, None))
-        with patch.object(mercari, "send_telegram", new=send_mock):
+        with patch.object(mercari, "send_telegram", new=send_mock), patch.object(
+            mercari, "push_state", return_value=True
+        ):
             await mercari.send_pending()
         send_mock.assert_not_awaited()
 
@@ -149,12 +151,36 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         ]
         send_mock = AsyncMock(return_value=(True, None))
         with patch.object(mercari, "send_telegram", new=send_mock), patch.object(
-            mercari.asyncio, "sleep", new=AsyncMock()
-        ):
-            remaining, sent_alerts = await mercari.flush_pending(pending, ["new:already"])
+            mercari, "push_state", return_value=True
+        ), patch.object(mercari.asyncio, "sleep", new=AsyncMock()):
+            remaining, sent_alerts = await mercari.flush_pending({}, pending, ["new:already"])
         self.assertEqual(remaining, [])
         send_mock.assert_awaited_once_with("send", None)
         self.assertEqual(sent_alerts, ["new:already", "new:send"])
+
+    async def test_flush_pending_persists_after_each_send_and_stops_on_push_failure(self):
+        # 알림을 하나 보낼 때마다 곧바로 push_state를 호출해야 하고,
+        # 그 저장이 실패하면 이후 남은 항목은 이번 실행에서 보내지 않아야 합니다
+        # (배치 전체가 아니라 '방금 보낸 1건'만 위험 구간에 남기기 위함).
+        pending = [
+            {"alert_id": "new:a", "caption": "a"},
+            {"alert_id": "new:b", "caption": "b"},
+        ]
+        send_mock = AsyncMock(return_value=(True, None))
+        push_mock = Mock(side_effect=[False])  # 첫 전송 직후 저장이 실패하는 상황
+
+        with patch.object(mercari, "send_telegram", new=send_mock), patch.object(
+            mercari, "push_state", new=push_mock
+        ), patch.object(mercari.asyncio, "sleep", new=AsyncMock()):
+            remaining, sent_alerts = await mercari.flush_pending({}, pending, [])
+
+        # 텔레그램 전송 자체는 첫 건만 시도되고 멈춤
+        send_mock.assert_awaited_once_with("a", None)
+        push_mock.assert_called_once_with("record Mercari alert delivery")
+        # 이미 보낸 건 sent_alerts에는 남아 있어야, 이후 save_state 때 결국 반영됨
+        self.assertEqual(sent_alerts, ["new:a"])
+        # 두 번째 항목은 아직 안 보냈으므로 대기열에 그대로 남아 있어야 함
+        self.assertEqual([entry["alert_id"] for entry in remaining], ["new:b"])
 
 
 if __name__ == "__main__":
