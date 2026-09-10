@@ -2,6 +2,9 @@
 # seen_items.json을 원격 저장소에 반영합니다. 드문 push 충돌도 상태 병합 후 재시도합니다.
 set -euo pipefail
 
+# 어느 위치에서 호출되든 항상 저장소 루트 기준으로 동작하도록 고정합니다.
+cd "$(git rev-parse --show-toplevel)"
+
 commit_message="${1:-update Mercari alert state}"
 
 for attempt in 1 2 3 4 5; do
