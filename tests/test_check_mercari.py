@@ -53,6 +53,25 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         mercari.SEARCHES = self.original_searches
         self.temp_directory.cleanup()
 
+    async def test_check_keyword_routes_shops_url_by_id_pattern_even_without_item_type(self):
+        # item_type이 "SHOP"을 담고 있지 않아도, ID가 일반 매물 형식(m+숫자)이 아니면
+        # 숍스 상품으로 판단해 /shops/product/ 링크를 만들어야 합니다.
+        seen = {}
+        new_items = []
+        fake_api = FakeMercapi(
+            {
+                "test": [
+                    FakeItem("2JUHeREMxTVqFa42uQFwEc", "Shop item", 5000, item_type="ITEM"),
+                    FakeItem("m90925725213", "Regular item", 3000, item_type="ITEM"),
+                ]
+            }
+        )
+
+        await mercari.check_keyword(fake_api, "test", [], seen, new_items)
+
+        self.assertIn("https://jp.mercari.com/shops/product/2JUHeREMxTVqFa42uQFwEc", new_items[0]["caption"])
+        self.assertIn("https://jp.mercari.com/item/m90925725213", new_items[1]["caption"])
+
     async def test_check_keyword_assigns_unique_keys_for_new_and_price_drop(self):
         seen = {"old-item": 12000}
         new_items = []
