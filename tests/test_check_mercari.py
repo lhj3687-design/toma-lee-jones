@@ -10,7 +10,6 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-# 테스트 환경에는 실제 mercapi 설치가 필요 없습니다.
 mercapi_stub = types.ModuleType("mercapi")
 mercapi_stub.Mercapi = object
 sys.modules.setdefault("mercapi", mercapi_stub)
@@ -65,9 +64,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
                 ]
             }
         )
-
         await mercari.check_keyword(fake_api, "test", [], seen, new_items)
-
         self.assertEqual(seen, {"old-item": 9000, "new-item": 15000})
         self.assertEqual(
             [entry["alert_id"] for entry in new_items],
@@ -82,7 +79,6 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             {"caption": "legacy"},
         ]
         mercari.save_state({"a": 1}, pending, ["new:b", "new:already"])
-
         state = json.loads(mercari.SEEN_FILE.read_text())
         self.assertEqual([entry["alert_id"] for entry in state["pending"]], ["new:a", "legacy:legacy"])
         self.assertEqual(state["sent_alerts"], ["new:b", "new:already"])
@@ -98,7 +94,6 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
                 ]
             }
         )
-
         with patch.object(mercari, "Mercapi", return_value=fake_api), patch.object(
             mercari.asyncio, "sleep", new=AsyncMock()
         ):
@@ -123,7 +118,6 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             ["drop:old-item:12000:9000", "new:new-item"],
         )
 
-        # 다음 send 단계는 전송 대기열이 없어 텔레그램을 다시 호출하지 않습니다.
         send_mock = AsyncMock(return_value=(True, None))
         with patch.object(mercari, "send_telegram", new=send_mock):
             await mercari.send_pending()
@@ -135,12 +129,10 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             {"alert_id": "new:send", "caption": "send"},
         ]
         send_mock = AsyncMock(return_value=(True, None))
-
         with patch.object(mercari, "send_telegram", new=send_mock), patch.object(
             mercari.asyncio, "sleep", new=AsyncMock()
         ):
             remaining, sent_alerts = await mercari.flush_pending(pending, ["new:already"])
-
         self.assertEqual(remaining, [])
         send_mock.assert_awaited_once_with("send", None)
         self.assertEqual(sent_alerts, ["new:already", "new:send"])
