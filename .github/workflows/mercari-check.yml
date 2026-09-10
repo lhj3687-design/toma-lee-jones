@@ -26,6 +26,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Send 단계 내부(check_mercari.py)에서도 알림 하나마다 바로 push를 하기 때문에,
+      # git 사용자 정보를 맨 앞에서 한 번만 설정해 모든 이후 단계에서 쓸 수 있게 합니다.
+      - name: Configure git identity
+        run: |
+          git config user.name "mercari-alert-bot"
+          git config user.email "actions@github.com"
+
       # 회귀를 미리 잡아내기 위해 배포 전에 유닛 테스트를 돌립니다 (표준 라이브러리만 사용, 추가 의존성 없음).
       - name: Run unit tests
         run: python -m unittest discover -s tests
@@ -36,23 +43,19 @@ jobs:
 
       # 2) 텔레그램을 호출하기 전에 상태를 GitHub에 확정합니다.
       - name: Persist collected state before notification
-        run: |
-          git config user.name "mercari-alert-bot"
-          git config user.email "actions@github.com"
-          bash scripts/push_state.sh "queue Mercari alerts"
+        run: bash scripts/push_state.sh "queue Mercari alerts"
 
-      # 3) 이제 원격 저장소에 저장된 대기열만 전송합니다.
+      # 3) 원격 저장소에 저장된 대기열만 전송합니다.
+      #    알림을 하나 보낼 때마다 스크립트 내부에서 곧바로 push_state.sh를 호출해
+      #    '전송 성공했지만 기록은 아직 안 올라간' 위험 구간을 최소화합니다.
       - name: Send pending Telegram alerts
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python check_mercari.py --mode send
 
-      # 4) 성공적으로 전송한 알림을 전송 이력에 기록하고 대기열에서 제거합니다.
-      #    전송 단계가 중간에 실패해도 가능한 한 상태는 보존합니다.
+      # 4) 최종 안전망: 건별 push로 못 잡은 자투리 상태 변화(재시도 횟수, 포기한 항목 등)를
+      #    한 번 더 반영합니다. 전송 단계가 중간에 실패해도 가능한 한 상태는 보존합니다.
       - name: Persist delivery result
         if: always()
-        run: |
-          git config user.name "mercari-alert-bot"
-          git config user.email "actions@github.com"
-          bash scripts/push_state.sh "record Mercari alert delivery"
+        run: bash scripts/push_state.sh "record Mercari alert delivery"
