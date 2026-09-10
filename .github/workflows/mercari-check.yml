@@ -26,6 +26,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # 회귀를 미리 잡아내기 위해 배포 전에 유닛 테스트를 돌립니다 (표준 라이브러리만 사용, 추가 의존성 없음).
+      - name: Run unit tests
+        run: python -m unittest discover -s tests
+
       # 1) 메루카리 검색 후, 새 알림과 최신 가격을 상태 파일에 먼저 기록합니다.
       - name: Collect Mercari updates
         run: python check_mercari.py --mode collect
