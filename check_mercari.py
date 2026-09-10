@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import sys
 from dataclasses import asdict
 from decimal import Decimal
@@ -122,6 +123,31 @@ def save_state(seen: dict, pending: list, sent_alerts: list) -> None:
     temporary_file.replace(SEEN_FILE)
 
 
+def push_state(commit_message: str) -> bool:
+    """scripts/push_state.sh를 호출해 현재 상태 파일을 원격 저장소에 즉시 반영합니다.
+
+    텔레그램 알림을 하나 보낼 때마다 이 함수를 호출해서,
+    '전송 완료 기록'이 원격에 반영되기 전의 위험 구간을 최소화합니다.
+    실패하면 False를 반환하며, 호출한 쪽에서 더 이상의 전송을 멈춰야 합니다.
+    """
+    try:
+        result = subprocess.run(
+            ["bash", "scripts/push_state.sh", commit_message],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        print(f"[상태 저장 실행 실패] {exc}", file=sys.stderr)
+        return False
+
+    if result.returncode != 0:
+        print(f"[상태 저장 실패]\n{result.stdout}\n{result.stderr}", file=sys.stderr)
+        return False
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    return True
+
+
 def extract_field(item, candidates, default=None):
     data = asdict(item)
     for key in candidates:
@@ -166,7 +192,14 @@ async def send_telegram(caption: str, photo_url):
     return False, retry_after
 
 
-async def flush_pending(pending: list, sent_alerts: list) -> tuple[list, list]:
+async def flush_pending(seen: dict, pending: list, sent_alerts: list) -> tuple[list, list]:
+    """대기열을 전송하고, 성공할 때마다 곧바로 원격 저장소에 기록합니다.
+
+    한 건이라도 전송된 뒤 원격 저장 기록(push_state)이 실패하면 즉시 멈춥니다.
+    이미 텔레그램으로는 전송됐으므로 sent_alerts에는 남겨 두고(그래야 이후
+    save_state 호출에서 결국 반영됨), 그 이상 대기열을 처리하지 않아
+    "배치 전체 중복 재전송" 위험을 '방금 보낸 1건'으로 최소화합니다.
+    """
     remaining = list(pending)
     sent = 0
     while remaining:
@@ -180,6 +213,14 @@ async def flush_pending(pending: list, sent_alerts: list) -> tuple[list, list]:
             sent_alerts.append(key)
             remaining.pop(0)
             sent += 1
+            save_state(seen, remaining, sent_alerts)
+            if not push_state("record Mercari alert delivery"):
+                print(
+                    "[중단] 전송 기록 저장에 실패해 이번 실행은 여기서 멈춥니다 "
+                    "(다음 실행 때 안전하게 이어갑니다)",
+                    file=sys.stderr,
+                )
+                break
             await asyncio.sleep(1.5)
             continue
         if retry_after and retry_after <= 60:
@@ -279,7 +320,7 @@ async def send_pending() -> None:
         return
 
     try:
-        pending, sent_alerts = await flush_pending(pending, sent_alerts)
+        pending, sent_alerts = await flush_pending(seen, pending, sent_alerts)
     finally:
         save_state(seen, pending, sent_alerts)
 
