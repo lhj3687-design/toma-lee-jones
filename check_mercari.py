@@ -7,6 +7,10 @@ GitHub Actions는 아래 순서로 이 파일을 두 번 실행합니다.
 
 이 순서 덕분에 텔레그램 전송이 오래 걸리거나 실행이 중간에 겹쳐도,
 같은 매물이나 같은 가격 인하가 다시 새 알림으로 등록되는 일을 막습니다.
+
+'신규' 판정은 상태 파일(seen)뿐 아니라 매물의 실제 등록 시각(created)을 함께 봅니다.
+상태 파일은 용량 제한 때문에 오래된 항목을 버릴 수밖에 없는데, 등록 시각을 같이 보면
+버려진 오래된 매물이 다시 '신규'로 둔갑해 알림이 가는 일을 원천적으로 막을 수 있습니다.
 """
 
 import argparse
@@ -18,6 +22,7 @@ import subprocess
 import sys
 import unicodedata
 from dataclasses import asdict
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -30,15 +35,40 @@ from mercapi import Mercapi
 MERCARI_ITEM_ID_PATTERN = re.compile(r"^m\d+$")
 
 # 제목 정규화 시 제거할 기호(전각/반각 공백, 대괄호·괄호·특수문자 등 꾸밈 차이 무시용)
-_TITLE_NOISE_PATTERN = re.compile(r"[\s\u3000!-/:-@\[-`{-~、。・【】「」『』［］（）]+")
+_TITLE_NOISE_PATTERN = re.compile(r"[\s　!-/:-@\[-`{-~、。・【】「」『』［］（）]+")
+
+# 메루카리 검색 API는 숍스(기업 판매자) 상품의 sellerId를 0으로 돌려줍니다.
+# 이 값을 진짜 판매자 ID로 쓰면 서로 다른 숍스 상품들이 "같은 판매자"로 묶여서
+# 제목만 같으면 재출품으로 오인되고, 진짜 새 매물 알림이 조용히 삼켜집니다.
+UNKNOWN_SELLER_IDS = {"", "0", "none", "null"}
 
 SEEN_FILE = Path("seen_items.json")
-MAX_ITEMS_PER_KEYWORD = 120  # 키워드당 확인할 최근 매물 개수
-MAX_SEEN_ITEMS = 5000
-MAX_RELIST_FINGERPRINTS = 5000
+MAX_ITEMS_PER_KEYWORD = 120  # 메루카리 검색 한 페이지 크기(키워드당 정렬 방식마다 확인할 매물 개수)
+MAX_SEARCH_PAGES = 3  # 새 매물이 한 페이지를 가득 채웠을 때만 추가로 볼 최대 페이지 수
+MAX_SEEN_ITEMS = 15000
+MAX_RELIST_FINGERPRINTS = 6000
 PRICE_DROP_ALERT_THRESHOLD = 1000  # 마지막 알림 가격보다 이 금액(엔) 이상 떨어졌을 때만 알립니다.
 MAX_PENDING_ALERTS = 500
-MAX_SENT_ALERTS = 5000
+MAX_SENT_ALERTS = 8000
+
+# 마지막 '전체 조회' 시각을 담는 예약 키입니다(키워드 이름과 겹치지 않도록 표시를 붙였습니다).
+FULL_SCAN_STATE_KEY = "__full_scan__"
+
+# 전송 단계는 알림 하나마다 git push까지 하기 때문에 한 건당 수 초가 걸립니다.
+# 한 실행이 5분 크론을 넘겨 다음 실행이 줄줄이 밀리지 않도록 한 번에 보낼 양을 제한하고,
+# 남은 알림은 다음 실행에서 이어서 보냅니다(대기열은 그대로 보존됩니다).
+SEND_INTERVAL_SECONDS = 1.5
+MAX_SEND_ATTEMPTS_PER_RUN = 40
+MAX_ALERT_ATTEMPTS = 3
+MAX_CONSECUTIVE_SEND_FAILURES = 5
+
+# 등록 시각 기준으로 '신규'를 판정할 때 쓰는 여유값들(초 단위).
+# GRACE: 크론 지연·실행 큐 대기 때문에 직전 조회 시각이 조금 밀릴 수 있어 그만큼 넉넉히 봅니다.
+# FIRST_LOOKBACK: 해당 키워드의 직전 조회 기록이 아직 없을 때(업그레이드 직후 첫 실행) 쓰는 기본 창.
+# MAX_LOOKBACK: 봇이 오래 멈춰 있다 살아났을 때 며칠치가 한꺼번에 쏟아지지 않도록 상한을 둡니다.
+NEW_ITEM_GRACE_SECONDS = 15 * 60
+FIRST_RUN_LOOKBACK_SECONDS = 60 * 60
+MAX_LOOKBACK_SECONDS = 24 * 60 * 60
 
 SEARCHES = [
     {"query": "Carol Christian Poell", "categories": []},
@@ -80,18 +110,72 @@ LEGACY_KEYWORDS_SEEDED_AT_UPGRADE = [
     "ザ・ロウ",
 ]
 
+# 현재 코드가 만들어 내는 재출품 지문 접두사입니다.
+# 예전(또는 외부 도구가 잠깐 끼어들어 만든) 형식의 지문은 지금 코드가 조회하지 않으면서
+# 용량 상한만 잡아먹기 때문에, 상태를 읽을 때 한 번 정리합니다.
+SUPPORTED_FINGERPRINT_PREFIXES = ("seller:", "title:")
 
-def load_state() -> tuple[dict, list, list, dict, set]:
+
+def build_search_options() -> dict:
+    """정렬 방식별 검색 옵션을 준비합니다.
+
+    - created: 등록 시각 내림차순. 새 매물을 놓치지 않기 위한 본 패스입니다.
+    - score: 메루카리 기본값(추천순). 오래된 매물의 가격 인하를 계속 추적하기 위해 함께 봅니다.
+    두 패스 모두 '판매중'만 조회해서, 이미 팔린 매물이 자리를 차지하지 않게 합니다.
+
+    mercapi가 없거나(테스트) 옵션 이름이 바뀌어도 봇이 죽지 않도록 실패 시 기본 검색으로 물러납니다.
+    """
+    try:
+        from mercapi.requests import SearchRequestData as request_data
+
+        on_sale = [request_data.Status.STATUS_ON_SALE]
+        return {
+            "created": {
+                "sort_by": request_data.SortBy.SORT_CREATED_TIME,
+                "sort_order": request_data.SortOrder.ORDER_DESC,
+                "status": on_sale,
+            },
+            "score": {
+                "sort_by": request_data.SortBy.SORT_SCORE,
+                "sort_order": request_data.SortOrder.ORDER_DESC,
+                "status": on_sale,
+            },
+        }
+    except Exception as exc:  # pragma: no cover - 라이브러리 구조가 바뀐 예외 상황
+        print(f"[검색 정렬 옵션 준비 실패 -> 기본 검색으로 진행] {exc}", file=sys.stderr)
+        return {"created": {}, "score": {}}
+
+
+SEARCH_SORT_OPTIONS = build_search_options()
+
+# 새 매물을 책임지는 정렬 패스의 이름입니다. 이 조회가 실패하면 그 구간의 새 매물을
+# 놓친 것이므로, 해당 키워드의 조회 시각을 갱신하면 안 됩니다.
+NEW_ITEM_SORT_PASS = "created"
+
+# 1분처럼 짧은 주기로 돌릴 때를 위한 구분입니다.
+# - 빠른 조회: 등록순만 봅니다. 새 매물을 놓치지 않는 데는 이것만으로 충분하고,
+#   실행 시간과 메루카리 API 호출량이 절반으로 줄어 짧은 주기에서도 밀리지 않습니다.
+# - 전체 조회: 추천순까지 함께 봐서 오래 올라와 있는 매물의 가격 인하도 확인합니다.
+#
+# 실행 주기에 맞춰 이 값 하나만 조절하면 됩니다.
+#   0     : 매 실행마다 전체 조회 (2분 이상 주기로 돌릴 때 권장 — 가격 인하를 가장 빨리 잡음)
+#   5*60  : 1분 주기로 돌릴 때 권장 (새 매물은 매분, 가격 인하는 5분마다)
+FULL_SCAN_INTERVAL_SECONDS = 5 * 60
+
+
+def load_state() -> tuple[dict, list, list, dict, set, dict]:
+    empty = ({}, [], [], {}, set(LEGACY_KEYWORDS_SEEDED_AT_UPGRADE), {})
+
     if not SEEN_FILE.exists():
-        return {}, [], [], {}, set(LEGACY_KEYWORDS_SEEDED_AT_UPGRADE)
+        return empty
     try:
         data = json.loads(SEEN_FILE.read_text())
     except Exception as exc:
         print(f"[상태 파일 읽기 실패] {exc}", file=sys.stderr)
-        return {}, [], [], {}, set(LEGACY_KEYWORDS_SEEDED_AT_UPGRADE)
+        return empty
 
     if isinstance(data, list):
-        return {item_id: None for item_id in data}, [], [], {}, set(LEGACY_KEYWORDS_SEEDED_AT_UPGRADE)
+        return ({item_id: None for item_id in data},) + empty[1:]
 
     raw_seen = data.get("seen", [])
     seen = {item_id: None for item_id in raw_seen} if isinstance(raw_seen, list) else raw_seen
@@ -104,14 +188,28 @@ def load_state() -> tuple[dict, list, list, dict, set]:
         if isinstance(raw_known_keywords, list)
         else set(LEGACY_KEYWORDS_SEEDED_AT_UPGRADE)
     )
+    raw_checked_at = data.get("keyword_checked_at")
+    keyword_checked_at = dict(raw_checked_at) if isinstance(raw_checked_at, dict) else {}
+    # 마지막 '전체 조회' 시각은 keyword_checked_at 안에 예약 키로 같이 보관합니다.
+    # (상태 파일 형식과 병합 로직을 그대로 두면서 값 하나만 늘리기 위한 선택입니다.)
 
     return (
         seen if isinstance(seen, dict) else {},
         pending if isinstance(pending, list) else [],
         sent_alerts if isinstance(sent_alerts, list) else [],
-        relist_fingerprints if isinstance(relist_fingerprints, dict) else {},
+        prune_fingerprints(relist_fingerprints if isinstance(relist_fingerprints, dict) else {}),
         known_keywords,
+        keyword_checked_at,
     )
+
+
+def prune_fingerprints(relist_fingerprints: dict) -> dict:
+    """현재 코드가 조회하지 않는 형식의 재출품 지문을 걸러냅니다."""
+    return {
+        key: value
+        for key, value in relist_fingerprints.items()
+        if str(key).startswith(SUPPORTED_FINGERPRINT_PREFIXES)
+    }
 
 
 def alert_key(entry: dict) -> str:
@@ -146,18 +244,47 @@ def deduplicate_pending(pending: list, sent_alerts: list) -> list:
         normalized.setdefault("alert_id", key)
         result.append(normalized)
         pending_keys.add(key)
+    if len(result) > MAX_PENDING_ALERTS:
+        # 상한을 넘으면 가장 오래된 알림부터 버려집니다. 조용히 사라지면 원인을 찾기
+        # 어려우므로 반드시 로그를 남깁니다(평소에는 절대 찍히지 않아야 정상입니다).
+        print(
+            f"[경고] 대기 알림이 상한({MAX_PENDING_ALERTS}건)을 넘어 "
+            f"오래된 {len(result) - MAX_PENDING_ALERTS}건을 버립니다",
+            file=sys.stderr,
+        )
     return result[-MAX_PENDING_ALERTS:]
 
 
-def save_state(seen: dict, pending: list, sent_alerts: list, relist_fingerprints: dict, known_keywords: set) -> None:
+def remember(store: dict, key, value) -> None:
+    """가장 최근에 본 항목이 항상 dict의 맨 뒤에 오도록 다시 넣습니다.
+
+    파이썬 dict는 이미 있는 키에 값만 바꾸면 원래 자리(처음 넣은 순서)를 그대로 지킵니다.
+    상태 파일은 용량 상한 때문에 '뒤에서부터 N개'만 남기므로, 이 처리를 빼먹으면
+    매번 검색에 걸리는 '오래 올라와 있는 인기 매물'이 가장 먼저 잘려 나가고,
+    다음 조회에서 처음 보는 매물로 오인돼 알림이 갑니다. (실제로 발생했던 버그)
+    """
+    store.pop(key, None)
+    store[key] = value
+
+
+def save_state(
+    seen: dict,
+    pending: list,
+    sent_alerts: list,
+    relist_fingerprints: dict,
+    known_keywords: set,
+    keyword_checked_at: dict | None = None,
+) -> None:
     sent_alerts = unique_recent(sent_alerts, MAX_SENT_ALERTS)
     pending = deduplicate_pending(pending, sent_alerts)
+    relist_fingerprints = prune_fingerprints(relist_fingerprints)
     data = {
         "seen": dict(list(seen.items())[-MAX_SEEN_ITEMS:]),
         "pending": pending,
         "sent_alerts": sent_alerts,
         "relist_fingerprints": dict(list(relist_fingerprints.items())[-MAX_RELIST_FINGERPRINTS:]),
         "known_keywords": sorted(known_keywords),
+        "keyword_checked_at": keyword_checked_at or {},
     }
     temporary_file = SEEN_FILE.with_suffix(".tmp")
     temporary_file.write_text(json.dumps(data, ensure_ascii=False))
@@ -211,18 +338,42 @@ def normalize_title(name) -> str:
     return text.lower()
 
 
+def item_fields(item) -> dict:
+    """검색 결과 항목을 평범한 dict로 바꿉니다.
+
+    asdict()는 중첩 구조까지 전부 깊은 복사를 하는 무거운 함수라, 한 매물마다 필드를
+    꺼낼 때마다 부르면 실행 시간이 크게 늘어납니다. 매물당 한 번만 변환해서 돌려씁니다.
+    """
+    if isinstance(item, dict):
+        return item
+    try:
+        return asdict(item)
+    except Exception:
+        return dict(getattr(item, "__dict__", {}) or {})
+
+
 def extract_seller_id(item) -> str | None:
     """검색 결과에서 판매자 ID를 뽑아냅니다. 라이브러리 버전에 따라 필드 위치가
-    다를 수 있어 평평한 필드와 중첩된 seller 객체를 모두 시도합니다."""
-    data = asdict(item)
-    direct = data.get("seller_id") or data.get("sellerId")
+    다를 수 있어 평평한 필드와 중첩된 seller 객체를 모두 시도합니다.
+
+    숍스 상품처럼 판매자 ID가 0으로 내려오는 경우는 '모름'으로 취급합니다
+    (0을 그대로 쓰면 서로 다른 숍스 상품이 같은 판매자로 묶여 버립니다)."""
+
+    def clean(value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        return None if text.lower() in UNKNOWN_SELLER_IDS else text
+
+    data = item_fields(item)
+    direct = clean(data.get("seller_id")) or clean(data.get("sellerId"))
     if direct:
-        return str(direct)
+        return direct
     seller = data.get("seller")
     if isinstance(seller, dict):
-        nested = seller.get("id") or seller.get("id_") or seller.get("seller_id")
+        nested = clean(seller.get("id")) or clean(seller.get("id_")) or clean(seller.get("seller_id"))
         if nested:
-            return str(nested)
+            return nested
     return None
 
 
@@ -243,12 +394,91 @@ def relist_fingerprint(seller_id, name, price) -> str | None:
 
 
 def extract_field(item, candidates, default=None):
-    data = asdict(item)
+    """여러 후보 필드명 중 값이 있는 첫 번째를 돌려줍니다(매물 객체/dict 둘 다 허용)."""
+    data = item_fields(item)
     for key in candidates:
         value = data.get(key)
         if value:
             return value
     return default
+
+
+def extract_item_id(item) -> str | None:
+    """매물 ID를 항상 문자열로 정규화해서 돌려줍니다.
+
+    상태 파일은 JSON이라 저장 시 키가 무조건 문자열이 됩니다. 여기서 정수 ID가
+    섞여 들어오면 저장 전후로 키가 달라져서, 다음 실행에 같은 매물을 처음 보는
+    매물로 오인하게 됩니다."""
+    value = extract_field(item, ["id_", "id", "item_id", "itemId"])
+    return str(value) if value else None
+
+
+def listing_created_at(item) -> float | None:
+    """매물의 실제 등록 시각을 epoch 초로 돌려줍니다 (없으면 None)."""
+    value = item.get("created") if isinstance(item, dict) else getattr(item, "created", None)
+    if isinstance(value, datetime):
+        try:
+            return value.timestamp()
+        except Exception:
+            return None
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    return None
+
+
+def current_time() -> float:
+    """현재 시각을 epoch 초로 돌려줍니다(테스트에서 시간을 갈아끼울 수 있도록 분리)."""
+    return datetime.now().timestamp()
+
+
+def new_item_cutoff(keyword_checked_at: dict, keyword: str, now: float) -> float:
+    """이 키워드에서 '신규'로 볼 등록 시각의 하한선을 계산합니다.
+
+    - 직전에 이 키워드를 조회한 시각이 기준선입니다(그 이후 등록된 것만 새 매물).
+    - 조회 기록이 없으면(업그레이드 직후 첫 실행) 최근 1시간만 신규로 봅니다.
+    - 봇이 오래 멈춰 있었다면 최대 24시간까지만 거슬러 올라갑니다.
+    """
+    if keyword == FULL_SCAN_STATE_KEY:
+        return now - FIRST_RUN_LOOKBACK_SECONDS
+    last_checked = keyword_checked_at.get(keyword)
+    if not isinstance(last_checked, (int, float)):
+        return now - FIRST_RUN_LOOKBACK_SECONDS
+    return max(float(last_checked), now - MAX_LOOKBACK_SECONDS)
+
+
+def is_fresh_listing(created_at: float | None, cutoff: float | None) -> bool:
+    """등록 시각 기준으로 '이번에 새로 올라온 매물'인지 판단합니다.
+
+    등록 시각을 알 수 없거나 비교 기준이 없으면, 예전처럼 상태 파일 기준으로만 판단하도록
+    True를 돌려줍니다(알림을 놓치는 쪽보다 한 번 더 보내는 쪽이 안전).
+    """
+    if created_at is None or cutoff is None:
+        return True
+    return created_at >= cutoff - NEW_ITEM_GRACE_SECONDS
+
+
+async def _telegram_post(token: str, chat_id: str, method: str, payload: dict):
+    """텔레그램 API를 한 번 호출하고 (성공여부, 재시도대기초, 상태코드)를 돌려줍니다."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            response = await client.post(
+                f"https://api.telegram.org/bot{token}/{method}",
+                data={"chat_id": chat_id, **payload},
+            )
+        except Exception as exc:
+            print(f"[텔레그램 전송 에러] {exc}", file=sys.stderr)
+            return False, None, None
+
+    if response.status_code == 200:
+        return True, None, 200
+
+    retry_after = None
+    try:
+        retry_after = response.json().get("parameters", {}).get("retry_after")
+    except Exception:
+        pass
+    print(f"[텔레그램 전송 실패 {response.status_code}] {response.text}", file=sys.stderr)
+    return False, retry_after, response.status_code
 
 
 async def send_telegram(caption: str, photo_url):
@@ -258,36 +488,31 @@ async def send_telegram(caption: str, photo_url):
         print("[텔레그램 설정 누락] TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID", file=sys.stderr)
         return False, None
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            if photo_url:
-                response = await client.post(
-                    f"https://api.telegram.org/bot{token}/sendPhoto",
-                    data={"chat_id": chat_id, "caption": caption, "photo": photo_url},
-                )
-            else:
-                response = await client.post(
-                    f"https://api.telegram.org/bot{token}/sendMessage",
-                    data={"chat_id": chat_id, "text": caption},
-                )
-        except Exception as exc:
-            print(f"[텔레그램 전송 에러] {exc}", file=sys.stderr)
-            return False, None
+    if photo_url:
+        ok, retry_after, status = await _telegram_post(
+            token, chat_id, "sendPhoto", {"caption": caption, "photo": photo_url}
+        )
+        if ok:
+            return True, None
+        # 메루카리 썸네일은 webp라서 텔레그램이 사진으로 받아주지 않는 경우가 있습니다.
+        # 사진 때문에 알림 자체를 놓치지 않도록, 잘못된 요청(4xx)이면 텍스트로 한 번 더 시도합니다.
+        if status is not None and 400 <= status < 500 and status != 429:
+            print("[사진 전송 실패 -> 텍스트로 재시도]", file=sys.stderr)
+            ok, retry_after, _ = await _telegram_post(token, chat_id, "sendMessage", {"text": caption})
+            return ok, retry_after
+        return False, retry_after
 
-    if response.status_code == 200:
-        return True, None
-
-    retry_after = None
-    try:
-        retry_after = response.json().get("parameters", {}).get("retry_after")
-    except Exception:
-        pass
-    print(f"[텔레그램 전송 실패 {response.status_code}] {response.text}", file=sys.stderr)
-    return False, retry_after
+    ok, retry_after, _ = await _telegram_post(token, chat_id, "sendMessage", {"text": caption})
+    return ok, retry_after
 
 
 async def flush_pending(
-    seen: dict, pending: list, sent_alerts: list, relist_fingerprints: dict, known_keywords: set
+    seen: dict,
+    pending: list,
+    sent_alerts: list,
+    relist_fingerprints: dict,
+    known_keywords: set,
+    keyword_checked_at: dict | None = None,
 ) -> tuple[list, list]:
     """대기열을 전송하고, 성공할 때마다 곧바로 원격 저장소에 기록합니다.
 
@@ -295,21 +520,38 @@ async def flush_pending(
     이미 텔레그램으로는 전송됐으므로 sent_alerts에는 남겨 두고(그래야 이후
     save_state 호출에서 결국 반영됨), 그 이상 대기열을 처리하지 않아
     "배치 전체 중복 재전송" 위험을 '방금 보낸 1건'으로 최소화합니다.
+
+    전송에 실패한 알림은 대기열 뒤로 미뤄 두고 다음 알림을 먼저 보냅니다.
+    한 건이 막혀서 뒤에 쌓인 정상 알림까지 지연되지 않게 하려는 것이며,
+    같은 알림을 한 실행에서 두 번 시도하지는 않습니다(재시도는 다음 실행에서).
+    전부 실패하거나 한 실행 전송 상한에 도달하면 남은 알림은 그대로 보존한 채 끝냅니다.
     """
     remaining = list(pending)
+    sent_keys = set(sent_alerts)
+    failed_keys: set[str] = set()
     sent = 0
-    while remaining:
+    consecutive_failures = 0
+    attempted = 0
+    while remaining and attempted < MAX_SEND_ATTEMPTS_PER_RUN:
         entry = remaining[0]
         key = alert_key(entry)
-        if key in sent_alerts:
+        if key in sent_keys:
             remaining.pop(0)
             continue
+        if key in failed_keys:
+            # 이번 실행에서 이미 시도했다가 실패해 뒤로 미뤄 둔 알림입니다.
+            # 여기까지 돌아왔다는 건 대기열을 한 바퀴 다 돌았다는 뜻이므로 이번 실행은 마칩니다.
+            # (재시도는 다음 실행에서 — 일시적인 장애가 회복될 시간을 줍니다.)
+            break
+        attempted += 1
         ok, retry_after = await send_telegram(entry["caption"], entry.get("photo"))
         if ok:
             sent_alerts.append(key)
+            sent_keys.add(key)
             remaining.pop(0)
             sent += 1
-            save_state(seen, remaining, sent_alerts, relist_fingerprints, known_keywords)
+            consecutive_failures = 0
+            save_state(seen, remaining, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at)
             if not push_state("record Mercari alert delivery"):
                 print(
                     "[중단] 전송 기록 저장에 실패해 이번 실행은 여기서 멈춥니다 "
@@ -317,51 +559,189 @@ async def flush_pending(
                     file=sys.stderr,
                 )
                 break
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(SEND_INTERVAL_SECONDS)
             continue
         if retry_after and retry_after <= 60:
             print(f"[레이트리밋] {retry_after}초 대기 후 재시도", file=sys.stderr)
             await asyncio.sleep(retry_after + 1)
             continue
+
+        consecutive_failures += 1
+        failed_keys.add(key)
         entry["attempts"] = entry.get("attempts", 0) + 1
-        if entry["attempts"] >= 3:
-            print(f"[알림 포기: 3회 실패] {entry['caption'][:50]}", file=sys.stderr)
-            remaining.pop(0)
-            continue
-        break
+        remaining.pop(0)
+        if entry["attempts"] >= MAX_ALERT_ATTEMPTS:
+            print(f"[알림 포기: {MAX_ALERT_ATTEMPTS}회 실패] {entry['caption'][:50]}", file=sys.stderr)
+        else:
+            # 실패한 알림을 맨 앞에 그대로 두면 그 한 건 때문에 뒤에 쌓인 알림이 전부
+            # 막혀서(매 실행 1회 재시도 -> 15분 정체) 정상 알림까지 늦어집니다.
+            # 뒤로 미뤄 두고 다음 알림부터 먼저 보냅니다.
+            remaining.append(entry)
+        if consecutive_failures >= MAX_CONSECUTIVE_SEND_FAILURES:
+            # 토큰 오류나 텔레그램 장애처럼 전체가 실패하는 상황입니다.
+            # 대기열 전체를 헛돌지 않도록 이번 실행은 여기서 멈춥니다.
+            print(
+                f"[중단] 연속 {consecutive_failures}건 전송 실패 -> 이번 실행은 여기서 멈춥니다",
+                file=sys.stderr,
+            )
+            break
+    if remaining and attempted >= MAX_SEND_ATTEMPTS_PER_RUN:
+        print(
+            f"[이번 실행 전송 상한({MAX_SEND_ATTEMPTS_PER_RUN}건) 도달 -> 나머지는 다음 실행에서]",
+            file=sys.stderr,
+        )
     if sent:
         print(f"텔레그램 알림 {sent}건 전송 완료")
     return remaining, unique_recent(sent_alerts, MAX_SENT_ALERTS)
 
 
+def wants_another_page(pass_name: str, results, items: list, created_cutoff: float | None) -> bool:
+    """등록순 조회에서 한 페이지가 통째로 '신규 구간'에 들어갈 때만 다음 페이지를 봅니다.
+
+    한 페이지(120개)가 전부 기준선 이후에 등록된 매물이라면, 그 뒤에 아직 못 본 새 매물이
+    더 있을 수 있다는 뜻입니다. 인기 키워드에서 짧은 시간에 매물이 쏟아질 때 놓치지 않으려는
+    장치이며, 평소(5분에 120개 미만)에는 한 페이지만 보고 끝납니다.
+    """
+    if pass_name != "created" or created_cutoff is None:
+        return False
+    if len(items) < MAX_ITEMS_PER_KEYWORD:
+        return False
+    if not getattr(getattr(results, "meta", None), "next_page_token", ""):
+        return False
+    created_times = [t for t in (listing_created_at(item) for item in items) if t is not None]
+    if not created_times:
+        return False
+    return is_fresh_listing(min(created_times), created_cutoff)
+
+
+async def search_items(
+    m: Mercapi,
+    keyword: str,
+    categories: list,
+    created_cutoff: float | None = None,
+    sort_passes: list[str] | None = None,
+) -> tuple[list[dict], bool, bool]:
+    """한 키워드를 '등록순'과 '추천순' 두 가지로 조회해 매물 목록을 합칩니다.
+
+    메루카리 기본 검색은 추천순(관련도)이라, 갓 올라온 매물이 상위 120개 안에 못 드는 일이
+    자주 생깁니다. 그래서 새 매물은 등록순으로 확실히 잡고, 오래 올라와 있는 매물의
+    가격 인하는 추천순 결과로 계속 추적합니다.
+
+    결과는 매물 객체가 아니라 필드 dict로 돌려줍니다(무거운 변환을 매물당 한 번만 하려고).
+
+    돌려주는 값은 (매물들, 조회 성공, 신규 매물 구간을 훑었는지) 세 가지입니다.
+    마지막 값을 따로 두는 이유: 새 매물을 책임지는 건 '등록순' 조회입니다. 등록순이
+    실패했는데 추천순만 성공했다고 조회 시각을 갱신해 버리면, 그 구간에 올라온 매물이
+    다음 실행에서 '오래된 매물'로 분류돼 영영 알림이 오지 않습니다.
+    """
+    merged: dict = {}
+    succeeded = False
+    new_item_coverage = False
+    passes = sort_passes if sort_passes is not None else list(SEARCH_SORT_OPTIONS)
+    for index, pass_name in enumerate(passes):
+        options = SEARCH_SORT_OPTIONS.get(pass_name, {})
+        if index:
+            await asyncio.sleep(1)
+        results = None
+        for page_number in range(MAX_SEARCH_PAGES):
+            try:
+                if page_number == 0:
+                    results = await m.search(keyword, categories=categories, **options)
+                else:
+                    results = await results.next_page()
+            except Exception as exc:
+                print(
+                    f"[검색 실패: {keyword} / {pass_name} {page_number + 1}페이지] {exc}",
+                    file=sys.stderr,
+                )
+                break
+            succeeded = True
+            if pass_name == NEW_ITEM_SORT_PASS:
+                new_item_coverage = True
+            page = [item_fields(item) for item in list(getattr(results, "items", []) or [])]
+            page = page[:MAX_ITEMS_PER_KEYWORD]
+            for fields in page:
+                item_id = extract_item_id(fields)
+                if item_id and item_id not in merged:
+                    merged[item_id] = fields
+            if not wants_another_page(pass_name, results, page, created_cutoff):
+                break
+            print(f"[{keyword}] 신규 매물이 한 페이지를 가득 채워 다음 페이지도 확인합니다")
+            await asyncio.sleep(1)
+    if NEW_ITEM_SORT_PASS not in passes:
+        # 등록순 조회를 쓸 수 없는 예외 상황(정렬 옵션 준비 실패)에서는
+        # 예전처럼 '한 번이라도 성공했는지'로 판단합니다.
+        new_item_coverage = succeeded
+    return list(merged.values()), succeeded, new_item_coverage
+
+
 async def check_keyword(
-    m: Mercapi, keyword: str, categories: list, seen: dict, relist_fingerprints: dict, new_items: list
+    m: Mercapi,
+    keyword: str,
+    categories: list,
+    seen: dict,
+    relist_fingerprints: dict,
+    new_items: list,
+    created_cutoff: float | None = None,
+) -> bool:
+    items, succeeded, _coverage = await search_items(m, keyword, categories, created_cutoff)
+    if not succeeded:
+        return False
+    process_items(keyword, items, seen, relist_fingerprints, new_items, created_cutoff)
+    return True
+
+
+def listed_item_ids(items: list[dict]) -> set[str]:
+    """지금 실제로 올라와 있는 매물 ID 집합. 재출품 판정에서
+    '예전 매물이 정말 사라졌는지' 확인하는 데 씁니다."""
+    return {item_id for item_id in (extract_item_id(fields) for fields in items) if item_id}
+
+
+def process_items(
+    keyword: str,
+    items: list[dict],
+    seen: dict,
+    relist_fingerprints: dict,
+    new_items: list,
+    created_cutoff: float | None = None,
+    listed_ids: set[str] | None = None,
+    can_resolve_relists: bool = True,
 ) -> None:
-    try:
-        results = await m.search(keyword, categories=categories)
-    except Exception as exc:
-        print(f"[검색 실패: {keyword}] {exc}", file=sys.stderr)
-        return
+    """검색 결과를 보고 신규/가격인하 알림을 만들고 상태를 갱신합니다.
+
+    listed_ids는 '이번 실행에서 살아 있는 것이 확인된 매물 ID' 집합입니다.
+    한 키워드의 결과만으로 판단하면, 같은 판매자가 제목이 똑같은 상품을 여러 개 올렸는데
+    카테고리 필터 때문에 한쪽만 검색에 잡히는 경우 별개의 매물을 재출품으로 오인합니다.
+    그래서 이번 실행의 모든 키워드 결과를 합쳐서 넘겨줍니다.
+    """
+    if listed_ids is None:
+        listed_ids = listed_item_ids(items)
 
     new_count = 0
     drop_count = 0
     relist_count = 0
-    for item in results.items[:MAX_ITEMS_PER_KEYWORD]:
-        item_id = extract_field(item, ["id_", "id", "item_id", "itemId"])
+    stale_count = 0
+    deferred_count = 0
+    for fields in items:
+        item_id = extract_item_id(fields)
         if not item_id:
             continue
-        name = getattr(item, "name", None) or extract_field(item, ["name", "title"], "(제목 없음)")
-        price = getattr(item, "price", None)
+        name = fields.get("name") or extract_field(fields, ["name", "title"], "(제목 없음)")
+        price = fields.get("price")
         if isinstance(price, Decimal):
             price = int(price)
-        photo = extract_field(item, ["thumbnails", "photos", "thumbnail", "image_url"])
+        # 가격 비공개(is_no_price) 매물은 price에 9999999가 들어옵니다. 그대로 두면
+        # 말도 안 되는 가격 인하 알림의 기준가가 되므로 '가격 모름'으로 취급합니다.
+        if fields.get("is_no_price"):
+            price = None
+        photo = extract_field(fields, ["thumbnails", "photos", "thumbnail", "image_url"])
         if isinstance(photo, (list, tuple)):
             photo = photo[0] if photo else None
-        seller_id = extract_seller_id(item)
+        seller_id = extract_seller_id(fields)
         fingerprint = relist_fingerprint(seller_id, name, price)
 
         # item_type에 "SHOP"이 찍히거나, ID가 일반 매물 형식(m+숫자)이 아니면 숍스 상품으로 간주합니다.
-        item_type = str(extract_field(item, ["item_type"], "")).upper()
+        item_type = str(extract_field(fields, ["item_type"], "")).upper()
         is_shop_item = "SHOP" in item_type or not MERCARI_ITEM_ID_PATTERN.match(str(item_id))
         item_url = (
             f"https://jp.mercari.com/shops/product/{item_id}"
@@ -373,24 +753,49 @@ async def check_keyword(
         if item_id in seen:
             record = price_record(seen, item_id)
         else:
-            # 새로 보이는 ID지만, 같은 판매자(또는 같은 제목+가격)의 지문이 이미 있다면
-            # 삭제 후 재등록된 매물로 보고 예전 가격 이력을 새 ID로 이어받습니다.
+            # 처음 보는 ID지만 지문이 이미 있다면 두 가지 경우입니다.
+            # 1) 같은 ID의 지문이 남아 있음 -> 예전에 확인했는데 seen 용량 상한 때문에 밀려난 매물.
+            # 2) 다른 ID의 지문 -> 같은 판매자(또는 같은 제목+가격)가 삭제 후 재등록한 매물.
+            # 어느 쪽이든 새 매물이 아니므로, 예전 가격 이력을 이어받고 '신규' 알림을 보내지 않습니다.
             matched = relist_fingerprints.get(fingerprint) if fingerprint else None
-            if matched and matched.get("item_id") != item_id:
-                record = {
-                    "last_alert_price": matched.get("last_alert_price"),
-                    "last_seen_price": matched.get("last_seen_price"),
-                }
-                seen.pop(matched.get("item_id"), None)
-                relist_count += 1
+            matched_id = matched.get("item_id") if matched else None
+            restored = {
+                "last_alert_price": matched.get("last_alert_price"),
+                "last_seen_price": matched.get("last_seen_price"),
+            } if matched else None
+
+            if matched and matched_id == item_id:
+                # 같은 ID의 지문이 남아 있음 = 예전에 확인했는데 seen에서만 밀려난 매물.
+                record = restored
+            elif matched and matched_id is not None:
+                if not can_resolve_relists:
+                    # 등록순만 훑은 '빠른 조회'에서는 이 매물이 재출품인지, 제목이 우연히
+                    # 같은 별개의 매물인지 가릴 근거(전체 매물 목록)가 없습니다.
+                    # 잘못 판단하면 알림이 새거나 삼켜지므로, 이번 실행에서는 상태를
+                    # 건드리지 않고 다음 전체 조회(최대 5분 뒤)에 맡깁니다.
+                    deferred_count += 1
+                    continue
+                # 지문의 주인이 지금도 버젓이 올라와 있다면 재출품이 아니라 별개의 매물입니다.
+                # 특히 판매자 ID를 알 수 없는 숍스 상품에서 이 혼동이 잦은데,
+                # 그대로 두면 진짜 새 매물 알림이 조용히 삼켜집니다.
+                if matched_id in listed_ids:
+                    record = None
+                else:
+                    record = restored
+                    relist_count += 1
             else:
                 record = None
 
         if record is None:
-            seen[item_id] = {"last_alert_price": price, "last_seen_price": price}
-            caption = f"[{keyword}] {name}\n💴 {price_txt}\n🔗 {item_url}"
-            new_items.append({"alert_id": f"new:{item_id}", "caption": caption, "photo": photo})
-            new_count += 1
+            remember(seen, item_id, {"last_alert_price": price, "last_seen_price": price})
+            if is_fresh_listing(listing_created_at(fields), created_cutoff):
+                caption = f"[{keyword}] {name}\n💴 {price_txt}\n🔗 {item_url}"
+                new_items.append({"alert_id": f"new:{item_id}", "caption": caption, "photo": photo})
+                new_count += 1
+            else:
+                # 등록 시각이 기준선보다 한참 예전인 매물입니다. 상태 파일에서 밀려났거나
+                # 검색 정렬이 흔들려 이제야 눈에 띈 것뿐이므로, 기준선만 저장하고 넘어갑니다.
+                stale_count += 1
         else:
             # last_alert_price: 실제로 알림을 보낸 적 있는 '역대 최저가' 기준입니다.
             #   가격이 올랐다가 다시 내려와도 이 값보다 위에 머무는 한 알림을 보내지 않고,
@@ -418,45 +823,154 @@ async def check_keyword(
             else:
                 last_alert_price = price
 
-            seen[item_id] = {"last_alert_price": last_alert_price, "last_seen_price": last_seen_price}
+            remember(
+                seen,
+                item_id,
+                {"last_alert_price": last_alert_price, "last_seen_price": last_seen_price},
+            )
 
         if fingerprint:
-            relist_fingerprints[fingerprint] = {
-                "item_id": item_id,
-                "last_alert_price": seen[item_id]["last_alert_price"],
-                "last_seen_price": seen[item_id]["last_seen_price"],
-            }
+            remember(
+                relist_fingerprints,
+                fingerprint,
+                {
+                    "item_id": item_id,
+                    "last_alert_price": seen[item_id]["last_alert_price"],
+                    "last_seen_price": seen[item_id]["last_seen_price"],
+                },
+            )
 
     print(
-        f"[{keyword}] 검색 {len(results.items)}개 확인 "
-        f"(신규 {new_count}개, 재출품 {relist_count}개, 가격인하 {drop_count}개)"
+        f"[{keyword}] 검색 {len(items)}개 확인 "
+        f"(신규 {new_count}개, 재출품 {relist_count}개, 가격인하 {drop_count}개, "
+        f"오래된 매물 {stale_count}개 조용히 기록"
+        + (f", 판정 보류 {deferred_count}개" if deferred_count else "")
+        + ")"
     )
+
+
+def report_feed_health(searched: list) -> None:
+    """메루카리 응답이 기대대로 오는지 실행마다 한 줄로 요약합니다.
+
+    '오래된 매물을 신규로 오인하지 않는' 방어선은 매물의 등록 시각(created)에 기대고 있는데,
+    이 필드는 응답에 따라 비어 있을 수 있습니다. 비어 있으면 조용히 예전 방식(상태 파일만
+    보고 판단)으로 되돌아가기 때문에, 눈치채지 못한 채 지나가지 않도록 로그를 남깁니다.
+    """
+    total = 0
+    with_created = 0
+    unknown_seller = 0
+    for _keyword, items, checked, _coverage, _cutoff in searched:
+        if not checked:
+            continue
+        for fields in items:
+            total += 1
+            if listing_created_at(fields) is not None:
+                with_created += 1
+            if not extract_seller_id(fields):
+                unknown_seller += 1
+
+    failed = [keyword for keyword, _items, checked, _c, _cut in searched if not checked]
+    if failed:
+        print(f"[점검] 조회 실패한 키워드 {len(failed)}개: {', '.join(failed)}", file=sys.stderr)
+    if not total:
+        print("[점검] 이번 실행에서 확인한 매물이 없습니다", file=sys.stderr)
+        return
+
+    print(
+        f"[점검] 매물 {total}개 확인 / 등록시각 있음 {with_created}개 / 판매자ID 모름 {unknown_seller}개"
+    )
+    if not with_created:
+        print(
+            "[경고] 등록 시각(created)이 하나도 채워지지 않았습니다. "
+            "'오래된 매물을 신규로 오인하지 않는' 방어선이 상태 파일 기준으로만 동작합니다.",
+            file=sys.stderr,
+        )
 
 
 async def collect_updates() -> None:
     mercari = Mercapi()
-    seen, pending, sent_alerts, relist_fingerprints, known_keywords = load_state()
+    seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at = load_state()
     is_first_run = len(seen) == 0
     new_items: list = []
+    now = current_time()
 
-    for search in SEARCHES:
+    # 짧은 주기(예: 1분)로 돌릴 때, 매번 추천순까지 조회하면 실행이 주기를 넘겨
+    # 트리거가 버려지고 메루카리 API 호출량만 두 배가 됩니다.
+    # 새 매물 탐지는 등록순만으로 충분하므로, 추천순(가격 인하 추적)은 일정 간격으로만 봅니다.
+    last_full_scan = keyword_checked_at.get(FULL_SCAN_STATE_KEY)
+    full_scan = (
+        not isinstance(last_full_scan, (int, float))
+        or now - float(last_full_scan) >= FULL_SCAN_INTERVAL_SECONDS
+    )
+    sort_passes = None if full_scan else [NEW_ITEM_SORT_PASS]
+    print("전체 조회(등록순+추천순)" if full_scan else "빠른 조회(등록순만)")
+
+    # 1단계: 모든 키워드를 먼저 조회합니다.
+    # 판정을 뒤로 미루는 이유는, 재출품 여부를 판단할 때 '이번 실행에서 살아 있는 것이
+    # 확인된 매물' 전체를 봐야 별개의 매물을 재출품으로 오인하지 않기 때문입니다.
+    searched: list[tuple[str, list, bool, bool, float]] = []
+    for index, search in enumerate(SEARCHES):
+        if index:
+            await asyncio.sleep(1)
         keyword = search["query"]
-        keyword_is_new = keyword not in known_keywords
-        keyword_items: list = []
-        await check_keyword(mercari, keyword, search["categories"], seen, relist_fingerprints, keyword_items)
+        cutoff = new_item_cutoff(keyword_checked_at, keyword, now)
+        items, checked, coverage = await search_items(
+            mercari, keyword, search["categories"], cutoff, sort_passes
+        )
+        searched.append((keyword, items, checked, coverage, cutoff))
 
-        if keyword_is_new:
-            # 이 키워드를 처음 조회하는 실행입니다. 기존에 이미 올라와 있던 매물이 전부
-            # '신규'로 잡혀 알림 폭탄이 되는 걸 막기 위해, 기준선(seen)만 저장하고
-            # 이번 조회분의 알림은 보내지 않습니다. 다음 조회부터는 정상적으로 알림이 옵니다.
+    # 검색에 잡혔다는 것 자체가 '지금 살아 있다'는 증거이므로, 부분적으로만 성공한
+    # 키워드의 결과도 재출품 판정용 목록에는 넣습니다.
+    listed_ids: set[str] = set()
+    for _keyword, items, checked, _coverage, _cutoff in searched:
+        if checked:
+            listed_ids |= listed_item_ids(items)
+
+    report_feed_health(searched)
+
+    # 2단계: 모아 둔 결과로 알림을 판정합니다.
+    for keyword, items, checked, coverage, cutoff in searched:
+        keyword_is_new = keyword not in known_keywords
+        # 조회 시각 기록이 아직 없는 키워드는 '신규' 판정의 기준선이 없는 상태입니다.
+        # 새로 추가한 키워드일 수도 있고, 이 기능을 배포한 직후의 첫 실행일 수도 있습니다.
+        # 어느 쪽이든 이번 조회분은 기준선만 저장하고 넘어가야 알림 폭탄을 피할 수 있습니다.
+        baseline_only = keyword_is_new or keyword not in keyword_checked_at
+        keyword_items: list = []
+        if checked:
+            process_items(
+                keyword,
+                items,
+                seen,
+                relist_fingerprints,
+                keyword_items,
+                created_cutoff=cutoff,
+                listed_ids=listed_ids,
+                can_resolve_relists=full_scan,
+            )
+
+        if baseline_only:
+            # 기존에 이미 올라와 있던 매물이 전부 '신규'로 잡혀 알림 폭탄이 되는 걸 막기 위해,
+            # 기준선(seen)만 저장하고 이번 조회분의 신규 알림은 보내지 않습니다.
+            # 다음 조회부터는 정상적으로 알림이 옵니다. (가격 인하 알림은 이미 추적 중인
+            # 매물에만 해당하므로 그대로 내보냅니다.)
             suppressed = sum(1 for e in keyword_items if e["alert_id"].startswith("new:"))
             if suppressed:
-                print(f"[{keyword}] 새로 추가된 키워드 첫 조회: 매물 {suppressed}개 기준선만 저장, 알림 생략")
+                reason = "새로 추가된 키워드" if keyword_is_new else "기준선 최초 기록"
+                print(f"[{keyword}] {reason} 첫 조회: 매물 {suppressed}개 기준선만 저장, 알림 생략")
             keyword_items = [e for e in keyword_items if not e["alert_id"].startswith("new:")]
-            known_keywords.add(keyword)
+            if keyword_is_new and checked:
+                known_keywords.add(keyword)
 
         new_items.extend(keyword_items)
-        await asyncio.sleep(1)
+        # 등록순 조회에 실패한 키워드는 시각을 갱신하지 않습니다. 갱신해 버리면 그 구간에
+        # 올라온 매물을 다음 실행에서 '오래된 매물'로 보고 영영 건너뜁니다.
+        if coverage:
+            keyword_checked_at[keyword] = now
+        elif checked:
+            print(f"[{keyword}] 등록순 조회 실패 -> 조회 시각을 갱신하지 않고 다음 실행에서 다시 확인합니다")
+
+    if full_scan and any(coverage for _k, _i, _c, coverage, _cut in searched):
+        keyword_checked_at[FULL_SCAN_STATE_KEY] = now
 
     if is_first_run:
         print(f"첫 실행: 기존 매물 {len(seen)}개를 기준으로 저장했습니다 (알림 생략)")
@@ -464,22 +978,24 @@ async def collect_updates() -> None:
         pending = deduplicate_pending(pending + new_items, sent_alerts)
         print(f"새 알림 {len(new_items)}건 발견 (저장될 대기열 {len(pending)}건)")
 
-    save_state(seen, pending, sent_alerts, relist_fingerprints, known_keywords)
+    save_state(seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at)
 
 
 async def send_pending() -> None:
-    seen, pending, sent_alerts, relist_fingerprints, known_keywords = load_state()
+    seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at = load_state()
     pending = deduplicate_pending(pending, sent_alerts)
 
     if not pending:
         print("전송할 대기 알림이 없습니다")
-        save_state(seen, pending, sent_alerts, relist_fingerprints, known_keywords)
+        save_state(seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at)
         return
 
     try:
-        pending, sent_alerts = await flush_pending(seen, pending, sent_alerts, relist_fingerprints, known_keywords)
+        pending, sent_alerts = await flush_pending(
+            seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at
+        )
     finally:
-        save_state(seen, pending, sent_alerts, relist_fingerprints, known_keywords)
+        save_state(seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at)
 
     if pending:
         print(f"[대기열에 {len(pending)}건 남음 -> 다음 실행에 재시도]", file=sys.stderr)

@@ -1,0 +1,3 @@
+__pycache__/
+*.pyc
+seen_items.tmp
