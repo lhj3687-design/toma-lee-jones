@@ -72,40 +72,37 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://jp.mercari.com/shops/product/2JUHeREMxTVqFa42uQFwEc", new_items[0]["caption"])
         self.assertIn("https://jp.mercari.com/item/m90925725213", new_items[1]["caption"])
 
-    async def test_check_keyword_ignores_small_drops_until_they_accumulate_past_threshold(self):
-        seen = {"item": 10000}
-        new_items = []
-        fake_api = FakeMercapi({"test": [FakeItem("item", "Small drop", 9900)]})
+    async def test_check_keyword_never_raises_alert_baseline_scenario_from_advisor(self):
+        # 조언받은 시나리오 그대로 검증:
+        # 50000->48000(알림) ->55000(상승, 알림기준 불변) ->54000(알림기준 48000보다 안 쌈, 알림 없음)
+        # ->46000(48000보다 1000엔 이상 싸짐, 알림)
+        seen = {}
+        new_items: list = []
 
-        # 100엔 하락 -> 기준가(1000엔 미만)라 알림 없음, 기준가도 그대로 유지
-        await mercari.check_keyword(fake_api, "test", [], seen, new_items)
+        async def observe(price):
+            new_items.clear()
+            api = FakeMercapi({"test": [FakeItem("item", "Margiela bag", price)]})
+            await mercari.check_keyword(api, "test", [], seen, new_items)
+
+        await observe(50000)  # 신규 매물 -> '신규' 알림은 발생 (가격인하 알림 대상 아님)
+        self.assertEqual([e["alert_id"] for e in new_items], ["new:item"])
+        self.assertEqual(seen["item"], {"last_alert_price": 50000, "last_seen_price": 50000})
+
+        await observe(48000)  # 2000엔 하락 -> 알림
+        self.assertEqual([e["alert_id"] for e in new_items], ["drop:item:50000:48000"])
+        self.assertEqual(seen["item"], {"last_alert_price": 48000, "last_seen_price": 48000})
+
+        await observe(55000)  # 가격 상승 -> 알림 없음, last_alert_price는 그대로
         self.assertEqual(new_items, [])
-        self.assertEqual(seen["item"], 10000)
+        self.assertEqual(seen["item"], {"last_alert_price": 48000, "last_seen_price": 55000})
 
-        # 다시 100엔 더 떨어져 누적 900엔 -> 아직 1000엔 미만이라 알림 없음
-        fake_api.items_by_keyword["test"] = [FakeItem("item", "Small drop", 9100)]
-        await mercari.check_keyword(fake_api, "test", [], seen, new_items)
+        await observe(54000)  # 역대 최저가(48000)보다 안 쌈 -> 알림 없음
         self.assertEqual(new_items, [])
-        self.assertEqual(seen["item"], 10000)
+        self.assertEqual(seen["item"], {"last_alert_price": 48000, "last_seen_price": 54000})
 
-        # 다시 200엔 더 떨어져 기준가 대비 누적 1100엔 하락 -> 이제 알림 발생, 기준가도 갱신
-        fake_api.items_by_keyword["test"] = [FakeItem("item", "Big enough drop", 8900)]
-        await mercari.check_keyword(fake_api, "test", [], seen, new_items)
-        self.assertEqual(
-            [entry["alert_id"] for entry in new_items],
-            ["drop:item:10000:8900"],
-        )
-        self.assertEqual(seen["item"], 8900)
-
-    async def test_check_keyword_raises_baseline_when_price_increases(self):
-        seen = {"item": 10000}
-        new_items = []
-        fake_api = FakeMercapi({"test": [FakeItem("item", "Price up", 12000)]})
-
-        await mercari.check_keyword(fake_api, "test", [], seen, new_items)
-
-        self.assertEqual(new_items, [])
-        self.assertEqual(seen["item"], 12000)
+        await observe(46000)  # 48000보다 2000엔 싸짐 -> 알림, 새 최저가로 갱신
+        self.assertEqual([e["alert_id"] for e in new_items], ["drop:item:48000:46000"])
+        self.assertEqual(seen["item"], {"last_alert_price": 46000, "last_seen_price": 46000})
 
     async def test_check_keyword_assigns_unique_keys_for_new_and_price_drop(self):
         seen = {"old-item": 12000}
@@ -119,7 +116,13 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         await mercari.check_keyword(fake_api, "test", [], seen, new_items)
-        self.assertEqual(seen, {"old-item": 9000, "new-item": 15000})
+        self.assertEqual(
+            seen,
+            {
+                "old-item": {"last_alert_price": 9000, "last_seen_price": 9000},
+                "new-item": {"last_alert_price": 15000, "last_seen_price": 15000},
+            },
+        )
         self.assertEqual(
             [entry["alert_id"] for entry in new_items],
             ["drop:old-item:12000:9000", "new:new-item"],
@@ -158,7 +161,13 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             [entry["alert_id"] for entry in collected["pending"]],
             ["drop:old-item:12000:9000", "new:new-item"],
         )
-        self.assertEqual(collected["seen"], {"old-item": 9000, "new-item": 15000})
+        self.assertEqual(
+            collected["seen"],
+            {
+                "old-item": {"last_alert_price": 9000, "last_seen_price": 9000},
+                "new-item": {"last_alert_price": 15000, "last_seen_price": 15000},
+            },
+        )
 
         with patch.object(mercari, "send_telegram", new=AsyncMock(return_value=(True, None))), patch.object(
             mercari, "push_state", return_value=True
