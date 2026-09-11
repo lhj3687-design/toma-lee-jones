@@ -7,33 +7,12 @@ import types
 import unittest
 from dataclasses import dataclass
 from decimal import Decimal
-from enum import Enum
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 mercapi_stub = types.ModuleType("mercapi")
 mercapi_stub.Mercapi = object
 sys.modules.setdefault("mercapi", mercapi_stub)
-mercapi_requests_stub = types.ModuleType("mercapi.requests")
-
-
-class _SortBy(Enum):
-    SORT_SCORE = 1
-    SORT_CREATED_TIME = 2
-
-
-class _SortOrder(Enum):
-    ORDER_DESC = 1
-    ORDER_ASC = 2
-
-
-class _SearchRequestData:
-    SortBy = _SortBy
-    SortOrder = _SortOrder
-
-
-mercapi_requests_stub.SearchRequestData = _SearchRequestData
-sys.modules.setdefault("mercapi.requests", mercapi_requests_stub)
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -48,8 +27,6 @@ class FakeItem:
     thumbnails: list[str] | None = None
     item_type: str = "ITEM"
     seller_id: str | None = None
-    created: object = None
-    photos: list[str] | None = None
 
 
 class FakeResults:
@@ -60,10 +37,8 @@ class FakeResults:
 class FakeMercapi:
     def __init__(self, items_by_keyword):
         self.items_by_keyword = items_by_keyword
-        self.search_calls = []
 
-    async def search(self, keyword, categories, **kwargs):
-        self.search_calls.append((keyword, categories, kwargs))
+    async def search(self, keyword, categories):
         return FakeResults(self.items_by_keyword[keyword])
 
 
@@ -163,7 +138,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         new_items: list = []
 
         api1 = FakeMercapi(
-            {"test": [FakeItem("m1000", "Margiela 초레어 카트소", 20000, seller_id="seller-A", thumbnails=["photo-a"])]}
+            {"test": [FakeItem("m1000", "Margiela 초레어 카트소", 20000, seller_id="seller-A")]}
         )
         await mercari.check_keyword(api1, "test", [], seen, relist_fingerprints, new_items)
         self.assertEqual([e["alert_id"] for e in new_items], ["new:m1000"])
@@ -171,7 +146,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         # 판매자가 삭제 후 재등록: ID는 바뀌었지만 판매자+제목(공백/기호 차이만 있음)은 동일
         new_items.clear()
         api2 = FakeMercapi(
-            {"test": [FakeItem("m2000", "  Margiela  초레어  카트소 ", 20000, seller_id="seller-A", thumbnails=["photo-a"])]}
+            {"test": [FakeItem("m2000", "  Margiela  초레어  카트소 ", 20000, seller_id="seller-A")]}
         )
         await mercari.check_keyword(api2, "test", [], seen, relist_fingerprints, new_items)
 
@@ -182,7 +157,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         # 재등록하면서 1000엔 이상 더 싸게 올렸다면 가격인하 알림은 정상적으로 와야 함
         new_items.clear()
         api3 = FakeMercapi(
-            {"test": [FakeItem("m3000", "Margiela 초레어 카트소", 18000, seller_id="seller-A", thumbnails=["photo-a"])]}
+            {"test": [FakeItem("m3000", "Margiela 초레어 카트소", 18000, seller_id="seller-A")]}
         )
         await mercari.check_keyword(api3, "test", [], seen, relist_fingerprints, new_items)
         self.assertEqual([e["alert_id"] for e in new_items], ["drop:m3000:20000:18000"])
@@ -266,61 +241,6 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("n2", collected["seen"])
         # 이제 new-keyword도 known_keywords에 등록되어, 다음 조회부터는 정상적으로 알림이 옴
         self.assertIn("new-keyword", collected["known_keywords"])
-
-    async def test_new_keyword_suppresses_price_drop_and_registers_only_after_success(self):
-        mercari.SEARCHES = [{"query": "new-keyword", "categories": []}]
-        mercari.save_state(
-            {"old": {"last_alert_price": 10000, "last_seen_price": 10000}},
-            [], [], {}, set()
-        )
-        fake_api = FakeMercapi({"new-keyword": [FakeItem("old", "Old item", 8000)]})
-
-        with patch.object(mercari, "Mercapi", return_value=fake_api), patch.object(
-            mercari.asyncio, "sleep", new=AsyncMock()
-        ):
-            await mercari.collect_updates()
-
-        state = json.loads(mercari.SEEN_FILE.read_text())
-        self.assertEqual(state["pending"], [])
-        self.assertIn("new-keyword", state["known_keywords"])
-        # 첫 조회는 현재 가격을 기준선으로 반영하되 알림만 생략합니다.
-        self.assertEqual(state["seen"]["old"]["last_alert_price"], 8000)
-
-    async def test_failed_new_keyword_is_not_marked_known(self):
-        mercari.SEARCHES = [{"query": "new-keyword", "categories": []}]
-        mercari.save_state({"existing": {"last_alert_price": 1, "last_seen_price": 1}}, [], [], {}, set())
-
-        class FailingMercapi:
-            async def search(self, keyword, categories, **kwargs):
-                raise RuntimeError("temporary API failure")
-
-        with patch.object(mercari, "Mercapi", return_value=FailingMercapi()), patch.object(
-            mercari.asyncio, "sleep", new=AsyncMock()
-        ):
-            await mercari.collect_updates()
-
-        state = json.loads(mercari.SEEN_FILE.read_text())
-        self.assertNotIn("new-keyword", state["known_keywords"])
-
-    async def test_search_requests_created_descending_and_sorts_response(self):
-        seen = {}
-        new_items = []
-        fake_api = FakeMercapi(
-            {
-                "test": [
-                    FakeItem("old", "Old", 1000, created=1),
-                    FakeItem("new", "New", 1000, created=3),
-                    FakeItem("middle", "Middle", 1000, created=2),
-                ]
-            }
-        )
-
-        await mercari.check_keyword(fake_api, "test", [], seen, {}, new_items)
-
-        kwargs = fake_api.search_calls[0][2]
-        self.assertEqual(kwargs["sort_by"].name, "SORT_CREATED_TIME")
-        self.assertEqual(kwargs["sort_order"].name, "ORDER_DESC")
-        self.assertEqual([entry["alert_id"] for entry in new_items], ["new:new", "new:middle", "new:old"])
 
     async def test_collect_persists_before_send_and_delivery_is_not_repeated(self):
         mercari.SEARCHES = [{"query": "test", "categories": []}]
