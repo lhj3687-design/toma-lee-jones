@@ -51,6 +51,9 @@ PRICE_DROP_ALERT_THRESHOLD = 1000  # 마지막 알림 가격보다 이 금액(�
 MAX_PENDING_ALERTS = 500
 MAX_SENT_ALERTS = 8000
 
+# 마지막 '전체 조회' 시각을 담는 예약 키입니다(키워드 이름과 겹치지 않도록 표시를 붙였습니다).
+FULL_SCAN_STATE_KEY = "__full_scan__"
+
 # 전송 단계는 알림 하나마다 git push까지 하기 때문에 한 건당 수 초가 걸립니다.
 # 한 실행이 5분 크론을 넘겨 다음 실행이 줄줄이 밀리지 않도록 한 번에 보낼 양을 제한하고,
 # 남은 알림은 다음 실행에서 이어서 보냅니다(대기열은 그대로 보존됩니다).
@@ -149,9 +152,16 @@ SEARCH_SORT_OPTIONS = build_search_options()
 # 놓친 것이므로, 해당 키워드의 조회 시각을 갱신하면 안 됩니다.
 NEW_ITEM_SORT_PASS = "created"
 
+# 1분처럼 짧은 주기로 돌릴 때를 위한 구분입니다.
+# - 빠른 조회: 등록순만 봅니다. 새 매물을 놓치지 않는 데는 이것만으로 충분하고,
+#   실행 시간과 메루카리 API 호출량이 절반으로 줄어 짧은 주기에서도 밀리지 않습니다.
+# - 전체 조회: 추천순까지 함께 봐서 오래 올라와 있는 매물의 가격 인하도 확인합니다.
+FULL_SCAN_INTERVAL_SECONDS = 5 * 60
+
 
 def load_state() -> tuple[dict, list, list, dict, set, dict]:
     empty = ({}, [], [], {}, set(LEGACY_KEYWORDS_SEEDED_AT_UPGRADE), {})
+
     if not SEEN_FILE.exists():
         return empty
     try:
@@ -175,7 +185,9 @@ def load_state() -> tuple[dict, list, list, dict, set, dict]:
         else set(LEGACY_KEYWORDS_SEEDED_AT_UPGRADE)
     )
     raw_checked_at = data.get("keyword_checked_at")
-    keyword_checked_at = raw_checked_at if isinstance(raw_checked_at, dict) else {}
+    keyword_checked_at = dict(raw_checked_at) if isinstance(raw_checked_at, dict) else {}
+    # 마지막 '전체 조회' 시각은 keyword_checked_at 안에 예약 키로 같이 보관합니다.
+    # (상태 파일 형식과 병합 로직을 그대로 두면서 값 하나만 늘리기 위한 선택입니다.)
 
     return (
         seen if isinstance(seen, dict) else {},
@@ -422,6 +434,8 @@ def new_item_cutoff(keyword_checked_at: dict, keyword: str, now: float) -> float
     - 조회 기록이 없으면(업그레이드 직후 첫 실행) 최근 1시간만 신규로 봅니다.
     - 봇이 오래 멈춰 있었다면 최대 24시간까지만 거슬러 올라갑니다.
     """
+    if keyword == FULL_SCAN_STATE_KEY:
+        return now - FIRST_RUN_LOOKBACK_SECONDS
     last_checked = keyword_checked_at.get(keyword)
     if not isinstance(last_checked, (int, float)):
         return now - FIRST_RUN_LOOKBACK_SECONDS
@@ -597,7 +611,11 @@ def wants_another_page(pass_name: str, results, items: list, created_cutoff: flo
 
 
 async def search_items(
-    m: Mercapi, keyword: str, categories: list, created_cutoff: float | None = None
+    m: Mercapi,
+    keyword: str,
+    categories: list,
+    created_cutoff: float | None = None,
+    sort_passes: list[str] | None = None,
 ) -> tuple[list[dict], bool, bool]:
     """한 키워드를 '등록순'과 '추천순' 두 가지로 조회해 매물 목록을 합칩니다.
 
@@ -615,7 +633,9 @@ async def search_items(
     merged: dict = {}
     succeeded = False
     new_item_coverage = False
-    for index, (pass_name, options) in enumerate(SEARCH_SORT_OPTIONS.items()):
+    passes = sort_passes if sort_passes is not None else list(SEARCH_SORT_OPTIONS)
+    for index, pass_name in enumerate(passes):
+        options = SEARCH_SORT_OPTIONS.get(pass_name, {})
         if index:
             await asyncio.sleep(1)
         results = None
@@ -644,7 +664,7 @@ async def search_items(
                 break
             print(f"[{keyword}] 신규 매물이 한 페이지를 가득 채워 다음 페이지도 확인합니다")
             await asyncio.sleep(1)
-    if NEW_ITEM_SORT_PASS not in SEARCH_SORT_OPTIONS:
+    if NEW_ITEM_SORT_PASS not in passes:
         # 등록순 조회를 쓸 수 없는 예외 상황(정렬 옵션 준비 실패)에서는
         # 예전처럼 '한 번이라도 성공했는지'로 판단합니다.
         new_item_coverage = succeeded
@@ -681,6 +701,7 @@ def process_items(
     new_items: list,
     created_cutoff: float | None = None,
     listed_ids: set[str] | None = None,
+    can_resolve_relists: bool = True,
 ) -> None:
     """검색 결과를 보고 신규/가격인하 알림을 만들고 상태를 갱신합니다.
 
@@ -696,6 +717,7 @@ def process_items(
     drop_count = 0
     relist_count = 0
     stale_count = 0
+    deferred_count = 0
     for fields in items:
         item_id = extract_item_id(fields)
         if not item_id:
@@ -733,17 +755,29 @@ def process_items(
             # 어느 쪽이든 새 매물이 아니므로, 예전 가격 이력을 이어받고 '신규' 알림을 보내지 않습니다.
             matched = relist_fingerprints.get(fingerprint) if fingerprint else None
             matched_id = matched.get("item_id") if matched else None
-            # 지문의 주인이 지금도 버젓이 올라와 있다면, 이 매물은 재출품이 아니라
-            # 제목(과 가격)이 우연히 같은 '별개의 매물'입니다. 특히 판매자 ID를 알 수 없는
-            # 숍스 상품에서 이 혼동이 잦은데, 그대로 두면 진짜 새 매물 알림이 조용히 삼켜집니다.
-            is_same_item_seen_before = matched_id == item_id
-            is_gone_and_relisted = matched_id is not None and matched_id not in listed_ids
-            if matched and (is_same_item_seen_before or is_gone_and_relisted):
-                record = {
-                    "last_alert_price": matched.get("last_alert_price"),
-                    "last_seen_price": matched.get("last_seen_price"),
-                }
-                if not is_same_item_seen_before:
+            restored = {
+                "last_alert_price": matched.get("last_alert_price"),
+                "last_seen_price": matched.get("last_seen_price"),
+            } if matched else None
+
+            if matched and matched_id == item_id:
+                # 같은 ID의 지문이 남아 있음 = 예전에 확인했는데 seen에서만 밀려난 매물.
+                record = restored
+            elif matched and matched_id is not None:
+                if not can_resolve_relists:
+                    # 등록순만 훑은 '빠른 조회'에서는 이 매물이 재출품인지, 제목이 우연히
+                    # 같은 별개의 매물인지 가릴 근거(전체 매물 목록)가 없습니다.
+                    # 잘못 판단하면 알림이 새거나 삼켜지므로, 이번 실행에서는 상태를
+                    # 건드리지 않고 다음 전체 조회(최대 5분 뒤)에 맡깁니다.
+                    deferred_count += 1
+                    continue
+                # 지문의 주인이 지금도 버젓이 올라와 있다면 재출품이 아니라 별개의 매물입니다.
+                # 특히 판매자 ID를 알 수 없는 숍스 상품에서 이 혼동이 잦은데,
+                # 그대로 두면 진짜 새 매물 알림이 조용히 삼켜집니다.
+                if matched_id in listed_ids:
+                    record = None
+                else:
+                    record = restored
                     relist_count += 1
             else:
                 record = None
@@ -805,7 +839,9 @@ def process_items(
     print(
         f"[{keyword}] 검색 {len(items)}개 확인 "
         f"(신규 {new_count}개, 재출품 {relist_count}개, 가격인하 {drop_count}개, "
-        f"오래된 매물 {stale_count}개 조용히 기록)"
+        f"오래된 매물 {stale_count}개 조용히 기록"
+        + (f", 판정 보류 {deferred_count}개" if deferred_count else "")
+        + ")"
     )
 
 
@@ -854,6 +890,17 @@ async def collect_updates() -> None:
     new_items: list = []
     now = current_time()
 
+    # 짧은 주기(예: 1분)로 돌릴 때, 매번 추천순까지 조회하면 실행이 주기를 넘겨
+    # 트리거가 버려지고 메루카리 API 호출량만 두 배가 됩니다.
+    # 새 매물 탐지는 등록순만으로 충분하므로, 추천순(가격 인하 추적)은 일정 간격으로만 봅니다.
+    last_full_scan = keyword_checked_at.get(FULL_SCAN_STATE_KEY)
+    full_scan = (
+        not isinstance(last_full_scan, (int, float))
+        or now - float(last_full_scan) >= FULL_SCAN_INTERVAL_SECONDS
+    )
+    sort_passes = None if full_scan else [NEW_ITEM_SORT_PASS]
+    print("전체 조회(등록순+추천순)" if full_scan else "빠른 조회(등록순만)")
+
     # 1단계: 모든 키워드를 먼저 조회합니다.
     # 판정을 뒤로 미루는 이유는, 재출품 여부를 판단할 때 '이번 실행에서 살아 있는 것이
     # 확인된 매물' 전체를 봐야 별개의 매물을 재출품으로 오인하지 않기 때문입니다.
@@ -864,7 +911,7 @@ async def collect_updates() -> None:
         keyword = search["query"]
         cutoff = new_item_cutoff(keyword_checked_at, keyword, now)
         items, checked, coverage = await search_items(
-            mercari, keyword, search["categories"], cutoff
+            mercari, keyword, search["categories"], cutoff, sort_passes
         )
         searched.append((keyword, items, checked, coverage, cutoff))
 
@@ -894,6 +941,7 @@ async def collect_updates() -> None:
                 keyword_items,
                 created_cutoff=cutoff,
                 listed_ids=listed_ids,
+                can_resolve_relists=full_scan,
             )
 
         if baseline_only:
@@ -916,6 +964,9 @@ async def collect_updates() -> None:
             keyword_checked_at[keyword] = now
         elif checked:
             print(f"[{keyword}] 등록순 조회 실패 -> 조회 시각을 갱신하지 않고 다음 실행에서 다시 확인합니다")
+
+    if full_scan and any(coverage for _k, _i, _c, coverage, _cut in searched):
+        keyword_checked_at[FULL_SCAN_STATE_KEY] = now
 
     if is_first_run:
         print(f"첫 실행: 기존 매물 {len(seen)}개를 기준으로 저장했습니다 (알림 생략)")

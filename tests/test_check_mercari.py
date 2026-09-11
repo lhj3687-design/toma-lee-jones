@@ -729,14 +729,28 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         first = FakeItem("m1", "완전히 같은 제목", 5000, seller_id="seller-A")
         second = FakeItem("m2", "완전히 같은 제목", 5000, seller_id="seller-A")
 
-        # 1회차: kw-a에서 m1만 보임
-        with patch.object(mercari, "Mercapi", return_value=FakeMercapi({"kw-a": [first], "kw-b": []})):
+        base = datetime.now().timestamp()
+
+        # 1회차(전체 조회): kw-a에서 m1만 보임
+        with patch.object(mercari, "Mercapi", return_value=FakeMercapi({"kw-a": [first], "kw-b": []})), \
+             patch.object(mercari, "current_time", return_value=base):
             await mercari.collect_updates()
 
-        # 2회차: kw-a에는 m1, kw-b에는 m2가 각각 보임 -> m2는 별개의 새 매물
+        # 2회차(빠른 조회, 1분 뒤): m2가 재출품인지 별개 매물인지 가릴 근거가 없으므로
+        # 상태를 건드리지 않고 판정을 미룹니다.
         with patch.object(
             mercari, "Mercapi", return_value=FakeMercapi({"kw-a": [first], "kw-b": [second]})
-        ):
+        ), patch.object(mercari, "current_time", return_value=base + 60):
+            await mercari.collect_updates()
+
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        self.assertEqual(state["pending"], [])
+        self.assertNotIn("m2", state["seen"])  # 다음 전체 조회에 맡김
+
+        # 3회차(전체 조회, 6분 뒤): 두 매물이 동시에 살아 있음이 확인되므로 새 매물로 알림
+        with patch.object(
+            mercari, "Mercapi", return_value=FakeMercapi({"kw-a": [first], "kw-b": [second]})
+        ), patch.object(mercari, "current_time", return_value=base + 360):
             await mercari.collect_updates()
 
         state = json.loads(mercari.SEEN_FILE.read_text())
@@ -803,6 +817,69 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             await mercari.collect_updates()
 
         self.assertNotIn("[경고]", captured.getvalue())
+
+
+    async def test_quick_scan_only_runs_the_new_item_search(self):
+        # 1분처럼 짧은 주기에서는 등록순만 봅니다(실행 시간과 API 호출량 절반).
+        mercari.SEARCHES = [{"query": "test", "categories": []}]
+        base = datetime.now().timestamp()
+        mercari.save_state(
+            {"x": 1}, [], [], {}, {"test"},
+            {"test": base - 60, mercari.FULL_SCAN_STATE_KEY: base - 60},
+        )
+        api = FakeMercapi({"test": [FakeItem("m1", "item", 1000)]})
+
+        with patch.object(mercari, "Mercapi", return_value=api), patch.object(
+            mercari, "current_time", return_value=base
+        ):
+            await mercari.collect_updates()
+
+        self.assertEqual(len(api.calls), 1)  # 등록순 한 번만
+
+    async def test_full_scan_runs_after_the_interval_and_records_its_time(self):
+        mercari.SEARCHES = [{"query": "test", "categories": []}]
+        base = datetime.now().timestamp()
+        stale = base - mercari.FULL_SCAN_INTERVAL_SECONDS - 1
+        mercari.save_state(
+            {"x": 1}, [], [], {}, {"test"},
+            {"test": base - 60, mercari.FULL_SCAN_STATE_KEY: stale},
+        )
+        api = FakeMercapi({"test": [FakeItem("m1", "item", 1000)]})
+
+        with patch.object(mercari, "Mercapi", return_value=api), patch.object(
+            mercari, "current_time", return_value=base
+        ):
+            await mercari.collect_updates()
+
+        self.assertEqual(len(api.calls), 2)  # 등록순 + 추천순
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        self.assertEqual(state["keyword_checked_at"][mercari.FULL_SCAN_STATE_KEY], base)
+
+    async def test_full_scan_marker_is_not_mistaken_for_a_keyword(self):
+        # 예약 키가 키워드처럼 취급되면 엉뚱한 기준선이 생깁니다.
+        cutoff = mercari.new_item_cutoff(
+            {mercari.FULL_SCAN_STATE_KEY: 0}, mercari.FULL_SCAN_STATE_KEY, 10_000.0
+        )
+        self.assertEqual(cutoff, 10_000.0 - mercari.FIRST_RUN_LOOKBACK_SECONDS)
+
+    async def test_quick_scan_still_alerts_on_brand_new_listings(self):
+        # 빠른 조회에서도 새 매물 알림은 정상적으로 와야 합니다(이게 핵심 목적).
+        mercari.SEARCHES = [{"query": "test", "categories": []}]
+        base = datetime.now().timestamp()
+        mercari.save_state(
+            {"x": 1}, [], [], {}, {"test"},
+            {"test": base - 60, mercari.FULL_SCAN_STATE_KEY: base - 60},
+        )
+        fresh = FakeItem("m-new", "방금 올라옴", 30000, created=datetime.now())
+        api = FakeMercapi({"test": [fresh]})
+
+        with patch.object(mercari, "Mercapi", return_value=api), patch.object(
+            mercari, "current_time", return_value=base
+        ):
+            await mercari.collect_updates()
+
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        self.assertEqual([e["alert_id"] for e in state["pending"]], ["new:m-new"])
 
 
 if __name__ == "__main__":
