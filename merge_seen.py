@@ -90,32 +90,37 @@ def prune_fingerprints(fingerprints: dict) -> dict:
     }
 
 
-mine = read_json("/tmp/mine.json")
-theirs = read_json("/tmp/theirs.json")
+def main() -> None:
+    mine = read_json("/tmp/mine.json")
+    theirs = read_json("/tmp/theirs.json")
 
-merged_seen = merge_ordered(theirs.get("seen", {}), mine.get("seen", {}), MAX_SEEN_ITEMS)
-sent_alerts = unique_recent(theirs.get("sent_alerts", []) + mine.get("sent_alerts", []), MAX_SENT_ALERTS)
-merged_pending = merge_pending(theirs.get("pending", []), mine.get("pending", []), sent_alerts)
-merged_fingerprints = merge_ordered(
-    prune_fingerprints(theirs.get("relist_fingerprints", {})),
-    prune_fingerprints(mine.get("relist_fingerprints", {})),
-    MAX_RELIST_FINGERPRINTS,
-)
-merged_known_keywords = sorted(set(theirs.get("known_keywords", [])) | set(mine.get("known_keywords", [])))
-merged_checked_at = merge_checked_at(
-    theirs.get("keyword_checked_at", {}) or {}, mine.get("keyword_checked_at", {}) or {}
-)
-
-with open("/tmp/merged.json", "w") as file:
-    json.dump(
-        {
-            "seen": merged_seen,
-            "pending": merged_pending,
-            "sent_alerts": sent_alerts,
-            "relist_fingerprints": merged_fingerprints,
-            "known_keywords": merged_known_keywords,
-            "keyword_checked_at": merged_checked_at,
-        },
-        file,
-        ensure_ascii=False,
+    merged_seen = merge_ordered(theirs.get("seen", {}), mine.get("seen", {}), MAX_SEEN_ITEMS)
+    sent_alerts = unique_recent(theirs.get("sent_alerts", []) + mine.get("sent_alerts", []), MAX_SENT_ALERTS)
+    merged_pending = merge_pending(theirs.get("pending", []), mine.get("pending", []), sent_alerts)
+    merged_fingerprints = merge_ordered(
+        prune_fingerprints(theirs.get("relist_fingerprints", {})),
+        prune_fingerprints(mine.get("relist_fingerprints", {})),
+        MAX_RELIST_FINGERPRINTS,
     )
+    merged_known_keywords = sorted(set(theirs.get("known_keywords", [])) | set(mine.get("known_keywords", [])))
+    merged_checked_at = merge_checked_at(
+        theirs.get("keyword_checked_at", {}) or {}, mine.get("keyword_checked_at", {}) or {}
+    )
+
+    with open("/tmp/merged.json", "w") as file:
+        json.dump(
+            {
+                "seen": merged_seen,
+                "pending": merged_pending,
+                "sent_alerts": sent_alerts,
+                "relist_fingerprints": merged_fingerprints,
+                "known_keywords": merged_known_keywords,
+                "keyword_checked_at": merged_checked_at,
+            },
+            file,
+            ensure_ascii=False,
+        )
+
+
+if __name__ == "__main__":
+    main()

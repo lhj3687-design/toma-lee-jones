@@ -1,5 +1,5 @@
-import asyncio
 import importlib
+import io
 import json
 import sys
 import tempfile
@@ -32,9 +32,21 @@ class FakeItem:
     is_no_price: bool = False
 
 
+@dataclass
+class FakeMeta:
+    next_page_token: str = ""
+    prev_page_token: str = ""
+    num_found: int = 0
+
+
 class FakeResults:
-    def __init__(self, items):
+    def __init__(self, items, pages=None):
         self.items = items
+        self.pages = list(pages or [])
+        self.meta = FakeMeta(next_page_token="next" if self.pages else "")
+
+    async def next_page(self):
+        return FakeResults(self.pages[0], self.pages[1:])
 
 
 class FakeMercapi:
@@ -44,16 +56,18 @@ class FakeMercapi:
     호출 횟수를 세어 두 번 불렸는지도 검증할 수 있게 합니다.
     """
 
-    def __init__(self, items_by_keyword, fail_keywords=()):
+    def __init__(self, items_by_keyword, fail_keywords=(), extra_pages_by_keyword=None):
         self.items_by_keyword = items_by_keyword
         self.fail_keywords = set(fail_keywords)
+        self.extra_pages_by_keyword = extra_pages_by_keyword or {}
         self.calls = []
 
     async def search(self, keyword, categories=(), **options):
         self.calls.append((keyword, options))
         if keyword in self.fail_keywords:
             raise RuntimeError("검색 실패 시뮬레이션")
-        return FakeResults(self.items_by_keyword[keyword])
+        pages = self.extra_pages_by_keyword.get(keyword)
+        return FakeResults(self.items_by_keyword[keyword], pages)
 
 
 class MercariStateTests(unittest.IsolatedAsyncioTestCase):
@@ -536,6 +550,186 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         )
         _, _, _, fingerprints, _, _ = mercari.load_state()
         self.assertEqual(list(fingerprints), ["seller:1:title"])
+
+
+    async def test_two_live_listings_sharing_a_title_are_not_merged_as_a_relist(self):
+        # 판매자 ID를 알 수 없는 숍스 상품은 '제목+가격' 지문으로 재출품을 판단합니다.
+        # 그런데 예전 매물이 아직 버젓이 올라와 있다면 재출품이 아니라 별개의 매물이므로,
+        # 진짜 새 매물 알림이 삼켜지면 안 됩니다.
+        seen: dict = {}
+        relist_fingerprints: dict = {}
+        new_items: list = []
+
+        first = FakeItem("shop-1", "같은 제목 같은 가격", 5000, seller_id="0")
+        api1 = FakeMercapi({"test": [first]})
+        await mercari.check_keyword(api1, "test", [], seen, relist_fingerprints, new_items)
+        self.assertEqual([e["alert_id"] for e in new_items], ["new:shop-1"])
+
+        # 두 매물이 동시에 올라와 있는 상태 -> 두 번째도 새 매물로 알림이 와야 합니다.
+        new_items.clear()
+        second = FakeItem("shop-2", "같은 제목 같은 가격", 5000, seller_id="0")
+        api2 = FakeMercapi({"test": [first, second]})
+        await mercari.check_keyword(api2, "test", [], seen, relist_fingerprints, new_items)
+        self.assertEqual([e["alert_id"] for e in new_items], ["new:shop-2"])
+
+        # 반대로 예전 매물이 사라진 뒤 같은 제목+가격으로 다시 올라오면 재출품으로 처리합니다.
+        new_items.clear()
+        third = FakeItem("shop-3", "같은 제목 같은 가격", 5000, seller_id="0")
+        api3 = FakeMercapi({"test": [third]})
+        await mercari.check_keyword(api3, "test", [], seen, relist_fingerprints, new_items)
+        self.assertEqual(new_items, [])
+
+    def test_extract_item_id_is_always_a_string(self):
+        # 상태 파일은 JSON이라 키가 항상 문자열이 됩니다. 정수 ID가 섞이면 저장 전후로
+        # 키가 달라져서 같은 매물을 다음 실행에 '처음 보는 매물'로 오인하게 됩니다.
+        self.assertEqual(mercari.extract_item_id({"id_": 12345}), "12345")
+        self.assertEqual(mercari.extract_item_id({"id_": "m123"}), "m123")
+        self.assertIsNone(mercari.extract_item_id({}))
+
+    async def test_failed_alert_does_not_block_the_rest_of_the_queue(self):
+        # 예전에는 실패한 알림이 대기열 맨 앞에 그대로 남아, 그 한 건 때문에 뒤에 쌓인
+        # 알림이 전부 막혔습니다(실행마다 1회 재시도 -> 15분 정체).
+        pending = [
+            {"alert_id": "new:bad", "caption": "bad"},
+            {"alert_id": "new:good", "caption": "good"},
+        ]
+
+        async def send(caption, photo):
+            return (caption != "bad"), None
+
+        with patch.object(mercari, "send_telegram", new=AsyncMock(side_effect=send)), patch.object(
+            mercari, "push_state", return_value=True
+        ):
+            remaining, sent_alerts = await mercari.flush_pending({}, pending, [], {}, set(), {})
+
+        # 뒤에 있던 정상 알림은 이번 실행에 전송되고, 실패한 건만 대기열에 남습니다.
+        self.assertEqual(sent_alerts, ["new:good"])
+        self.assertEqual([e["alert_id"] for e in remaining], ["new:bad"])
+        self.assertEqual(remaining[0]["attempts"], 1)
+
+    async def test_flush_pending_stops_when_everything_keeps_failing(self):
+        # 토큰 오류나 텔레그램 장애처럼 전부 실패하는 상황에서 대기열을 몇 바퀴씩
+        # 헛돌지 않아야 합니다.
+        pending = [{"alert_id": f"new:{i}", "caption": str(i)} for i in range(20)]
+        send_mock = AsyncMock(return_value=(False, None))
+
+        with patch.object(mercari, "send_telegram", new=send_mock), patch.object(
+            mercari, "push_state", return_value=True
+        ):
+            remaining, _ = await mercari.flush_pending({}, pending, [], {}, set(), {})
+
+        self.assertEqual(send_mock.await_count, mercari.MAX_CONSECUTIVE_SEND_FAILURES)
+        self.assertEqual(len(remaining), 20)  # 한 건도 잃지 않고 다음 실행으로 넘김
+
+    async def test_flush_pending_caps_how_much_it_sends_in_one_run(self):
+        # 한 실행이 5분 크론을 넘겨 다음 실행들이 줄줄이 밀리지 않도록 상한을 둡니다.
+        count = mercari.MAX_SEND_ATTEMPTS_PER_RUN + 10
+        pending = [{"alert_id": f"new:{i}", "caption": str(i)} for i in range(count)]
+
+        with patch.object(mercari, "send_telegram", new=AsyncMock(return_value=(True, None))), patch.object(
+            mercari, "push_state", return_value=True
+        ):
+            remaining, sent_alerts = await mercari.flush_pending({}, pending, [], {}, set(), {})
+
+        self.assertEqual(len(sent_alerts), mercari.MAX_SEND_ATTEMPTS_PER_RUN)
+        self.assertEqual(len(remaining), 10)  # 나머지는 대기열에 그대로 보존
+
+    async def test_photo_failure_falls_back_to_a_text_message(self):
+        # 메루카리 썸네일은 webp라 텔레그램이 사진으로 거부하는 경우가 있습니다.
+        # 사진 때문에 알림 자체를 놓치면 안 됩니다.
+        calls = []
+
+        async def fake_post(token, chat_id, method, payload):
+            calls.append(method)
+            if method == "sendPhoto":
+                return False, None, 400
+            return True, None, 200
+
+        with patch.dict(
+            mercari.os.environ, {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c"}
+        ), patch.object(mercari, "_telegram_post", new=AsyncMock(side_effect=fake_post)):
+            ok, _ = await mercari.send_telegram("caption", "https://example.com/a.webp")
+
+        self.assertTrue(ok)
+        self.assertEqual(calls, ["sendPhoto", "sendMessage"])
+
+    async def test_rate_limited_photo_is_not_downgraded_to_text(self):
+        # 429(레이트리밋)는 사진이 문제가 아니라 잠시 기다리라는 뜻이므로
+        # 텍스트로 바꿔 보내면 안 됩니다.
+        async def fake_post(token, chat_id, method, payload):
+            return False, 20, 429
+
+        with patch.dict(
+            mercari.os.environ, {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c"}
+        ), patch.object(mercari, "_telegram_post", new=AsyncMock(side_effect=fake_post)) as post:
+            ok, retry_after = await mercari.send_telegram("caption", "https://example.com/a.webp")
+
+        self.assertFalse(ok)
+        self.assertEqual(retry_after, 20)
+        self.assertEqual(post.await_count, 1)
+
+    async def test_next_page_is_fetched_when_a_full_page_is_all_brand_new(self):
+        # 인기 키워드에서 짧은 시간에 매물이 쏟아지면 한 페이지(120개)로는 모자랍니다.
+        # 페이지 전체가 기준선 이후 등록분이면 다음 페이지도 확인해야 놓치지 않습니다.
+        now = datetime.now()
+        cutoff = (now - timedelta(minutes=5)).timestamp()
+        page1 = [
+            FakeItem(f"p1-{i}", f"신규 {i}", 1000, created=now - timedelta(minutes=1))
+            for i in range(mercari.MAX_ITEMS_PER_KEYWORD)
+        ]
+        page2 = [FakeItem("p2-0", "신규 추가분", 1000, created=now - timedelta(minutes=2))]
+        api = FakeMercapi({"test": page1}, extra_pages_by_keyword={"test": [page2]})
+
+        items, ok = await mercari.search_items(api, "test", [], created_cutoff=cutoff)
+        self.assertTrue(ok)
+        self.assertIn("p2-0", {mercari.extract_item_id(f) for f in items})
+
+    async def test_next_page_is_not_fetched_for_a_normal_page(self):
+        # 평소에는(한 페이지를 다 채우지 못하거나 오래된 매물이 섞여 있으면) 한 페이지만 봅니다.
+        now = datetime.now()
+        cutoff = (now - timedelta(minutes=5)).timestamp()
+        page1 = [FakeItem("p1-0", "신규", 1000, created=now - timedelta(minutes=1))]
+        page2 = [FakeItem("p2-0", "더 있음", 1000, created=now - timedelta(minutes=2))]
+        api = FakeMercapi({"test": page1}, extra_pages_by_keyword={"test": [page2]})
+
+        items, _ = await mercari.search_items(api, "test", [], created_cutoff=cutoff)
+        self.assertNotIn("p2-0", {mercari.extract_item_id(f) for f in items})
+
+    def test_pending_queue_overflow_is_reported(self):
+        # 상한을 넘겨 알림이 버려지는 상황은 조용히 넘어가면 안 됩니다.
+        pending = [{"alert_id": f"new:{i}", "caption": str(i)} for i in range(mercari.MAX_PENDING_ALERTS + 3)]
+        with patch("sys.stderr", new=io.StringIO()) as captured:
+            result = mercari.deduplicate_pending(pending, [])
+        self.assertEqual(len(result), mercari.MAX_PENDING_ALERTS)
+        self.assertIn("대기 알림이 상한", captured.getvalue())
+
+
+    async def test_relist_check_considers_every_keyword_searched_in_the_run(self):
+        # 같은 판매자가 제목이 똑같은 상품을 두 개 올렸는데, 카테고리 필터 때문에
+        # 키워드마다 한쪽씩만 잡히는 경우입니다. 한 키워드 결과만 보면 "예전 매물이
+        # 사라졌다"고 착각해 진짜 새 매물 알림을 삼켜 버립니다.
+        mercari.SEARCHES = [
+            {"query": "kw-a", "categories": [1]},
+            {"query": "kw-b", "categories": [2]},
+        ]
+        checkpoints = {"kw-a": datetime.now().timestamp() - 300, "kw-b": datetime.now().timestamp() - 300}
+        mercari.save_state({}, [], [], {}, {"kw-a", "kw-b"}, checkpoints)
+
+        first = FakeItem("m1", "완전히 같은 제목", 5000, seller_id="seller-A")
+        second = FakeItem("m2", "완전히 같은 제목", 5000, seller_id="seller-A")
+
+        # 1회차: kw-a에서 m1만 보임
+        with patch.object(mercari, "Mercapi", return_value=FakeMercapi({"kw-a": [first], "kw-b": []})):
+            await mercari.collect_updates()
+
+        # 2회차: kw-a에는 m1, kw-b에는 m2가 각각 보임 -> m2는 별개의 새 매물
+        with patch.object(
+            mercari, "Mercapi", return_value=FakeMercapi({"kw-a": [first], "kw-b": [second]})
+        ):
+            await mercari.collect_updates()
+
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        self.assertIn("new:m2", [entry["alert_id"] for entry in state["pending"]])
 
 
 if __name__ == "__main__":
