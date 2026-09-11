@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
@@ -28,9 +29,13 @@ from mercapi import Mercapi
 # item_type 필드만으로는 라이브러리가 숍스 여부를 늘 정확히 채워주지 않아 ID 형식을 보조 판단 기준으로 씁니다.
 MERCARI_ITEM_ID_PATTERN = re.compile(r"^m\d+$")
 
+# 제목 정규화 시 제거할 기호(전각/반각 공백, 대괄호·괄호·특수문자 등 꾸밈 차이 무시용)
+_TITLE_NOISE_PATTERN = re.compile(r"[\s\u3000!-/:-@\[-`{-~、。・【】「」『』［］（）]+")
+
 SEEN_FILE = Path("seen_items.json")
 MAX_ITEMS_PER_KEYWORD = 120  # 키워드당 확인할 최근 매물 개수
 MAX_SEEN_ITEMS = 5000
+MAX_RELIST_FINGERPRINTS = 5000
 PRICE_DROP_ALERT_THRESHOLD = 1000  # 마지막 알림 가격보다 이 금액(엔) 이상 떨어졌을 때만 알립니다.
 MAX_PENDING_ALERTS = 500
 MAX_SENT_ALERTS = 5000
@@ -52,27 +57,29 @@ SEARCHES = [
 ]
 
 
-def load_state() -> tuple[dict, list, list]:
+def load_state() -> tuple[dict, list, list, dict]:
     if not SEEN_FILE.exists():
-        return {}, [], []
+        return {}, [], [], {}
     try:
         data = json.loads(SEEN_FILE.read_text())
     except Exception as exc:
         print(f"[상태 파일 읽기 실패] {exc}", file=sys.stderr)
-        return {}, [], []
+        return {}, [], [], {}
 
     if isinstance(data, list):
-        return {item_id: None for item_id in data}, [], []
+        return {item_id: None for item_id in data}, [], [], {}
 
     raw_seen = data.get("seen", [])
     seen = {item_id: None for item_id in raw_seen} if isinstance(raw_seen, list) else raw_seen
     pending = data.get("pending", [])
     sent_alerts = data.get("sent_alerts", [])
+    relist_fingerprints = data.get("relist_fingerprints", {})
 
     return (
         seen if isinstance(seen, dict) else {},
         pending if isinstance(pending, list) else [],
         sent_alerts if isinstance(sent_alerts, list) else [],
+        relist_fingerprints if isinstance(relist_fingerprints, dict) else {},
     )
 
 
@@ -111,13 +118,14 @@ def deduplicate_pending(pending: list, sent_alerts: list) -> list:
     return result[-MAX_PENDING_ALERTS:]
 
 
-def save_state(seen: dict, pending: list, sent_alerts: list) -> None:
+def save_state(seen: dict, pending: list, sent_alerts: list, relist_fingerprints: dict) -> None:
     sent_alerts = unique_recent(sent_alerts, MAX_SENT_ALERTS)
     pending = deduplicate_pending(pending, sent_alerts)
     data = {
         "seen": dict(list(seen.items())[-MAX_SEEN_ITEMS:]),
         "pending": pending,
         "sent_alerts": sent_alerts,
+        "relist_fingerprints": dict(list(relist_fingerprints.items())[-MAX_RELIST_FINGERPRINTS:]),
     }
     temporary_file = SEEN_FILE.with_suffix(".tmp")
     temporary_file.write_text(json.dumps(data, ensure_ascii=False))
@@ -164,6 +172,44 @@ def price_record(seen: dict, item_id) -> dict:
     return {"last_alert_price": value, "last_seen_price": value}
 
 
+def normalize_title(name) -> str:
+    """재출품 판별용으로 제목을 정규화합니다 (공백/기호/전각·반각 차이를 무시)."""
+    text = unicodedata.normalize("NFKC", str(name or ""))
+    text = _TITLE_NOISE_PATTERN.sub("", text)
+    return text.lower()
+
+
+def extract_seller_id(item) -> str | None:
+    """검색 결과에서 판매자 ID를 뽑아냅니다. 라이브러리 버전에 따라 필드 위치가
+    다를 수 있어 평평한 필드와 중첩된 seller 객체를 모두 시도합니다."""
+    data = asdict(item)
+    direct = data.get("seller_id") or data.get("sellerId")
+    if direct:
+        return str(direct)
+    seller = data.get("seller")
+    if isinstance(seller, dict):
+        nested = seller.get("id") or seller.get("id_") or seller.get("seller_id")
+        if nested:
+            return str(nested)
+    return None
+
+
+def relist_fingerprint(seller_id, name, price) -> str | None:
+    """같은 매물의 재출품(삭제 후 재등록)을 잡아내기 위한 지문을 만듭니다.
+
+    판매자 ID를 알 수 있으면 '판매자+정규화된 제목'만으로 판단하고(가격이 달라도 매칭),
+    판매자 ID를 못 가져오면 '정규화된 제목+정확히 같은 가격'으로 대체합니다.
+    """
+    normalized_title = normalize_title(name)
+    if not normalized_title:
+        return None
+    if seller_id:
+        return f"seller:{seller_id}:{normalized_title}"
+    if isinstance(price, int):
+        return f"title:{normalized_title}:{price}"
+    return None
+
+
 def extract_field(item, candidates, default=None):
     data = asdict(item)
     for key in candidates:
@@ -208,7 +254,9 @@ async def send_telegram(caption: str, photo_url):
     return False, retry_after
 
 
-async def flush_pending(seen: dict, pending: list, sent_alerts: list) -> tuple[list, list]:
+async def flush_pending(
+    seen: dict, pending: list, sent_alerts: list, relist_fingerprints: dict
+) -> tuple[list, list]:
     """대기열을 전송하고, 성공할 때마다 곧바로 원격 저장소에 기록합니다.
 
     한 건이라도 전송된 뒤 원격 저장 기록(push_state)이 실패하면 즉시 멈춥니다.
@@ -229,7 +277,7 @@ async def flush_pending(seen: dict, pending: list, sent_alerts: list) -> tuple[l
             sent_alerts.append(key)
             remaining.pop(0)
             sent += 1
-            save_state(seen, remaining, sent_alerts)
+            save_state(seen, remaining, sent_alerts, relist_fingerprints)
             if not push_state("record Mercari alert delivery"):
                 print(
                     "[중단] 전송 기록 저장에 실패해 이번 실행은 여기서 멈춥니다 "
@@ -254,7 +302,9 @@ async def flush_pending(seen: dict, pending: list, sent_alerts: list) -> tuple[l
     return remaining, unique_recent(sent_alerts, MAX_SENT_ALERTS)
 
 
-async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, new_items: list) -> None:
+async def check_keyword(
+    m: Mercapi, keyword: str, categories: list, seen: dict, relist_fingerprints: dict, new_items: list
+) -> None:
     try:
         results = await m.search(keyword, categories=categories)
     except Exception as exc:
@@ -263,6 +313,7 @@ async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, 
 
     new_count = 0
     drop_count = 0
+    relist_count = 0
     for item in results.items[:MAX_ITEMS_PER_KEYWORD]:
         item_id = extract_field(item, ["id_", "id", "item_id", "itemId"])
         if not item_id:
@@ -274,6 +325,8 @@ async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, 
         photo = extract_field(item, ["thumbnails", "photos", "thumbnail", "image_url"])
         if isinstance(photo, (list, tuple)):
             photo = photo[0] if photo else None
+        seller_id = extract_seller_id(item)
+        fingerprint = relist_fingerprint(seller_id, name, price)
 
         # item_type에 "SHOP"이 찍히거나, ID가 일반 매물 형식(m+숫자)이 아니면 숍스 상품으로 간주합니다.
         item_type = str(extract_field(item, ["item_type"], "")).upper()
@@ -285,53 +338,77 @@ async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, 
         )
         price_txt = f"¥{price:,}" if isinstance(price, int) else "가격 확인 필요"
 
-        if item_id not in seen:
+        if item_id in seen:
+            record = price_record(seen, item_id)
+        else:
+            # 새로 보이는 ID지만, 같은 판매자(또는 같은 제목+가격)의 지문이 이미 있다면
+            # 삭제 후 재등록된 매물로 보고 예전 가격 이력을 새 ID로 이어받습니다.
+            matched = relist_fingerprints.get(fingerprint) if fingerprint else None
+            if matched and matched.get("item_id") != item_id:
+                record = {
+                    "last_alert_price": matched.get("last_alert_price"),
+                    "last_seen_price": matched.get("last_seen_price"),
+                }
+                seen.pop(matched.get("item_id"), None)
+                relist_count += 1
+            else:
+                record = None
+
+        if record is None:
             seen[item_id] = {"last_alert_price": price, "last_seen_price": price}
             caption = f"[{keyword}] {name}\n💴 {price_txt}\n🔗 {item_url}"
             new_items.append({"alert_id": f"new:{item_id}", "caption": caption, "photo": photo})
             new_count += 1
-            continue
-
-        # last_alert_price: 실제로 알림을 보낸 적 있는 '역대 최저가' 기준입니다.
-        #   가격이 올랐다가 다시 내려와도 이 값보다 위에 머무는 한 알림을 보내지 않고,
-        #   기준가를 절대 위로 올리지 않습니다 (그래야 잦은 가격 변동에도 기준이 안 꼬입니다).
-        # last_seen_price: 참고용으로 저장하는 가장 최근 관찰가로, 알림 판단에는 쓰지 않습니다.
-        record = price_record(seen, item_id)
-        last_alert_price = record["last_alert_price"]
-        last_seen_price = price if isinstance(price, int) else record["last_seen_price"]
-
-        if isinstance(last_alert_price, int) and isinstance(price, int):
-            if price <= last_alert_price - PRICE_DROP_ALERT_THRESHOLD:
-                caption = (
-                    f"💰[가격 인하] [{keyword}] {name}\n"
-                    f"¥{last_alert_price:,} → ¥{price:,}\n🔗 {item_url}"
-                )
-                new_items.append(
-                    {
-                        "alert_id": f"drop:{item_id}:{last_alert_price}:{price}",
-                        "caption": caption,
-                        "photo": photo,
-                    }
-                )
-                drop_count += 1
-                last_alert_price = price  # 역대 최저가 갱신 (알림을 보냈을 때만 내려감)
-            # else: 역대 최저가보다 충분히 싸지지 않음 -> 기준가 유지 (가격이 올라도 그대로)
         else:
-            last_alert_price = price
+            # last_alert_price: 실제로 알림을 보낸 적 있는 '역대 최저가' 기준입니다.
+            #   가격이 올랐다가 다시 내려와도 이 값보다 위에 머무는 한 알림을 보내지 않고,
+            #   기준가를 절대 위로 올리지 않습니다 (그래야 잦은 가격 변동에도 기준이 안 꼬입니다).
+            # last_seen_price: 참고용으로 저장하는 가장 최근 관찰가로, 알림 판단에는 쓰지 않습니다.
+            last_alert_price = record["last_alert_price"]
+            last_seen_price = price if isinstance(price, int) else record["last_seen_price"]
 
-        seen[item_id] = {"last_alert_price": last_alert_price, "last_seen_price": last_seen_price}
+            if isinstance(last_alert_price, int) and isinstance(price, int):
+                if price <= last_alert_price - PRICE_DROP_ALERT_THRESHOLD:
+                    caption = (
+                        f"💰[가격 인하] [{keyword}] {name}\n"
+                        f"¥{last_alert_price:,} → ¥{price:,}\n🔗 {item_url}"
+                    )
+                    new_items.append(
+                        {
+                            "alert_id": f"drop:{item_id}:{last_alert_price}:{price}",
+                            "caption": caption,
+                            "photo": photo,
+                        }
+                    )
+                    drop_count += 1
+                    last_alert_price = price  # 역대 최저가 갱신 (알림을 보냈을 때만 내려감)
+                # else: 역대 최저가보다 충분히 싸지지 않음 -> 기준가 유지 (가격이 올라도 그대로)
+            else:
+                last_alert_price = price
 
-    print(f"[{keyword}] 검색 {len(results.items)}개 확인 (신규 {new_count}개, 가격인하 {drop_count}개)")
+            seen[item_id] = {"last_alert_price": last_alert_price, "last_seen_price": last_seen_price}
+
+        if fingerprint:
+            relist_fingerprints[fingerprint] = {
+                "item_id": item_id,
+                "last_alert_price": seen[item_id]["last_alert_price"],
+                "last_seen_price": seen[item_id]["last_seen_price"],
+            }
+
+    print(
+        f"[{keyword}] 검색 {len(results.items)}개 확인 "
+        f"(신규 {new_count}개, 재출품 {relist_count}개, 가격인하 {drop_count}개)"
+    )
 
 
 async def collect_updates() -> None:
     mercari = Mercapi()
-    seen, pending, sent_alerts = load_state()
+    seen, pending, sent_alerts, relist_fingerprints = load_state()
     is_first_run = len(seen) == 0
     new_items: list = []
 
     for search in SEARCHES:
-        await check_keyword(mercari, search["query"], search["categories"], seen, new_items)
+        await check_keyword(mercari, search["query"], search["categories"], seen, relist_fingerprints, new_items)
         await asyncio.sleep(1)
 
     if is_first_run:
@@ -340,22 +417,22 @@ async def collect_updates() -> None:
         pending = deduplicate_pending(pending + new_items, sent_alerts)
         print(f"새 알림 {len(new_items)}건 발견 (저장될 대기열 {len(pending)}건)")
 
-    save_state(seen, pending, sent_alerts)
+    save_state(seen, pending, sent_alerts, relist_fingerprints)
 
 
 async def send_pending() -> None:
-    seen, pending, sent_alerts = load_state()
+    seen, pending, sent_alerts, relist_fingerprints = load_state()
     pending = deduplicate_pending(pending, sent_alerts)
 
     if not pending:
         print("전송할 대기 알림이 없습니다")
-        save_state(seen, pending, sent_alerts)
+        save_state(seen, pending, sent_alerts, relist_fingerprints)
         return
 
     try:
-        pending, sent_alerts = await flush_pending(seen, pending, sent_alerts)
+        pending, sent_alerts = await flush_pending(seen, pending, sent_alerts, relist_fingerprints)
     finally:
-        save_state(seen, pending, sent_alerts)
+        save_state(seen, pending, sent_alerts, relist_fingerprints)
 
     if pending:
         print(f"[대기열에 {len(pending)}건 남음 -> 다음 실행에 재시도]", file=sys.stderr)
