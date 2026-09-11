@@ -186,6 +186,17 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         await mercari.check_keyword(api3, "test", [], seen, relist_fingerprints, new_items)
         self.assertEqual([e["alert_id"] for e in new_items], ["new:m3"])
 
+    def test_load_state_seeds_legacy_keywords_when_field_missing(self):
+        # known_keywords 필드가 아직 없는 예전 상태 파일(이번 업그레이드 전)을 흉내냄.
+        # 예전부터 쓰던 키워드들은 이미 알려진 것으로 간주되어야, 이번 배포로
+        # 오래된 키워드까지 신규로 오인해 알림을 생략해버리는 일이 없습니다.
+        mercari.SEEN_FILE.write_text(json.dumps({"seen": {"a": 1}, "pending": [], "sent_alerts": []}))
+        _, _, _, _, known_keywords = mercari.load_state()
+        self.assertIn("Martin Margiela", known_keywords)
+        self.assertIn("Chrome Hearts", known_keywords)
+        # 이번에 새로 추가한 키워드는 레거시 시드 목록에 없어야 함(=첫 조회 시 알림 억제 대상)
+        self.assertNotIn("Gunter Wermekes", known_keywords)
+
     def test_save_state_removes_duplicate_and_already_sent_alerts(self):
         pending = [
             {"alert_id": "new:a", "caption": "a"},
@@ -193,14 +204,49 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             {"alert_id": "new:b", "caption": "b"},
             {"caption": "legacy"},
         ]
-        mercari.save_state({"a": 1}, pending, ["new:b", "new:already"], {})
+        mercari.save_state({"a": 1}, pending, ["new:b", "new:already"], {}, set())
         state = json.loads(mercari.SEEN_FILE.read_text())
         self.assertEqual([entry["alert_id"] for entry in state["pending"]], ["new:a", "legacy:legacy"])
         self.assertEqual(state["sent_alerts"], ["new:b", "new:already"])
 
+    async def test_collect_suppresses_new_alerts_only_for_newly_added_keyword(self):
+        # "old-keyword"는 이미 알려진 키워드, "new-keyword"는 이번에 새로 추가된 키워드라고 가정.
+        # 새 키워드의 기존 매물들은 '신규' 알림 없이 기준선만 저장되고,
+        # 기존 키워드는 평소대로 정상적으로 알림이 와야 합니다.
+        mercari.SEARCHES = [
+            {"query": "old-keyword", "categories": []},
+            {"query": "new-keyword", "categories": []},
+        ]
+        mercari.save_state({"unrelated-item": {"last_alert_price": 1, "last_seen_price": 1}}, [], [], {}, {"old-keyword"})
+        fake_api = FakeMercapi(
+            {
+                "old-keyword": [FakeItem("o1", "Old keyword item", 10000)],
+                "new-keyword": [
+                    FakeItem("n1", "New keyword item A", 5000),
+                    FakeItem("n2", "New keyword item B", 7000),
+                ],
+            }
+        )
+
+        with patch.object(mercari, "Mercapi", return_value=fake_api), patch.object(
+            mercari.asyncio, "sleep", new=AsyncMock()
+        ):
+            await mercari.collect_updates()
+
+        collected = json.loads(mercari.SEEN_FILE.read_text())
+        # old-keyword 매물은 정상적으로 '신규' 알림 대기열에 들어감
+        self.assertEqual([entry["alert_id"] for entry in collected["pending"]], ["new:o1"])
+        # new-keyword 매물들은 알림 없이 기준선(seen)에만 저장됨
+        self.assertIn("n1", collected["seen"])
+        self.assertIn("n2", collected["seen"])
+        # 이제 new-keyword도 known_keywords에 등록되어, 다음 조회부터는 정상적으로 알림이 옴
+        self.assertIn("new-keyword", collected["known_keywords"])
+
     async def test_collect_persists_before_send_and_delivery_is_not_repeated(self):
         mercari.SEARCHES = [{"query": "test", "categories": []}]
-        mercari.save_state({"old-item": 12000}, [], [], {})
+        # "test" 키워드는 이미 알려진 것으로 표시해서, 이 테스트가 검증하려는
+        # 기존 collect->send 흐름이 새 키워드 첫 조회 억제 로직의 영향을 받지 않게 합니다.
+        mercari.save_state({"old-item": 12000}, [], [], {}, {"test"})
         fake_api = FakeMercapi(
             {
                 "test": [
@@ -255,7 +301,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(mercari, "send_telegram", new=send_mock), patch.object(
             mercari, "push_state", return_value=True
         ), patch.object(mercari.asyncio, "sleep", new=AsyncMock()):
-            remaining, sent_alerts = await mercari.flush_pending({}, pending, ["new:already"], {})
+            remaining, sent_alerts = await mercari.flush_pending({}, pending, ["new:already"], {}, set())
         self.assertEqual(remaining, [])
         send_mock.assert_awaited_once_with("send", None)
         self.assertEqual(sent_alerts, ["new:already", "new:send"])
@@ -274,7 +320,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(mercari, "send_telegram", new=send_mock), patch.object(
             mercari, "push_state", new=push_mock
         ), patch.object(mercari.asyncio, "sleep", new=AsyncMock()):
-            remaining, sent_alerts = await mercari.flush_pending({}, pending, [], {})
+            remaining, sent_alerts = await mercari.flush_pending({}, pending, [], {}, set())
 
         # 텔레그램 전송 자체는 첫 건만 시도되고 멈춤
         send_mock.assert_awaited_once_with("a", None)
