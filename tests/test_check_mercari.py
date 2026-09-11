@@ -882,5 +882,24 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e["alert_id"] for e in state["pending"]], ["new:m-new"])
 
 
+    async def test_zero_interval_makes_every_run_a_full_scan(self):
+        # 실행 주기를 늘렸을 때를 위한 설정입니다. 이 값을 0으로 두면 매 실행이
+        # 전체 조회가 되어, 빠른/전체 분리를 넣기 전과 똑같이 동작합니다.
+        mercari.SEARCHES = [{"query": "test", "categories": []}]
+        base = datetime.now().timestamp()
+        mercari.save_state(
+            {"x": 1}, [], [], {}, {"test"},
+            {"test": base - 60, mercari.FULL_SCAN_STATE_KEY: base},  # 방금 전체 조회함
+        )
+        api = FakeMercapi({"test": [FakeItem("m1", "item", 1000)]})
+
+        with patch.object(mercari, "FULL_SCAN_INTERVAL_SECONDS", 0), patch.object(
+            mercari, "Mercapi", return_value=api
+        ), patch.object(mercari, "current_time", return_value=base):
+            await mercari.collect_updates()
+
+        self.assertEqual(len(api.calls), 2)  # 간격이 0이면 언제나 등록순+추천순
+
+
 if __name__ == "__main__":
     unittest.main()

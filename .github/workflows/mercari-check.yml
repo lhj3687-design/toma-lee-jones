@@ -19,9 +19,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 의존성 캐시를 켜면 매 실행마다 반복되는 설치 시간(대략 15~25초)이 줄어듭니다.
+      # 1분 주기처럼 짧게 돌릴수록 이 고정 비용이 알림 지연에서 차지하는 비중이 큽니다.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: pip install -r requirements.txt
