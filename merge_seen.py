@@ -4,6 +4,7 @@
 - sent_alerts: 합집합으로 보존해 이미 전송된 알림이 대기열에 되살아나도 재전송하지 않습니다.
 - pending: 고유 alert_id(구버전은 caption) 기준으로 합치되 sent_alerts에 있는 항목은 제거합니다.
 - relist_fingerprints: 재출품 감지용 지문 기록도 두 쪽 다 유지합니다(합집합, 최신 쪽 우선).
+- known_keywords: 이미 한 번이라도 조회한 키워드 목록도 합집합으로 유지합니다.
 """
 import json
 
@@ -59,6 +60,7 @@ merged_seen = {**theirs.get("seen", {}), **mine.get("seen", {})}
 sent_alerts = unique_recent(theirs.get("sent_alerts", []) + mine.get("sent_alerts", []), 5000)
 merged_pending = merge_pending(theirs.get("pending", []), mine.get("pending", []), sent_alerts)
 merged_fingerprints = {**theirs.get("relist_fingerprints", {}), **mine.get("relist_fingerprints", {})}
+merged_known_keywords = sorted(set(theirs.get("known_keywords", [])) | set(mine.get("known_keywords", [])))
 
 with open("/tmp/merged.json", "w") as file:
     json.dump(
@@ -67,6 +69,7 @@ with open("/tmp/merged.json", "w") as file:
             "pending": merged_pending,
             "sent_alerts": sent_alerts,
             "relist_fingerprints": dict(list(merged_fingerprints.items())[-5000:]),
+            "known_keywords": merged_known_keywords,
         },
         file,
         ensure_ascii=False,
