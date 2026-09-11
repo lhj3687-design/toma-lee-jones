@@ -26,6 +26,7 @@ class FakeItem:
     price: int | Decimal
     thumbnails: list[str] | None = None
     item_type: str = "ITEM"
+    seller_id: str | None = None
 
 
 class FakeResults:
@@ -67,7 +68,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        await mercari.check_keyword(fake_api, "test", [], seen, new_items)
+        await mercari.check_keyword(fake_api, "test", [], seen, {}, new_items)
 
         self.assertIn("https://jp.mercari.com/shops/product/2JUHeREMxTVqFa42uQFwEc", new_items[0]["caption"])
         self.assertIn("https://jp.mercari.com/item/m90925725213", new_items[1]["caption"])
@@ -77,12 +78,13 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         # 50000->48000(알림) ->55000(상승, 알림기준 불변) ->54000(알림기준 48000보다 안 쌈, 알림 없음)
         # ->46000(48000보다 1000엔 이상 싸짐, 알림)
         seen = {}
+        relist_fingerprints = {}
         new_items: list = []
 
         async def observe(price):
             new_items.clear()
             api = FakeMercapi({"test": [FakeItem("item", "Margiela bag", price)]})
-            await mercari.check_keyword(api, "test", [], seen, new_items)
+            await mercari.check_keyword(api, "test", [], seen, relist_fingerprints, new_items)
 
         await observe(50000)  # 신규 매물 -> '신규' 알림은 발생 (가격인하 알림 대상 아님)
         self.assertEqual([e["alert_id"] for e in new_items], ["new:item"])
@@ -115,7 +117,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
                 ]
             }
         )
-        await mercari.check_keyword(fake_api, "test", [], seen, new_items)
+        await mercari.check_keyword(fake_api, "test", [], seen, {}, new_items)
         self.assertEqual(
             seen,
             {
@@ -128,6 +130,62 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             ["drop:old-item:12000:9000", "new:new-item"],
         )
 
+    async def test_relist_with_same_seller_id_does_not_trigger_new_alert(self):
+        # 같은 판매자가 삭제 후 새 ID로 재등록한 경우: '신규' 알림 없이
+        # 예전 최저가 기록을 새 ID로 이어받아야 합니다.
+        seen = {}
+        relist_fingerprints = {}
+        new_items: list = []
+
+        api1 = FakeMercapi(
+            {"test": [FakeItem("m1000", "Margiela 초레어 카트소", 20000, seller_id="seller-A")]}
+        )
+        await mercari.check_keyword(api1, "test", [], seen, relist_fingerprints, new_items)
+        self.assertEqual([e["alert_id"] for e in new_items], ["new:m1000"])
+
+        # 판매자가 삭제 후 재등록: ID는 바뀌었지만 판매자+제목(공백/기호 차이만 있음)은 동일
+        new_items.clear()
+        api2 = FakeMercapi(
+            {"test": [FakeItem("m2000", "  Margiela  초레어  카트소 ", 20000, seller_id="seller-A")]}
+        )
+        await mercari.check_keyword(api2, "test", [], seen, relist_fingerprints, new_items)
+
+        self.assertEqual(new_items, [])  # 재출품이므로 '신규' 알림 없음
+        self.assertNotIn("m1000", seen)  # 예전 ID는 정리됨
+        self.assertEqual(seen["m2000"], {"last_alert_price": 20000, "last_seen_price": 20000})
+
+        # 재등록하면서 1000엔 이상 더 싸게 올렸다면 가격인하 알림은 정상적으로 와야 함
+        new_items.clear()
+        api3 = FakeMercapi(
+            {"test": [FakeItem("m3000", "Margiela 초레어 카트소", 18000, seller_id="seller-A")]}
+        )
+        await mercari.check_keyword(api3, "test", [], seen, relist_fingerprints, new_items)
+        self.assertEqual([e["alert_id"] for e in new_items], ["drop:m3000:20000:18000"])
+
+    async def test_relist_fallback_to_title_and_exact_price_without_seller_id(self):
+        # seller_id를 못 가져오는 경우, 제목+가격이 완전히 같을 때만 재출품으로 판단합니다.
+        seen = {}
+        relist_fingerprints = {}
+        new_items: list = []
+
+        api1 = FakeMercapi({"test": [FakeItem("m1", "Chrome Hearts Tシャツ", 32000)]})
+        await mercari.check_keyword(api1, "test", [], seen, relist_fingerprints, new_items)
+        self.assertEqual([e["alert_id"] for e in new_items], ["new:m1"])
+
+        # 같은 제목, 같은 가격, 다른 ID -> 재출품으로 처리 (알림 없음)
+        new_items.clear()
+        api2 = FakeMercapi({"test": [FakeItem("m2", "Chrome Hearts Tシャツ", 32000)]})
+        await mercari.check_keyword(api2, "test", [], seen, relist_fingerprints, new_items)
+        self.assertEqual(new_items, [])
+        self.assertNotIn("m1", seen)
+        self.assertIn("m2", seen)
+
+        # 같은 제목이라도 가격이 다르면(단서 부족) 구분 못 하고 신규로 처리 -> 알려진 한계
+        new_items.clear()
+        api3 = FakeMercapi({"test": [FakeItem("m3", "Chrome Hearts Tシャツ", 29000)]})
+        await mercari.check_keyword(api3, "test", [], seen, relist_fingerprints, new_items)
+        self.assertEqual([e["alert_id"] for e in new_items], ["new:m3"])
+
     def test_save_state_removes_duplicate_and_already_sent_alerts(self):
         pending = [
             {"alert_id": "new:a", "caption": "a"},
@@ -135,14 +193,14 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             {"alert_id": "new:b", "caption": "b"},
             {"caption": "legacy"},
         ]
-        mercari.save_state({"a": 1}, pending, ["new:b", "new:already"])
+        mercari.save_state({"a": 1}, pending, ["new:b", "new:already"], {})
         state = json.loads(mercari.SEEN_FILE.read_text())
         self.assertEqual([entry["alert_id"] for entry in state["pending"]], ["new:a", "legacy:legacy"])
         self.assertEqual(state["sent_alerts"], ["new:b", "new:already"])
 
     async def test_collect_persists_before_send_and_delivery_is_not_repeated(self):
         mercari.SEARCHES = [{"query": "test", "categories": []}]
-        mercari.save_state({"old-item": 12000}, [], [])
+        mercari.save_state({"old-item": 12000}, [], [], {})
         fake_api = FakeMercapi(
             {
                 "test": [
@@ -197,7 +255,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(mercari, "send_telegram", new=send_mock), patch.object(
             mercari, "push_state", return_value=True
         ), patch.object(mercari.asyncio, "sleep", new=AsyncMock()):
-            remaining, sent_alerts = await mercari.flush_pending({}, pending, ["new:already"])
+            remaining, sent_alerts = await mercari.flush_pending({}, pending, ["new:already"], {})
         self.assertEqual(remaining, [])
         send_mock.assert_awaited_once_with("send", None)
         self.assertEqual(sent_alerts, ["new:already", "new:send"])
@@ -216,7 +274,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(mercari, "send_telegram", new=send_mock), patch.object(
             mercari, "push_state", new=push_mock
         ), patch.object(mercari.asyncio, "sleep", new=AsyncMock()):
-            remaining, sent_alerts = await mercari.flush_pending({}, pending, [])
+            remaining, sent_alerts = await mercari.flush_pending({}, pending, [], {})
 
         # 텔레그램 전송 자체는 첫 건만 시도되고 멈춤
         send_mock.assert_awaited_once_with("a", None)
