@@ -56,15 +56,26 @@ class FakeMercapi:
     호출 횟수를 세어 두 번 불렸는지도 검증할 수 있게 합니다.
     """
 
-    def __init__(self, items_by_keyword, fail_keywords=(), extra_pages_by_keyword=None):
+    def __init__(
+        self,
+        items_by_keyword,
+        fail_keywords=(),
+        extra_pages_by_keyword=None,
+        fail_call_indexes=None,
+    ):
         self.items_by_keyword = items_by_keyword
         self.fail_keywords = set(fail_keywords)
         self.extra_pages_by_keyword = extra_pages_by_keyword or {}
+        # 키워드별로 "몇 번째 조회를 실패시킬지" (0=등록순, 1=추천순)
+        self.fail_call_indexes = fail_call_indexes or {}
+        self.call_counts = {}
         self.calls = []
 
     async def search(self, keyword, categories=(), **options):
+        index = self.call_counts.get(keyword, 0)
+        self.call_counts[keyword] = index + 1
         self.calls.append((keyword, options))
-        if keyword in self.fail_keywords:
+        if keyword in self.fail_keywords or index in self.fail_call_indexes.get(keyword, ()):
             raise RuntimeError("검색 실패 시뮬레이션")
         pages = self.extra_pages_by_keyword.get(keyword)
         return FakeResults(self.items_by_keyword[keyword], pages)
@@ -680,7 +691,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         page2 = [FakeItem("p2-0", "신규 추가분", 1000, created=now - timedelta(minutes=2))]
         api = FakeMercapi({"test": page1}, extra_pages_by_keyword={"test": [page2]})
 
-        items, ok = await mercari.search_items(api, "test", [], created_cutoff=cutoff)
+        items, ok, _ = await mercari.search_items(api, "test", [], created_cutoff=cutoff)
         self.assertTrue(ok)
         self.assertIn("p2-0", {mercari.extract_item_id(f) for f in items})
 
@@ -692,7 +703,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         page2 = [FakeItem("p2-0", "더 있음", 1000, created=now - timedelta(minutes=2))]
         api = FakeMercapi({"test": page1}, extra_pages_by_keyword={"test": [page2]})
 
-        items, _ = await mercari.search_items(api, "test", [], created_cutoff=cutoff)
+        items, _, _ = await mercari.search_items(api, "test", [], created_cutoff=cutoff)
         self.assertNotIn("p2-0", {mercari.extract_item_id(f) for f in items})
 
     def test_pending_queue_overflow_is_reported(self):
@@ -730,6 +741,68 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
 
         state = json.loads(mercari.SEEN_FILE.read_text())
         self.assertIn("new:m2", [entry["alert_id"] for entry in state["pending"]])
+
+
+    async def test_checkpoint_waits_when_only_the_new_item_search_fails(self):
+        # 새 매물을 책임지는 건 '등록순' 조회입니다. 등록순이 실패했는데 추천순만
+        # 성공했다고 조회 시각을 갱신하면, 그 구간에 올라온 매물이 다음 실행에서
+        # '오래된 매물'로 분류돼 영영 알림이 오지 않습니다.
+        mercari.SEARCHES = [{"query": "test", "categories": []}]
+        mercari.save_state({"old-item": 12000}, [], [], {}, {"test"}, {"test": 1000.0})
+        api = FakeMercapi(
+            {"test": [FakeItem("old-item", "가격 인하", 9000)]},
+            fail_call_indexes={"test": {0}},  # 등록순만 실패
+        )
+
+        with patch.object(mercari, "Mercapi", return_value=api):
+            await mercari.collect_updates()
+
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        # 조회 시각은 예전 값 그대로 -> 다음 실행에서 그 구간을 다시 훑습니다.
+        self.assertEqual(state["keyword_checked_at"], {"test": 1000.0})
+        # 추천순으로 본 결과의 가격 인하 알림은 그대로 나갑니다.
+        self.assertEqual(
+            [entry["alert_id"] for entry in state["pending"]], ["drop:old-item:12000:9000"]
+        )
+
+    async def test_checkpoint_advances_when_the_new_item_search_succeeds(self):
+        mercari.SEARCHES = [{"query": "test", "categories": []}]
+        mercari.save_state({"x": 1}, [], [], {}, {"test"}, {"test": 1000.0})
+        api = FakeMercapi(
+            {"test": [FakeItem("m1", "item", 1000)]},
+            fail_call_indexes={"test": {1}},  # 추천순만 실패해도 기준선은 전진
+        )
+
+        with patch.object(mercari, "Mercapi", return_value=api):
+            await mercari.collect_updates()
+
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        self.assertGreater(state["keyword_checked_at"]["test"], 1000.0)
+
+    async def test_missing_created_field_is_reported_loudly(self):
+        # created가 비어 있으면 방어선 하나가 조용히 사라집니다. 로그로 드러나야 합니다.
+        mercari.SEARCHES = [{"query": "test", "categories": []}]
+        mercari.save_state({"x": 1}, [], [], {}, {"test"}, {"test": 1000.0})
+        api = FakeMercapi({"test": [FakeItem("m1", "created 없음", 1000)]})
+
+        with patch.object(mercari, "Mercapi", return_value=api), patch(
+            "sys.stderr", new=io.StringIO()
+        ) as captured:
+            await mercari.collect_updates()
+
+        self.assertIn("등록 시각(created)이 하나도", captured.getvalue())
+
+    async def test_feed_health_is_quiet_when_created_is_present(self):
+        mercari.SEARCHES = [{"query": "test", "categories": []}]
+        mercari.save_state({"x": 1}, [], [], {}, {"test"}, {"test": 1000.0})
+        api = FakeMercapi({"test": [FakeItem("m1", "정상", 1000, created=datetime.now())]})
+
+        with patch.object(mercari, "Mercapi", return_value=api), patch(
+            "sys.stderr", new=io.StringIO()
+        ) as captured:
+            await mercari.collect_updates()
+
+        self.assertNotIn("[경고]", captured.getvalue())
 
 
 if __name__ == "__main__":

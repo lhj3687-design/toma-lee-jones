@@ -145,6 +145,10 @@ def build_search_options() -> dict:
 
 SEARCH_SORT_OPTIONS = build_search_options()
 
+# 새 매물을 책임지는 정렬 패스의 이름입니다. 이 조회가 실패하면 그 구간의 새 매물을
+# 놓친 것이므로, 해당 키워드의 조회 시각을 갱신하면 안 됩니다.
+NEW_ITEM_SORT_PASS = "created"
+
 
 def load_state() -> tuple[dict, list, list, dict, set, dict]:
     empty = ({}, [], [], {}, set(LEGACY_KEYWORDS_SEEDED_AT_UPGRADE), {})
@@ -594,7 +598,7 @@ def wants_another_page(pass_name: str, results, items: list, created_cutoff: flo
 
 async def search_items(
     m: Mercapi, keyword: str, categories: list, created_cutoff: float | None = None
-) -> tuple[list[dict], bool]:
+) -> tuple[list[dict], bool, bool]:
     """한 키워드를 '등록순'과 '추천순' 두 가지로 조회해 매물 목록을 합칩니다.
 
     메루카리 기본 검색은 추천순(관련도)이라, 갓 올라온 매물이 상위 120개 안에 못 드는 일이
@@ -602,11 +606,15 @@ async def search_items(
     가격 인하는 추천순 결과로 계속 추적합니다.
 
     결과는 매물 객체가 아니라 필드 dict로 돌려줍니다(무거운 변환을 매물당 한 번만 하려고).
-    두 번째 값은 '조회에 한 번이라도 성공했는지'입니다. 전부 실패했다면 이번 실행에서는
-    이 키워드의 조회 시각을 갱신하면 안 됩니다(그 사이 올라온 매물을 영영 놓치게 되므로).
+
+    돌려주는 값은 (매물들, 조회 성공, 신규 매물 구간을 훑었는지) 세 가지입니다.
+    마지막 값을 따로 두는 이유: 새 매물을 책임지는 건 '등록순' 조회입니다. 등록순이
+    실패했는데 추천순만 성공했다고 조회 시각을 갱신해 버리면, 그 구간에 올라온 매물이
+    다음 실행에서 '오래된 매물'로 분류돼 영영 알림이 오지 않습니다.
     """
     merged: dict = {}
     succeeded = False
+    new_item_coverage = False
     for index, (pass_name, options) in enumerate(SEARCH_SORT_OPTIONS.items()):
         if index:
             await asyncio.sleep(1)
@@ -624,6 +632,8 @@ async def search_items(
                 )
                 break
             succeeded = True
+            if pass_name == NEW_ITEM_SORT_PASS:
+                new_item_coverage = True
             page = [item_fields(item) for item in list(getattr(results, "items", []) or [])]
             page = page[:MAX_ITEMS_PER_KEYWORD]
             for fields in page:
@@ -634,7 +644,11 @@ async def search_items(
                 break
             print(f"[{keyword}] 신규 매물이 한 페이지를 가득 채워 다음 페이지도 확인합니다")
             await asyncio.sleep(1)
-    return list(merged.values()), succeeded
+    if NEW_ITEM_SORT_PASS not in SEARCH_SORT_OPTIONS:
+        # 등록순 조회를 쓸 수 없는 예외 상황(정렬 옵션 준비 실패)에서는
+        # 예전처럼 '한 번이라도 성공했는지'로 판단합니다.
+        new_item_coverage = succeeded
+    return list(merged.values()), succeeded, new_item_coverage
 
 
 async def check_keyword(
@@ -646,7 +660,7 @@ async def check_keyword(
     new_items: list,
     created_cutoff: float | None = None,
 ) -> bool:
-    items, succeeded = await search_items(m, keyword, categories, created_cutoff)
+    items, succeeded, _coverage = await search_items(m, keyword, categories, created_cutoff)
     if not succeeded:
         return False
     process_items(keyword, items, seen, relist_fingerprints, new_items, created_cutoff)
@@ -795,6 +809,44 @@ def process_items(
     )
 
 
+def report_feed_health(searched: list) -> None:
+    """메루카리 응답이 기대대로 오는지 실행마다 한 줄로 요약합니다.
+
+    '오래된 매물을 신규로 오인하지 않는' 방어선은 매물의 등록 시각(created)에 기대고 있는데,
+    이 필드는 응답에 따라 비어 있을 수 있습니다. 비어 있으면 조용히 예전 방식(상태 파일만
+    보고 판단)으로 되돌아가기 때문에, 눈치채지 못한 채 지나가지 않도록 로그를 남깁니다.
+    """
+    total = 0
+    with_created = 0
+    unknown_seller = 0
+    for _keyword, items, checked, _coverage, _cutoff in searched:
+        if not checked:
+            continue
+        for fields in items:
+            total += 1
+            if listing_created_at(fields) is not None:
+                with_created += 1
+            if not extract_seller_id(fields):
+                unknown_seller += 1
+
+    failed = [keyword for keyword, _items, checked, _c, _cut in searched if not checked]
+    if failed:
+        print(f"[점검] 조회 실패한 키워드 {len(failed)}개: {', '.join(failed)}", file=sys.stderr)
+    if not total:
+        print("[점검] 이번 실행에서 확인한 매물이 없습니다", file=sys.stderr)
+        return
+
+    print(
+        f"[점검] 매물 {total}개 확인 / 등록시각 있음 {with_created}개 / 판매자ID 모름 {unknown_seller}개"
+    )
+    if not with_created:
+        print(
+            "[경고] 등록 시각(created)이 하나도 채워지지 않았습니다. "
+            "'오래된 매물을 신규로 오인하지 않는' 방어선이 상태 파일 기준으로만 동작합니다.",
+            file=sys.stderr,
+        )
+
+
 async def collect_updates() -> None:
     mercari = Mercapi()
     seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at = load_state()
@@ -805,22 +857,28 @@ async def collect_updates() -> None:
     # 1단계: 모든 키워드를 먼저 조회합니다.
     # 판정을 뒤로 미루는 이유는, 재출품 여부를 판단할 때 '이번 실행에서 살아 있는 것이
     # 확인된 매물' 전체를 봐야 별개의 매물을 재출품으로 오인하지 않기 때문입니다.
-    searched: list[tuple[str, list, bool, float]] = []
+    searched: list[tuple[str, list, bool, bool, float]] = []
     for index, search in enumerate(SEARCHES):
         if index:
             await asyncio.sleep(1)
         keyword = search["query"]
         cutoff = new_item_cutoff(keyword_checked_at, keyword, now)
-        items, checked = await search_items(mercari, keyword, search["categories"], cutoff)
-        searched.append((keyword, items, checked, cutoff))
+        items, checked, coverage = await search_items(
+            mercari, keyword, search["categories"], cutoff
+        )
+        searched.append((keyword, items, checked, coverage, cutoff))
 
+    # 검색에 잡혔다는 것 자체가 '지금 살아 있다'는 증거이므로, 부분적으로만 성공한
+    # 키워드의 결과도 재출품 판정용 목록에는 넣습니다.
     listed_ids: set[str] = set()
-    for _, items, checked, _cutoff in searched:
+    for _keyword, items, checked, _coverage, _cutoff in searched:
         if checked:
             listed_ids |= listed_item_ids(items)
 
+    report_feed_health(searched)
+
     # 2단계: 모아 둔 결과로 알림을 판정합니다.
-    for keyword, items, checked, cutoff in searched:
+    for keyword, items, checked, coverage, cutoff in searched:
         keyword_is_new = keyword not in known_keywords
         # 조회 시각 기록이 아직 없는 키워드는 '신규' 판정의 기준선이 없는 상태입니다.
         # 새로 추가한 키워드일 수도 있고, 이 기능을 배포한 직후의 첫 실행일 수도 있습니다.
@@ -852,10 +910,12 @@ async def collect_updates() -> None:
                 known_keywords.add(keyword)
 
         new_items.extend(keyword_items)
-        # 조회에 실패한 키워드는 시각을 갱신하지 않습니다.
-        # 갱신해 버리면 검색이 실패한 그 구간에 올라온 매물을 다음 실행에서 '오래된 매물'로 보고 건너뜁니다.
-        if checked:
+        # 등록순 조회에 실패한 키워드는 시각을 갱신하지 않습니다. 갱신해 버리면 그 구간에
+        # 올라온 매물을 다음 실행에서 '오래된 매물'로 보고 영영 건너뜁니다.
+        if coverage:
             keyword_checked_at[keyword] = now
+        elif checked:
+            print(f"[{keyword}] 등록순 조회 실패 -> 조회 시각을 갱신하지 않고 다음 실행에서 다시 확인합니다")
 
     if is_first_run:
         print(f"첫 실행: 기존 매물 {len(seen)}개를 기준으로 저장했습니다 (알림 생략)")
