@@ -31,6 +31,7 @@ MERCARI_ITEM_ID_PATTERN = re.compile(r"^m\d+$")
 SEEN_FILE = Path("seen_items.json")
 MAX_ITEMS_PER_KEYWORD = 120  # 키워드당 확인할 최근 매물 개수
 MAX_SEEN_ITEMS = 5000
+PRICE_DROP_ALERT_THRESHOLD = 1000  # 마지막 알림 가격보다 이 금액(엔) 이상 떨어졌을 때만 알립니다.
 MAX_PENDING_ALERTS = 500
 MAX_SENT_ALERTS = 5000
 
@@ -276,17 +277,27 @@ async def check_keyword(m: Mercapi, keyword: str, categories: list, seen: dict, 
             new_count += 1
             continue
 
+        # seen[item_id]는 '마지막으로 알림을 보낸 기준 가격'입니다.
+        # 100엔씩 조금씩 떨어지는 자동 가격조정 알림 스팸을 막기 위해,
+        # 이 기준가보다 PRICE_DROP_ALERT_THRESHOLD 이상 떨어졌을 때만 알리고,
+        # 그보다 작은 하락은 기준가를 그대로 두어 이후 하락분과 합산되게 합니다.
         old_price = seen.get(item_id)
-        if isinstance(old_price, int) and isinstance(price, int) and price < old_price:
-            caption = (
-                f"💰[가격 인하] [{keyword}] {name}\n"
-                f"¥{old_price:,} → ¥{price:,}\n🔗 {item_url}"
-            )
-            new_items.append(
-                {"alert_id": f"drop:{item_id}:{old_price}:{price}", "caption": caption, "photo": photo}
-            )
-            drop_count += 1
-        seen[item_id] = price
+        if isinstance(old_price, int) and isinstance(price, int):
+            if price <= old_price - PRICE_DROP_ALERT_THRESHOLD:
+                caption = (
+                    f"💰[가격 인하] [{keyword}] {name}\n"
+                    f"¥{old_price:,} → ¥{price:,}\n🔗 {item_url}"
+                )
+                new_items.append(
+                    {"alert_id": f"drop:{item_id}:{old_price}:{price}", "caption": caption, "photo": photo}
+                )
+                drop_count += 1
+                seen[item_id] = price  # 새 기준가로 갱신
+            elif price > old_price:
+                seen[item_id] = price  # 가격이 오르면 기준가도 최신 가격으로 갱신
+            # else: 기준가 대비 하락폭이 작음 -> 기준가 유지, 다음 하락과 합산해서 판단
+        else:
+            seen[item_id] = price
 
     print(f"[{keyword}] 검색 {len(results.items)}개 확인 (신규 {new_count}개, 가격인하 {drop_count}개)")
 
