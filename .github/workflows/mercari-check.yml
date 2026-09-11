@@ -12,16 +12,17 @@ concurrency:
 
 permissions:
   contents: write
+  actions: read   # 실패 알림에서 직전 실행의 성공 여부를 확인하는 데 씁니다
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # 의존성 캐시를 켜면 매 실행마다 반복되는 설치 시간(대략 15~25초)이 줄어듭니다.
       # 1분 주기처럼 짧게 돌릴수록 이 고정 비용이 알림 지연에서 차지하는 비중이 큽니다.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -63,3 +64,17 @@ jobs:
       - name: Persist delivery result
         if: always()
         run: bash scripts/push_state.sh "record Mercari alert delivery"
+
+      # 5) 이 봇은 평소에 조용한 게 정상이라, 고장이 나도 "새 매물이 없나 보다"와 구분되지 않습니다.
+      #    실행이 실패하면 그 사실을 텔레그램으로 알립니다.
+      #    1분마다 도는 봇이라 실패할 때마다 알리면 폭탄이 되므로,
+      #    '직전 실행은 성공했는데 이번에 실패한' 전환 시점에만 보냅니다(스크립트 주석 참고).
+      - name: Notify on failure
+        if: failure()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_FILE: mercari-check.yml
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: bash scripts/notify_failure.sh

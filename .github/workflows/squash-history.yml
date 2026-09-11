@@ -51,7 +51,7 @@ jobs:
           echo "size_mb=${size_mb}" >> "$GITHUB_OUTPUT"
 
       # 이력은 필요 없습니다. 최신 커밋 하나만 있으면 압축할 수 있습니다.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: steps.check.outputs.proceed == 'true'
         with:
           fetch-depth: 1

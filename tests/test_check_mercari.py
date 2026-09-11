@@ -20,6 +20,15 @@ sys.path.insert(0, str(ROOT))
 mercari = importlib.import_module("check_mercari")
 
 
+def keyword_checkpoints(state: dict) -> dict:
+    """상태 파일의 키워드별 조회 시각만 추립니다(예약 키 제외)."""
+    return {
+        k: v
+        for k, v in state.get("keyword_checked_at", {}).items()
+        if k not in mercari.RESERVED_STATE_KEYS
+    }
+
+
 @dataclass
 class FakeItem:
     id_: str
@@ -496,7 +505,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             await mercari.collect_updates()
 
         state = json.loads(mercari.SEEN_FILE.read_text())
-        self.assertEqual(state["keyword_checked_at"], {})
+        self.assertEqual(keyword_checkpoints(state), {})
 
     async def test_collect_records_checkpoint_per_keyword_on_success(self):
         mercari.SEARCHES = [{"query": "test", "categories": []}]
@@ -773,7 +782,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
 
         state = json.loads(mercari.SEEN_FILE.read_text())
         # 조회 시각은 예전 값 그대로 -> 다음 실행에서 그 구간을 다시 훑습니다.
-        self.assertEqual(state["keyword_checked_at"], {"test": 1000.0})
+        self.assertEqual(keyword_checkpoints(state), {"test": 1000.0})
         # 추천순으로 본 결과의 가격 인하 알림은 그대로 나갑니다.
         self.assertEqual(
             [entry["alert_id"] for entry in state["pending"]], ["drop:old-item:12000:9000"]
@@ -899,6 +908,83 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             await mercari.collect_updates()
 
         self.assertEqual(len(api.calls), 2)  # 간격이 0이면 언제나 등록순+추천순
+
+
+    async def test_no_health_alert_for_a_single_failed_run(self):
+        # 일시적인 네트워크 오류 한 번으로 헛알림이 가면 안 됩니다.
+        base = datetime.now().timestamp()
+        checked_at = {mercari.LAST_SEARCH_OK_KEY: base - 60}
+        searched = [("kw", [], False, False, 0.0)]
+        self.assertEqual(mercari.health_alerts(searched, checked_at, base), [])
+
+    async def test_health_alert_after_searches_fail_for_a_while(self):
+        base = datetime.now().timestamp()
+        down_for = mercari.HEALTH_ALERT_AFTER_SECONDS + 120
+        checked_at = {mercari.LAST_SEARCH_OK_KEY: base - down_for}
+        searched = [("kw", [], False, False, 0.0)]
+
+        alerts = mercari.health_alerts(searched, checked_at, base)
+        self.assertEqual(len(alerts), 1)
+        self.assertTrue(alerts[0]["alert_id"].startswith("health:search-down:"))
+        self.assertIn("이상", alerts[0]["caption"])
+        # 고장이 이어져도 마지막 성공 시각은 갱신하지 않아야 경과 시간이 계속 늘어납니다.
+        self.assertEqual(checked_at[mercari.LAST_SEARCH_OK_KEY], base - down_for)
+
+    async def test_repeated_failures_reuse_one_alert_id_within_the_cooldown(self):
+        # 고장이 계속돼도 1분마다 알림이 쏟아지면 안 됩니다.
+        base = datetime.now().timestamp()
+        checked_at = {mercari.LAST_SEARCH_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 60}
+        searched = [("kw", [], False, False, 0.0)]
+
+        first = mercari.health_alerts(searched, dict(checked_at), base)[0]["alert_id"]
+        later = mercari.health_alerts(searched, dict(checked_at), base + 300)[0]["alert_id"]
+        self.assertEqual(first, later)  # 같은 id -> sent_alerts가 재전송을 막습니다
+
+        after_cooldown = mercari.health_alerts(
+            searched, dict(checked_at), base + mercari.HEALTH_ALERT_COOLDOWN_SECONDS
+        )[0]["alert_id"]
+        self.assertNotEqual(first, after_cooldown)  # 쿨다운이 지나면 다시 알립니다
+
+    async def test_recovery_alert_after_an_outage(self):
+        base = datetime.now().timestamp()
+        checked_at = {mercari.LAST_SEARCH_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 60}
+        searched = [("kw", [], True, True, 0.0)]
+
+        alerts = mercari.health_alerts(searched, checked_at, base)
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("복구", alerts[0]["caption"])
+        self.assertEqual(checked_at[mercari.LAST_SEARCH_OK_KEY], base)
+
+    async def test_no_recovery_alert_during_normal_operation(self):
+        base = datetime.now().timestamp()
+        checked_at = {mercari.LAST_SEARCH_OK_KEY: base - 60}
+        searched = [("kw", [], True, True, 0.0)]
+        self.assertEqual(mercari.health_alerts(searched, checked_at, base), [])
+        self.assertEqual(checked_at[mercari.LAST_SEARCH_OK_KEY], base)
+
+    async def test_health_alert_reaches_the_queue_even_on_the_first_run(self):
+        # 첫 실행은 매물 알림을 생략하지만, 봇 고장은 그때도 알려야 합니다.
+        mercari.SEARCHES = [{"query": "broken", "categories": []}]
+        base = datetime.now().timestamp()
+        mercari.save_state(
+            {}, [], [], {}, set(),
+            {mercari.LAST_SEARCH_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 120},
+        )
+        api = FakeMercapi({"broken": []}, fail_keywords=["broken"])
+
+        with patch.object(mercari, "Mercapi", return_value=api), patch.object(
+            mercari, "current_time", return_value=base
+        ):
+            await mercari.collect_updates()
+
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        ids = [e["alert_id"] for e in state["pending"]]
+        self.assertTrue(any(i.startswith("health:search-down:") for i in ids), ids)
+
+    async def test_reserved_state_keys_are_never_treated_as_keywords(self):
+        for key in mercari.RESERVED_STATE_KEYS:
+            cutoff = mercari.new_item_cutoff({key: 0}, key, 10_000.0)
+            self.assertEqual(cutoff, 10_000.0 - mercari.FIRST_RUN_LOOKBACK_SECONDS, key)
 
 
 if __name__ == "__main__":
