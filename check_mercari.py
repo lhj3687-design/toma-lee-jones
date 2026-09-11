@@ -54,32 +54,63 @@ SEARCHES = [
     {"query": "Richard Avedon", "categories": [3088]},
     {"query": "The Row", "categories": [2]},
     {"query": "ザ・ロウ", "categories": [2]},
+    {"query": "Gunter Wermekes", "categories": []},
+    {"query": "Label Under Construction", "categories": []},
+    {"query": "Yves Saint Laurent Rive Gauche", "categories": [2]},
+    {"query": "YSL Rive Gauche", "categories": [2]},
+]
+
+# 이 기능(키워드별 '첫 조회' 추적)을 배포하기 전부터 이미 돌리고 있던 키워드 목록입니다.
+# known_keywords가 상태 파일에 아직 없을 때(첫 업그레이드 실행)만 이 목록을 '이미 알려짐'으로
+# 간주해서, 오래전부터 쓰던 키워드까지 신규로 오인해 알림을 생략해버리는 일을 막습니다.
+# 이후 새 키워드를 추가할 때는 이 목록을 더 손댈 필요가 없습니다(실행 한 번이면 자동으로 등록됨).
+LEGACY_KEYWORDS_SEEDED_AT_UPGRADE = [
+    "Carol Christian Poell",
+    "Martin Margiela",
+    "マルタンマルジェラ",
+    "Margiela",
+    "マルジェラ",
+    "Hermes Margiela",
+    "Hermes",
+    "エルメス",
+    "Chrome Hearts",
+    "クロムハーツ",
+    "Richard Avedon",
+    "The Row",
+    "ザ・ロウ",
 ]
 
 
-def load_state() -> tuple[dict, list, list, dict]:
+def load_state() -> tuple[dict, list, list, dict, set]:
     if not SEEN_FILE.exists():
-        return {}, [], [], {}
+        return {}, [], [], {}, set(LEGACY_KEYWORDS_SEEDED_AT_UPGRADE)
     try:
         data = json.loads(SEEN_FILE.read_text())
     except Exception as exc:
         print(f"[상태 파일 읽기 실패] {exc}", file=sys.stderr)
-        return {}, [], [], {}
+        return {}, [], [], {}, set(LEGACY_KEYWORDS_SEEDED_AT_UPGRADE)
 
     if isinstance(data, list):
-        return {item_id: None for item_id in data}, [], [], {}
+        return {item_id: None for item_id in data}, [], [], {}, set(LEGACY_KEYWORDS_SEEDED_AT_UPGRADE)
 
     raw_seen = data.get("seen", [])
     seen = {item_id: None for item_id in raw_seen} if isinstance(raw_seen, list) else raw_seen
     pending = data.get("pending", [])
     sent_alerts = data.get("sent_alerts", [])
     relist_fingerprints = data.get("relist_fingerprints", {})
+    raw_known_keywords = data.get("known_keywords")
+    known_keywords = (
+        set(raw_known_keywords)
+        if isinstance(raw_known_keywords, list)
+        else set(LEGACY_KEYWORDS_SEEDED_AT_UPGRADE)
+    )
 
     return (
         seen if isinstance(seen, dict) else {},
         pending if isinstance(pending, list) else [],
         sent_alerts if isinstance(sent_alerts, list) else [],
         relist_fingerprints if isinstance(relist_fingerprints, dict) else {},
+        known_keywords,
     )
 
 
@@ -118,7 +149,7 @@ def deduplicate_pending(pending: list, sent_alerts: list) -> list:
     return result[-MAX_PENDING_ALERTS:]
 
 
-def save_state(seen: dict, pending: list, sent_alerts: list, relist_fingerprints: dict) -> None:
+def save_state(seen: dict, pending: list, sent_alerts: list, relist_fingerprints: dict, known_keywords: set) -> None:
     sent_alerts = unique_recent(sent_alerts, MAX_SENT_ALERTS)
     pending = deduplicate_pending(pending, sent_alerts)
     data = {
@@ -126,6 +157,7 @@ def save_state(seen: dict, pending: list, sent_alerts: list, relist_fingerprints
         "pending": pending,
         "sent_alerts": sent_alerts,
         "relist_fingerprints": dict(list(relist_fingerprints.items())[-MAX_RELIST_FINGERPRINTS:]),
+        "known_keywords": sorted(known_keywords),
     }
     temporary_file = SEEN_FILE.with_suffix(".tmp")
     temporary_file.write_text(json.dumps(data, ensure_ascii=False))
@@ -255,7 +287,7 @@ async def send_telegram(caption: str, photo_url):
 
 
 async def flush_pending(
-    seen: dict, pending: list, sent_alerts: list, relist_fingerprints: dict
+    seen: dict, pending: list, sent_alerts: list, relist_fingerprints: dict, known_keywords: set
 ) -> tuple[list, list]:
     """대기열을 전송하고, 성공할 때마다 곧바로 원격 저장소에 기록합니다.
 
@@ -277,7 +309,7 @@ async def flush_pending(
             sent_alerts.append(key)
             remaining.pop(0)
             sent += 1
-            save_state(seen, remaining, sent_alerts, relist_fingerprints)
+            save_state(seen, remaining, sent_alerts, relist_fingerprints, known_keywords)
             if not push_state("record Mercari alert delivery"):
                 print(
                     "[중단] 전송 기록 저장에 실패해 이번 실행은 여기서 멈춥니다 "
@@ -403,12 +435,27 @@ async def check_keyword(
 
 async def collect_updates() -> None:
     mercari = Mercapi()
-    seen, pending, sent_alerts, relist_fingerprints = load_state()
+    seen, pending, sent_alerts, relist_fingerprints, known_keywords = load_state()
     is_first_run = len(seen) == 0
     new_items: list = []
 
     for search in SEARCHES:
-        await check_keyword(mercari, search["query"], search["categories"], seen, relist_fingerprints, new_items)
+        keyword = search["query"]
+        keyword_is_new = keyword not in known_keywords
+        keyword_items: list = []
+        await check_keyword(mercari, keyword, search["categories"], seen, relist_fingerprints, keyword_items)
+
+        if keyword_is_new:
+            # 이 키워드를 처음 조회하는 실행입니다. 기존에 이미 올라와 있던 매물이 전부
+            # '신규'로 잡혀 알림 폭탄이 되는 걸 막기 위해, 기준선(seen)만 저장하고
+            # 이번 조회분의 알림은 보내지 않습니다. 다음 조회부터는 정상적으로 알림이 옵니다.
+            suppressed = sum(1 for e in keyword_items if e["alert_id"].startswith("new:"))
+            if suppressed:
+                print(f"[{keyword}] 새로 추가된 키워드 첫 조회: 매물 {suppressed}개 기준선만 저장, 알림 생략")
+            keyword_items = [e for e in keyword_items if not e["alert_id"].startswith("new:")]
+            known_keywords.add(keyword)
+
+        new_items.extend(keyword_items)
         await asyncio.sleep(1)
 
     if is_first_run:
@@ -417,22 +464,22 @@ async def collect_updates() -> None:
         pending = deduplicate_pending(pending + new_items, sent_alerts)
         print(f"새 알림 {len(new_items)}건 발견 (저장될 대기열 {len(pending)}건)")
 
-    save_state(seen, pending, sent_alerts, relist_fingerprints)
+    save_state(seen, pending, sent_alerts, relist_fingerprints, known_keywords)
 
 
 async def send_pending() -> None:
-    seen, pending, sent_alerts, relist_fingerprints = load_state()
+    seen, pending, sent_alerts, relist_fingerprints, known_keywords = load_state()
     pending = deduplicate_pending(pending, sent_alerts)
 
     if not pending:
         print("전송할 대기 알림이 없습니다")
-        save_state(seen, pending, sent_alerts, relist_fingerprints)
+        save_state(seen, pending, sent_alerts, relist_fingerprints, known_keywords)
         return
 
     try:
-        pending, sent_alerts = await flush_pending(seen, pending, sent_alerts, relist_fingerprints)
+        pending, sent_alerts = await flush_pending(seen, pending, sent_alerts, relist_fingerprints, known_keywords)
     finally:
-        save_state(seen, pending, sent_alerts, relist_fingerprints)
+        save_state(seen, pending, sent_alerts, relist_fingerprints, known_keywords)
 
     if pending:
         print(f"[대기열에 {len(pending)}건 남음 -> 다음 실행에 재시도]", file=sys.stderr)
