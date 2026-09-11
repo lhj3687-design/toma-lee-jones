@@ -1,2 +1,2 @@
-mercapi
+mercapi==0.4.2
 httpx

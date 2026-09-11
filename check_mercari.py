@@ -23,6 +23,7 @@ from pathlib import Path
 
 import httpx
 from mercapi import Mercapi
+from mercapi.requests import SearchRequestData
 
 # 일반 메루카리 개인 매물 ID는 항상 "m" + 숫자 형식입니다 (예: m90925725213).
 # 이 형식이 아니면 메루카리 숍스(기업 판매자) 상품이므로 /shops/product/ 링크를 써야 합니다.
@@ -226,20 +227,46 @@ def extract_seller_id(item) -> str | None:
     return None
 
 
-def relist_fingerprint(seller_id, name, price) -> str | None:
+def relist_fingerprint(seller_id, name, price, photo) -> str | None:
     """같은 매물의 재출품(삭제 후 재등록)을 잡아내기 위한 지문을 만듭니다.
 
-    판매자 ID를 알 수 있으면 '판매자+정규화된 제목'만으로 판단하고(가격이 달라도 매칭),
+    판매자 ID를 알 수 있어도 제목만으로는 같은 판매자의 다른 상품을 잘못 합칠 수
+    있으므로, 사진이 있으면 '판매자+정규화된 제목+대표 사진'을 함께 사용합니다.
+    사진이 없으면 보수적으로 '판매자+정규화된 제목+가격'을 사용해 가격이 달라진
+    별도 상품을 재출품으로 잘못 합치지 않습니다.
     판매자 ID를 못 가져오면 '정규화된 제목+정확히 같은 가격'으로 대체합니다.
     """
     normalized_title = normalize_title(name)
     if not normalized_title:
         return None
-    if seller_id:
-        return f"seller:{seller_id}:{normalized_title}"
+    if seller_id and photo:
+        return f"seller-photo:{seller_id}:{normalized_title}:{photo}"
+    if seller_id and isinstance(price, int):
+        return f"seller-price:{seller_id}:{normalized_title}:{price}"
     if isinstance(price, int):
         return f"title:{normalized_title}:{price}"
     return None
+
+
+def created_timestamp(item) -> float:
+    """created 필드를 정렬용 숫자로 변환합니다 (필드가 없으면 가장 오래된 값)."""
+    value = getattr(item, "created", None)
+    if value is None:
+        return 0.0
+    if hasattr(value, "timestamp"):
+        try:
+            return float(value.timestamp())
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def sort_latest_first(items: list) -> list:
+    """API 최신순 요청을 보완하기 위해 응답도 created 내림차순으로 정렬합니다."""
+    return sorted(items, key=created_timestamp, reverse=True)
 
 
 def extract_field(item, candidates, default=None):
@@ -336,17 +363,23 @@ async def flush_pending(
 
 async def check_keyword(
     m: Mercapi, keyword: str, categories: list, seen: dict, relist_fingerprints: dict, new_items: list
-) -> None:
+) -> bool:
     try:
-        results = await m.search(keyword, categories=categories)
+        results = await m.search(
+            keyword,
+            categories=categories,
+            sort_by=SearchRequestData.SortBy.SORT_CREATED_TIME,
+            sort_order=SearchRequestData.SortOrder.ORDER_DESC,
+        )
     except Exception as exc:
         print(f"[검색 실패: {keyword}] {exc}", file=sys.stderr)
-        return
+        return False
 
     new_count = 0
-    drop_count = 0
     relist_count = 0
-    for item in results.items[:MAX_ITEMS_PER_KEYWORD]:
+    drop_count = 0
+    ordered_items = sort_latest_first(list(results.items))
+    for item in ordered_items[:MAX_ITEMS_PER_KEYWORD]:
         item_id = extract_field(item, ["id_", "id", "item_id", "itemId"])
         if not item_id:
             continue
@@ -358,7 +391,7 @@ async def check_keyword(
         if isinstance(photo, (list, tuple)):
             photo = photo[0] if photo else None
         seller_id = extract_seller_id(item)
-        fingerprint = relist_fingerprint(seller_id, name, price)
+        fingerprint = relist_fingerprint(seller_id, name, price, photo)
 
         # item_type에 "SHOP"이 찍히거나, ID가 일반 매물 형식(m+숫자)이 아니면 숍스 상품으로 간주합니다.
         item_type = str(extract_field(item, ["item_type"], "")).upper()
@@ -428,9 +461,10 @@ async def check_keyword(
             }
 
     print(
-        f"[{keyword}] 검색 {len(results.items)}개 확인 "
+        f"[{keyword}] 검색 {len(ordered_items)}개 확인 "
         f"(신규 {new_count}개, 재출품 {relist_count}개, 가격인하 {drop_count}개)"
     )
+    return True
 
 
 async def collect_updates() -> None:
@@ -443,16 +477,17 @@ async def collect_updates() -> None:
         keyword = search["query"]
         keyword_is_new = keyword not in known_keywords
         keyword_items: list = []
-        await check_keyword(mercari, keyword, search["categories"], seen, relist_fingerprints, keyword_items)
+        search_succeeded = await check_keyword(
+            mercari, keyword, search["categories"], seen, relist_fingerprints, keyword_items
+        )
 
-        if keyword_is_new:
-            # 이 키워드를 처음 조회하는 실행입니다. 기존에 이미 올라와 있던 매물이 전부
-            # '신규'로 잡혀 알림 폭탄이 되는 걸 막기 위해, 기준선(seen)만 저장하고
-            # 이번 조회분의 알림은 보내지 않습니다. 다음 조회부터는 정상적으로 알림이 옵니다.
-            suppressed = sum(1 for e in keyword_items if e["alert_id"].startswith("new:"))
+        if keyword_is_new and search_succeeded:
+            # 첫 성공 조회는 신규/가격인하/재출품 등 종류와 무관하게 모두 기준선으로만
+            # 반영합니다. 검색 실패를 성공으로 기록하지 않아 다음 정상 조회가 안전합니다.
+            suppressed = len(keyword_items)
             if suppressed:
-                print(f"[{keyword}] 새로 추가된 키워드 첫 조회: 매물 {suppressed}개 기준선만 저장, 알림 생략")
-            keyword_items = [e for e in keyword_items if not e["alert_id"].startswith("new:")]
+                print(f"[{keyword}] 새 키워드 첫 성공 조회: 알림 {suppressed}건 기준선만 저장, 알림 생략")
+            keyword_items = []
             known_keywords.add(keyword)
 
         new_items.extend(keyword_items)
