@@ -56,9 +56,10 @@ MAX_PENDING_ALERTS = 500
 MAX_SENT_ALERTS = 20000
 
 # keyword_checked_at 안에 같이 보관하는 예약 키들입니다(키워드 이름과 겹치지 않도록 표시를 붙였습니다).
-FULL_SCAN_STATE_KEY = "__full_scan__"      # 마지막 '전체 조회' 시각
-LAST_SEARCH_OK_KEY = "__last_search_ok__"  # 마지막으로 검색에 성공한 시각
-RESERVED_STATE_KEYS = (FULL_SCAN_STATE_KEY, LAST_SEARCH_OK_KEY)
+FULL_SCAN_STATE_KEY = "__full_scan__"        # 마지막 '전체 조회' 시각
+LAST_SEARCH_OK_KEY = "__last_search_ok__"    # 마지막으로 검색에 성공한 시각
+LAST_CREATED_OK_KEY = "__last_created_ok__"  # 등록 시각을 정상적으로 받아온 마지막 시각
+RESERVED_STATE_KEYS = (FULL_SCAN_STATE_KEY, LAST_SEARCH_OK_KEY, LAST_CREATED_OK_KEY)
 
 # 봇 고장 감지.
 # 검색이 이 시간 넘게 한 건도 성공하지 못하면 "봇이 멈춘 것 같다"고 알립니다.
@@ -73,6 +74,12 @@ HEALTH_ALERT_COOLDOWN_SECONDS = 6 * 60 * 60
 # 계속 실패'하면 그 키워드 알림만 조용히 멈춥니다. 일시적인 실패와 구분하기 위해
 # 한참 동안 한 번도 성공하지 못했을 때만 알립니다.
 KEYWORD_STUCK_AFTER_SECONDS = 60 * 60
+
+# 매물 등록 시각(created)을 받아오는 비율의 하한입니다.
+# 이 값은 "오래된 매물을 신규로 오인하지 않는" 방어선이 쓰는 핵심 입력입니다.
+# 메루카리 응답에서 사라지면 그 방어선이 조용히 무력화되므로, 비율이 무너지면 알립니다.
+# 실측은 100%(2861/2861)라 50%면 정상 변동이 아니라 명백한 이상입니다.
+CREATED_COVERAGE_MIN_RATIO = 0.5
 
 # 전송 단계는 알림 하나마다 git push까지 하기 때문에 한 건당 수 초가 걸립니다.
 # 한 실행이 5분 크론을 넘겨 다음 실행이 줄줄이 밀리지 않도록 한 번에 보낼 양을 제한하고,
@@ -939,6 +946,79 @@ def health_alerts(searched: list, keyword_checked_at: dict, now: float) -> list:
     ]
 
 
+def created_coverage(searched: list) -> tuple[int, int]:
+    """이번 조회에서 (등록 시각을 받아온 매물 수, 전체 매물 수)를 셉니다."""
+    total = 0
+    with_created = 0
+    for _keyword, items, checked, _coverage, _cutoff in searched:
+        if not checked:
+            continue
+        for fields in items:
+            total += 1
+            if listing_created_at(fields) is not None:
+                with_created += 1
+    return with_created, total
+
+
+def created_coverage_alerts(searched: list, keyword_checked_at: dict, now: float) -> list:
+    """매물 등록 시각을 받아오지 못하게 되면 알립니다.
+
+    이 봇의 '오래된 매물을 신규로 오인하지 않는' 방어선은 등록 시각에 기대고 있습니다.
+    메루카리 응답에서 이 필드가 사라지면 방어선이 조용히 예전 방식(상태 파일만 보고 판단)으로
+    되돌아가고, 로그를 열어 보기 전에는 알 수 없습니다. 그 순간을 알리는 장치입니다.
+
+    검색이 아예 실패해 표본이 없는 실행은 판단하지 않습니다(그 상황은 health_alerts가 다룹니다).
+    한 번 어긋났다고 바로 알리지도 않습니다 — 다른 고장 알림과 같은 기준으로,
+    일정 시간 이상 이어질 때만, 정해진 간격당 한 번만 내보냅니다.
+    """
+    with_created, total = created_coverage(searched)
+    if total == 0:
+        return []
+
+    ratio = with_created / total
+    last_ok = keyword_checked_at.get(LAST_CREATED_OK_KEY)
+    last_ok = float(last_ok) if isinstance(last_ok, (int, float)) else None
+
+    if ratio >= CREATED_COVERAGE_MIN_RATIO:
+        keyword_checked_at[LAST_CREATED_OK_KEY] = now
+        if last_ok is not None and now - last_ok >= HEALTH_ALERT_AFTER_SECONDS:
+            minutes = int((now - last_ok) // 60)
+            return [
+                {
+                    "alert_id": f"health:created-ok:{int(last_ok)}",
+                    "caption": (
+                        f"✅ 메루카리 알림봇 방어선 복구\n"
+                        f"매물 등록 시각을 다시 정상적으로 받아옵니다 (약 {minutes}분 만에)."
+                    ),
+                    "photo": None,
+                }
+            ]
+        return []
+
+    if last_ok is None:
+        # 기준이 없으면 이번 실행을 기준으로 삼고 넘어갑니다.
+        keyword_checked_at[LAST_CREATED_OK_KEY] = now
+        return []
+    if now - last_ok < HEALTH_ALERT_AFTER_SECONDS:
+        return []
+
+    minutes = int((now - last_ok) // 60)
+    bucket = int(now // HEALTH_ALERT_COOLDOWN_SECONDS)
+    return [
+        {
+            "alert_id": f"health:created-missing:{bucket}",
+            "caption": (
+                f"⚠️ 메루카리 알림봇 방어선 이상\n"
+                f"매물 등록 시각을 {with_created}/{total}건({ratio:.0%})만 받아오고 있습니다 "
+                f"(약 {minutes}분째).\n"
+                f"'오래된 매물을 신규로 오인하지 않는' 장치가 약해진 상태라, "
+                f"오래된 매물 알림이 늘 수 있습니다."
+            ),
+            "photo": None,
+        }
+    ]
+
+
 def keyword_health_alerts(searched: list, previous_checked_at: dict, now: float) -> list:
     """키워드 하나가 오래 막혀 있으면 알립니다.
 
@@ -996,18 +1076,14 @@ def report_feed_health(searched: list) -> None:
     이 필드는 응답에 따라 비어 있을 수 있습니다. 비어 있으면 조용히 예전 방식(상태 파일만
     보고 판단)으로 되돌아가기 때문에, 눈치채지 못한 채 지나가지 않도록 로그를 남깁니다.
     """
-    total = 0
-    with_created = 0
-    unknown_seller = 0
-    for _keyword, items, checked, _coverage, _cutoff in searched:
-        if not checked:
-            continue
-        for fields in items:
-            total += 1
-            if listing_created_at(fields) is not None:
-                with_created += 1
-            if not extract_seller_id(fields):
-                unknown_seller += 1
+    with_created, total = created_coverage(searched)
+    unknown_seller = sum(
+        1
+        for _k, items, checked, _c, _cut in searched
+        if checked
+        for fields in items
+        if not extract_seller_id(fields)
+    )
 
     failed = [keyword for keyword, _items, checked, _c, _cut in searched if not checked]
     if failed:
@@ -1117,6 +1193,7 @@ async def collect_updates() -> None:
     # 봇 고장/복구 알림은 매물 알림과 달리 첫 실행에서도 내보냅니다.
     warnings = health_alerts(searched, keyword_checked_at, now)
     warnings += keyword_health_alerts(searched, previous_checked_at, now)
+    warnings += created_coverage_alerts(searched, keyword_checked_at, now)
     for entry in warnings:
         print(entry["caption"].splitlines()[0], file=sys.stderr)
 
