@@ -48,13 +48,28 @@ fi
 text="${headline}
 ${run_url}"
 
-if curl -sS -X POST \
+# 전송 성공은 종료 코드로 판단하면 안 됩니다.
+#
+# curl은 --fail 없이는 HTTP 401/400에도 종료 코드 0을 돌려줍니다. 그래서 예전에는
+# **토큰이 바뀌었거나 채팅 ID가 틀렸을 때**(README가 대표 사례로 꼽는 바로 그 상황)
+# 아무것도 전송되지 않았는데 "보냈습니다"라고 로그에 적혔습니다. 이건 알림 경로가
+# 막혔는지 확인할 마지막 수단까지 거짓말을 하는 것이라, 실제 상태와 로그가 어긋난
+# 채로 조용히 지나갑니다.
+#
+# 그래서 HTTP 상태와 텔레그램의 ok 필드를 둘 다 봅니다.
+response_file="$(mktemp)"
+status="$(curl -sS -o "$response_file" -w '%{http_code}' -X POST \
   "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
   --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-  --data-urlencode "text=${text}" >/dev/null; then
+  --data-urlencode "text=${text}" 2>"${response_file}.err")"
+body="$(head -c 300 "$response_file" 2>/dev/null)"
+transport_error="$(head -c 200 "${response_file}.err" 2>/dev/null)"
+rm -f "$response_file" "${response_file}.err"
+
+if [ "$status" = "200" ] && printf '%s' "$body" | grep -q '"ok":true'; then
   echo "실패 알림을 텔레그램으로 보냈습니다"
 else
-  echo "[경고] 실패 알림 전송에 실패했습니다" >&2
+  echo "[경고] 실패 알림이 전송되지 않았습니다 (HTTP ${status:-?}) ${body}${transport_error}" >&2
 fi
 
 exit 0
