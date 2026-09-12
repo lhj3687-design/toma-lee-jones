@@ -1017,5 +1017,92 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(fingerprints), ["seller:777:real", "title:shop:5000"])
 
 
+    async def test_stuck_keyword_is_reported_while_others_are_fine(self):
+        # 전량 실패는 health_alerts가 잡습니다. 여기서 잡는 건 "다른 키워드는 멀쩡한데
+        # 이 키워드만 계속 실패"하는 상황 — 그대로 두면 그 키워드 알림만 조용히 멈춥니다.
+        base = datetime.now().timestamp()
+        stuck = base - mercari.KEYWORD_STUCK_AFTER_SECONDS - 120
+        previous = {"ok-keyword": base - 60, "broken-keyword": stuck}
+        searched = [
+            ("ok-keyword", [], True, True, 0.0),
+            ("broken-keyword", [], False, False, 0.0),
+        ]
+
+        alerts = mercari.keyword_health_alerts(searched, previous, base)
+        self.assertEqual(len(alerts), 1)
+        self.assertTrue(alerts[0]["alert_id"].startswith("health:keyword-down:broken-keyword:"))
+        self.assertIn("broken-keyword", alerts[0]["caption"])
+
+    async def test_briefly_failing_keyword_is_not_reported(self):
+        base = datetime.now().timestamp()
+        previous = {"kw": base - 120}  # 2분 전에는 성공
+        searched = [("kw", [], False, False, 0.0), ("other", [], True, True, 0.0)]
+        self.assertEqual(mercari.keyword_health_alerts(searched, previous, base), [])
+
+    async def test_keyword_alerts_are_silent_when_the_whole_bot_is_down(self):
+        # 전량 실패한 실행에서 키워드마다 알리면 한 번에 17건이 쏟아집니다.
+        # 그 상황은 health_alerts가 한 건으로 알리므로 여기서는 아무것도 내보내지 않습니다.
+        base = datetime.now().timestamp()
+        stuck = base - mercari.KEYWORD_STUCK_AFTER_SECONDS - 120
+        previous = {"a": stuck, "b": stuck}
+        searched = [("a", [], False, False, 0.0), ("b", [], False, False, 0.0)]
+        self.assertEqual(mercari.keyword_health_alerts(searched, previous, base), [])
+
+    async def test_stuck_keyword_reports_recovery(self):
+        base = datetime.now().timestamp()
+        stuck = base - mercari.KEYWORD_STUCK_AFTER_SECONDS - 300
+        previous = {"kw": stuck}
+        searched = [("kw", [], True, True, 0.0)]
+
+        alerts = mercari.keyword_health_alerts(searched, previous, base)
+        self.assertEqual(len(alerts), 1)
+        self.assertTrue(alerts[0]["alert_id"].startswith("health:keyword-up:kw:"))
+        self.assertIn("재개", alerts[0]["caption"])
+
+    async def test_keyword_without_a_baseline_is_not_judged(self):
+        # 처음 추가한 키워드는 기준선이 없으므로 고장으로 오인하면 안 됩니다.
+        base = datetime.now().timestamp()
+        searched = [("new-kw", [], False, False, 0.0), ("other", [], True, True, 0.0)]
+        self.assertEqual(mercari.keyword_health_alerts(searched, {}, base), [])
+
+    async def test_stuck_keyword_alert_is_rate_limited(self):
+        base = datetime.now().timestamp()
+        stuck = base - mercari.KEYWORD_STUCK_AFTER_SECONDS - 120
+        previous = {"kw": stuck}
+        searched = [("kw", [], False, False, 0.0), ("other", [], True, True, 0.0)]
+
+        first = mercari.keyword_health_alerts(searched, previous, base)[0]["alert_id"]
+        soon = mercari.keyword_health_alerts(searched, previous, base + 600)[0]["alert_id"]
+        self.assertEqual(first, soon)  # 같은 id -> sent_alerts가 재전송을 막습니다
+        later = mercari.keyword_health_alerts(
+            searched, previous, base + mercari.HEALTH_ALERT_COOLDOWN_SECONDS
+        )[0]["alert_id"]
+        self.assertNotEqual(first, later)
+
+    async def test_stuck_keyword_alert_reaches_the_queue(self):
+        mercari.SEARCHES = [{"query": "ok", "categories": []}, {"query": "broken", "categories": []}]
+        base = datetime.now().timestamp()
+        mercari.save_state(
+            {"x": 1}, [], [], {}, {"ok", "broken"},
+            {
+                "ok": base - 60,
+                "broken": base - mercari.KEYWORD_STUCK_AFTER_SECONDS - 120,
+                mercari.LAST_SEARCH_OK_KEY: base - 60,
+                mercari.FULL_SCAN_STATE_KEY: base - 60,
+            },
+        )
+        api = FakeMercapi({"ok": [FakeItem("m1", "item", 1000)], "broken": []},
+                          fail_keywords=["broken"])
+
+        with patch.object(mercari, "Mercapi", return_value=api), patch.object(
+            mercari, "current_time", return_value=base
+        ):
+            await mercari.collect_updates()
+
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        ids = [e["alert_id"] for e in state["pending"]]
+        self.assertTrue(any(i.startswith("health:keyword-down:broken:") for i in ids), ids)
+
+
 if __name__ == "__main__":
     unittest.main()

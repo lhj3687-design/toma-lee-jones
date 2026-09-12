@@ -26,6 +26,7 @@ on:
 
 permissions:
   contents: write
+  actions: read   # 실패 알림에서 직전 실행의 성공 여부를 확인하는 데 씁니다
 
 jobs:
   squash:
@@ -69,3 +70,15 @@ jobs:
           echo "압축 전 크기: ${{ steps.check.outputs.size_mb }} MB"
           echo "실제 용량 회수는 GitHub가 내부 정리를 수행한 뒤에 반영되며, 보통 며칠 걸립니다."
           echo "알림 봇은 다음 실행에서 새 이력을 그대로 이어받습니다(상태 파일 내용이 보존되므로 영향 없음)."
+
+      # 이 워크플로는 주 1회만 돌기 때문에, 실패해도 알리지 않으면 Actions 탭을 열어
+      # 보기 전에는 몇 주가 지나도 모릅니다. 알림 봇과 같은 방식으로 한 번만 알립니다.
+      - name: Notify on failure
+        if: failure()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_FILE: squash-history.yml
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: bash scripts/notify_failure.sh
