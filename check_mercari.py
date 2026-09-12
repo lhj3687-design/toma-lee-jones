@@ -67,6 +67,7 @@ RESERVED_STATE_KEYS = (FULL_SCAN_STATE_KEY, LAST_SEARCH_OK_KEY, LAST_CREATED_OK_
 # 한 번 실패했다고 바로 알리지는 않습니다(일시적인 네트워크 오류로 헛알림이 가지 않도록).
 HEALTH_ALERT_AFTER_SECONDS = 10 * 60
 # 고장이 계속되는 동안 1분마다 알림이 쏟아지지 않도록, 이 간격당 최대 한 번만 알립니다.
+# 간격은 벽시계가 아니라 '고장이 시작된 시점'부터 셉니다(outage_bucket 참고).
 HEALTH_ALERT_COOLDOWN_SECONDS = 6 * 60 * 60
 
 # 키워드 하나만 막히는 경우를 잡는 기준입니다.
@@ -88,6 +89,11 @@ SEND_INTERVAL_SECONDS = 1.5
 MAX_SEND_ATTEMPTS_PER_RUN = 40
 MAX_ALERT_ATTEMPTS = 3
 MAX_CONSECUTIVE_SEND_FAILURES = 5
+# 건수 상한만으로는 실행 시간이 묶이지 않습니다. 텔레그램이 레이트리밋(429)을 걸면
+# 한 건마다 최대 1분을 기다리므로, 상한 40건이 곧 40분이 될 수 있습니다.
+# 워크플로는 concurrency 그룹으로 한 번에 하나만 돌기 때문에 그동안 모든 조회가 멈춥니다.
+# 시간 상한을 따로 둬서, 오래 걸리는 실행은 남은 대기열을 다음 실행에 넘기고 끝냅니다.
+MAX_SEND_SECONDS_PER_RUN = 4 * 60
 
 # 등록 시각 기준으로 '신규'를 판정할 때 쓰는 여유값들(초 단위).
 # GRACE: 크론 지연·실행 큐 대기 때문에 직전 조회 시각이 조금 밀릴 수 있어 그만큼 넉넉히 봅니다.
@@ -199,8 +205,17 @@ def load_state() -> tuple[dict, list, list, dict, set, dict]:
     try:
         data = json.loads(SEEN_FILE.read_text())
     except Exception as exc:
-        print(f"[상태 파일 읽기 실패] {exc}", file=sys.stderr)
-        return empty
+        # 파일이 있는데 읽지 못하는 상황에서 빈 상태로 출발하면 두 가지를 한꺼번에 잃습니다.
+        #   - sent_alerts: 이미 보낸 알림 기록이 사라져 예전 알림이 다시 나갈 수 있습니다.
+        #   - 원본: 이어지는 save_state가 깨진 파일을 '정상' 파일로 덮어써, 되돌릴 대상마저 사라집니다.
+        # 조용히 지나가는 대신 실행을 멈춥니다. 워크플로가 실패하면 텔레그램으로 알림이 가고,
+        # 상태 파일은 git에 남아 있으므로 직전 정상본으로 되돌리면 그대로 복구됩니다.
+        raise RuntimeError(
+            f"상태 파일({SEEN_FILE})을 읽지 못했습니다: {exc}\n"
+            "빈 상태로 새로 시작하면 이미 보낸 알림이 다시 나갈 수 있어 실행을 멈춥니다.\n"
+            "git 이력에서 직전 정상본을 되돌린 뒤 다시 실행해 주세요 "
+            "(예: git checkout HEAD~1 -- seen_items.json)."
+        ) from exc
 
     if isinstance(data, list):
         return ({item_id: None for item_id in data},) + empty[1:]
@@ -250,8 +265,17 @@ def is_usable_fingerprint(key: str) -> bool:
 
 
 def prune_fingerprints(relist_fingerprints: dict) -> dict:
-    """다시 조회될 일이 없는 재출품 지문을 걸러냅니다."""
-    return {key: value for key, value in relist_fingerprints.items() if is_usable_fingerprint(key)}
+    """다시 조회될 일이 없는 재출품 지문을 걸러냅니다.
+
+    값이 dict가 아닌 지문도 함께 버립니다. 지금 코드는 지문 값에서 item_id와 가격을
+    꺼내 쓰는데(matched.get(...)), 예전 형식이 섞여 들어오면 그 순간 조회가 통째로
+    죽고 다음 실행에서도 같은 자리에서 다시 죽습니다.
+    """
+    return {
+        key: value
+        for key, value in relist_fingerprints.items()
+        if is_usable_fingerprint(key) and isinstance(value, dict)
+    }
 
 
 def alert_key(entry: dict) -> str:
@@ -272,12 +296,27 @@ def unique_recent(values: list[str], limit: int) -> list[str]:
     return result[-limit:]
 
 
+def has_sendable_caption(entry: dict) -> bool:
+    """텔레그램으로 실제 보낼 수 있는 본문이 있는지 확인합니다.
+
+    본문이 없는 항목은 전송을 시도하는 순간 터지는데, 터지면 그 항목이 대기열에
+    그대로 남아 다음 실행도 같은 자리에서 터집니다. 즉 한 번 섞여 들어오면
+    전송 단계가 영영 멈춥니다. 대기열을 만들 때 걸러 내는 편이 안전합니다.
+    """
+    caption = entry.get("caption")
+    return isinstance(caption, str) and bool(caption.strip())
+
+
 def deduplicate_pending(pending: list, sent_alerts: list) -> list:
     sent_keys = set(sent_alerts)
     pending_keys = set()
     result = []
+    broken = 0
     for entry in pending:
         if not isinstance(entry, dict):
+            continue
+        if not has_sendable_caption(entry):
+            broken += 1
             continue
         key = alert_key(entry)
         if key in sent_keys or key in pending_keys:
@@ -286,6 +325,8 @@ def deduplicate_pending(pending: list, sent_alerts: list) -> list:
         normalized.setdefault("alert_id", key)
         result.append(normalized)
         pending_keys.add(key)
+    if broken:
+        print(f"[경고] 본문이 없는 대기 알림 {broken}건을 버렸습니다", file=sys.stderr)
     if len(result) > MAX_PENDING_ALERTS:
         # 상한을 넘으면 가장 오래된 알림부터 버려집니다. 조용히 사라지면 원인을 찾기
         # 어려우므로 반드시 로그를 남깁니다(평소에는 절대 찍히지 않아야 정상입니다).
@@ -574,7 +615,12 @@ async def flush_pending(
     sent = 0
     consecutive_failures = 0
     attempted = 0
+    started_at = current_time()
+    out_of_time = False
     while remaining and attempted < MAX_SEND_ATTEMPTS_PER_RUN:
+        if current_time() - started_at >= MAX_SEND_SECONDS_PER_RUN:
+            out_of_time = True
+            break
         entry = remaining[0]
         key = alert_key(entry)
         if key in sent_keys:
@@ -586,7 +632,7 @@ async def flush_pending(
             # (재시도는 다음 실행에서 — 일시적인 장애가 회복될 시간을 줍니다.)
             break
         attempted += 1
-        ok, retry_after = await send_telegram(entry["caption"], entry.get("photo"))
+        ok, retry_after = await send_telegram(entry.get("caption") or "", entry.get("photo"))
         if ok:
             sent_alerts.append(key)
             sent_keys.add(key)
@@ -604,6 +650,10 @@ async def flush_pending(
             await asyncio.sleep(SEND_INTERVAL_SECONDS)
             continue
         if retry_after and retry_after <= 60:
+            if current_time() - started_at + retry_after >= MAX_SEND_SECONDS_PER_RUN:
+                # 기다렸다가 보내면 시간 상한을 넘깁니다. 대기열은 그대로 두고 다음 실행에 넘깁니다.
+                out_of_time = True
+                break
             print(f"[레이트리밋] {retry_after}초 대기 후 재시도", file=sys.stderr)
             await asyncio.sleep(retry_after + 1)
             continue
@@ -627,7 +677,12 @@ async def flush_pending(
                 file=sys.stderr,
             )
             break
-    if remaining and attempted >= MAX_SEND_ATTEMPTS_PER_RUN:
+    if remaining and out_of_time:
+        print(
+            f"[이번 실행 전송 시간 상한({MAX_SEND_SECONDS_PER_RUN // 60}분) 도달 -> 나머지는 다음 실행에서]",
+            file=sys.stderr,
+        )
+    elif remaining and attempted >= MAX_SEND_ATTEMPTS_PER_RUN:
         print(
             f"[이번 실행 전송 상한({MAX_SEND_ATTEMPTS_PER_RUN}건) 도달 -> 나머지는 다음 실행에서]",
             file=sys.stderr,
@@ -891,6 +946,25 @@ def process_items(
     )
 
 
+def outage_bucket(down_for: float) -> int:
+    """고장이 이어지는 동안 지금이 '몇 번째 쿨다운 구간'인지 돌려줍니다.
+
+    예전에는 벽시계 절대 시각(now // COOLDOWN)으로 구간을 나눴습니다. 그러면 두 가지가 어긋납니다.
+
+      1) 구간 경계(6시간 쿨다운이면 UTC 00/06/12/18시)를 넘는 순간, 고장이 이어지는
+         중인데도 구간 번호가 바뀌어 알림이 한 번 더 나갑니다. 고장이 경계 직전에
+         시작되면 1분 간격으로 두 건이 오는데, 이건 "6시간당 한 번"이 아닙니다.
+      2) 알림 id가 벽시계에 묶여서, 같은 성질("고장이 이어지는 동안은 같은 id")을
+         검사하는 테스트가 경계 앞뒤에서만 깨집니다. 워크플로는 테스트가 실패하면
+         조회·전송 단계를 건너뛰므로, 실제로 2026-09-12 UTC 05:49~05:59에
+         11회 연속 실패로 봇이 멈췄습니다(하루 네 번 반복될 수 있던 문제).
+
+    고장이 시작된 시점부터 세면 둘 다 사라집니다. 첫 알림 이후 정확히 쿨다운
+    간격마다 한 번씩만 나가고, id가 벽시계와 무관해집니다.
+    """
+    return int(max(down_for, 0.0) // HEALTH_ALERT_COOLDOWN_SECONDS)
+
+
 def health_alerts(searched: list, keyword_checked_at: dict, now: float) -> list:
     """봇이 멈춘 것 같으면 알림을 만들고, 다시 살아나면 복구 알림을 만듭니다.
 
@@ -899,7 +973,8 @@ def health_alerts(searched: list, keyword_checked_at: dict, now: float) -> list:
 
     알림 폭탄을 막는 장치가 두 겹입니다.
       - 한 번 실패했다고 바로 알리지 않고, 마지막 성공으로부터 일정 시간이 지나야 알립니다.
-      - alert_id에 시간 구간을 넣어, 고장이 이어져도 그 구간당 한 번만 나갑니다
+      - alert_id에 '고장이 시작된 뒤 몇 번째 쿨다운 구간인지'를 넣어, 고장이 이어져도
+        그 구간당 한 번만 나갑니다
         (이미 보낸 알림을 거르는 기존 sent_alerts 장치가 그대로 적용됩니다).
     """
     if not searched:
@@ -933,10 +1008,10 @@ def health_alerts(searched: list, keyword_checked_at: dict, now: float) -> list:
         return []
 
     minutes = int(down_for // 60)
-    bucket = int(now // HEALTH_ALERT_COOLDOWN_SECONDS)
+    bucket = outage_bucket(down_for)
     return [
         {
-            "alert_id": f"health:search-down:{bucket}",
+            "alert_id": f"health:search-down:{int(last_ok)}:{bucket}",
             "caption": (
                 f"⚠️ 메루카리 알림봇 이상\n"
                 f"약 {minutes}분째 모든 키워드 검색이 실패하고 있습니다.\n"
@@ -1004,10 +1079,10 @@ def created_coverage_alerts(searched: list, keyword_checked_at: dict, now: float
         return []
 
     minutes = int((now - last_ok) // 60)
-    bucket = int(now // HEALTH_ALERT_COOLDOWN_SECONDS)
+    bucket = outage_bucket(now - last_ok)
     return [
         {
-            "alert_id": f"health:created-missing:{bucket}",
+            "alert_id": f"health:created-missing:{int(last_ok)}:{bucket}",
             "caption": (
                 f"⚠️ 메루카리 알림봇 방어선 이상\n"
                 f"매물 등록 시각을 {with_created}/{total}건({ratio:.0%})만 받아오고 있습니다 "
@@ -1032,9 +1107,24 @@ def keyword_health_alerts(searched: list, previous_checked_at: dict, now: float)
 
     봇 전체가 죽은 실행에서는 아무것도 내보내지 않습니다. 그런 실행에서 키워드마다
     알림을 만들면 한 번에 17건이 쏟아지기 때문입니다(그 상황은 health_alerts가 한 건으로 알립니다).
+
+    봇 전체가 한동안 멈춰 있다가 살아난 실행에서도 마찬가지입니다. 그때는 모든 키워드가
+    동시에 '오래 막혀 있었다'가 되기 때문에, 막아 두지 않으면 복구되는 순간
+    "✅ [키워드] 검색 재개"가 키워드 수만큼(지금은 18건) 한꺼번에 쏟아집니다.
+    같은 소식을 health_alerts가 이미 "✅ 정상 복구" 한 건으로 알리므로 전부 군더더기입니다.
+    여기서 다루려는 건 어디까지나 '다른 키워드는 멀쩡한데 이 키워드만' 막힌 경우입니다.
     """
     alive = any(coverage for _k, _i, _c, coverage, _cut in searched)
     if not alive:
+        return []
+
+    # previous_checked_at은 이번 실행 '전'의 값이라, 여기 담긴 마지막 검색 성공 시각이
+    # 곧 봇 전체가 얼마나 멈춰 있었는지입니다.
+    last_search_ok = previous_checked_at.get(LAST_SEARCH_OK_KEY)
+    if (
+        isinstance(last_search_ok, (int, float))
+        and now - float(last_search_ok) >= KEYWORD_STUCK_AFTER_SECONDS
+    ):
         return []
 
     alerts = []
@@ -1056,10 +1146,10 @@ def keyword_health_alerts(searched: list, previous_checked_at: dict, now: float)
                 }
             )
         else:
-            bucket = int(now // HEALTH_ALERT_COOLDOWN_SECONDS)
+            bucket = outage_bucket(stuck_for)
             alerts.append(
                 {
-                    "alert_id": f"health:keyword-down:{keyword}:{bucket}",
+                    "alert_id": f"health:keyword-down:{keyword}:{int(last_ok)}:{bucket}",
                     "caption": (
                         f"⚠️ [{keyword}] 검색이 약 {minutes}분째 실패하고 있습니다.\n"
                         f"다른 키워드는 정상이라 이 키워드 알림만 멈춘 상태입니다."

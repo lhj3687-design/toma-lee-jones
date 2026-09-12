@@ -20,21 +20,24 @@ sys.path.insert(0, str(ROOT))
 mercari = importlib.import_module("check_mercari")
 
 
-def bucket_safe_now() -> float:
-    """쿨다운 버킷 경계에 걸리지 않는 '지금'을 돌려줍니다.
+def just_before_a_wall_clock_boundary() -> float:
+    """다음 벽시계 구간 경계 1분 전을 돌려줍니다(6시간 쿨다운이면 UTC 00/06/12/18시 직전).
 
-    고장 알림의 alert_id에는 int(now // HEALTH_ALERT_COOLDOWN_SECONDS)로 계산한
-    시간 구간이 들어갑니다. 기준 시각을 실제 벽시계로 잡으면, 하루 네 번 찾아오는
-    구간 경계(UTC 00/06/12/18시) 직전에 테스트가 돌 때 base와 base+오프셋이 서로
-    다른 구간에 떨어져 "고장이 이어지는 동안은 같은 alert_id"라는 단언이 깨집니다.
-    코드가 멀쩡한데도 경계 앞 10분 동안만 봇 워크플로가 통째로 실패했습니다.
+    2026-09-12 사고의 재발 방지선입니다. 그때 고장 알림의 alert_id는
+    int(now // HEALTH_ALERT_COOLDOWN_SECONDS), 즉 벽시계 절대 시각으로 만든 구간
+    번호를 달고 있었습니다. 그래서 경계를 사이에 둔 두 시각의 id가 서로 달랐고,
 
-    그래서 기준 시각을 구간 시작 직후로 내려 둡니다. 검사하려는 성질(같은 구간
-    안에서는 id가 같다)은 그대로 두면서 시계에 대한 의존만 없앱니다.
+      - 고장이 이어지는 중인데도 경계를 넘는 순간 알림이 한 번 더 나갔습니다
+        (경계 직전에 시작된 고장이면 1분 간격으로 두 건).
+      - "고장이 이어지는 동안은 같은 id"를 검사하는 테스트가 경계 앞 10분에만 깨졌고,
+        워크플로는 테스트가 실패하면 조회·전송을 건너뛰므로 봇이 하루 네 번,
+        10분씩 멈췄습니다(실제로 UTC 05:49~05:59에 11회 연속 실패).
+
+    지금은 고장이 시작된 시점부터 구간을 세므로 경계를 넘어도 id가 같아야 합니다.
+    아래 쿨다운 테스트들은 일부러 경계를 걸치는 시각을 써서 그 성질을 지킵니다.
     """
-    now = datetime.now().timestamp()
     cooldown = mercari.HEALTH_ALERT_COOLDOWN_SECONDS
-    return (now // cooldown) * cooldown + 60
+    return (datetime.now().timestamp() // cooldown + 1) * cooldown - 60
 
 
 def keyword_checkpoints(state: dict) -> dict:
@@ -269,6 +272,61 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Chrome Hearts", known_keywords)
         # 이번에 새로 추가한 키워드는 레거시 시드 목록에 없어야 함(=첫 조회 시 알림 억제 대상)
         self.assertNotIn("Gunter Wermekes", known_keywords)
+
+    def test_a_broken_state_file_stops_the_run_instead_of_starting_empty(self):
+        """읽지 못하는 상태 파일을 빈 상태로 갈음하면 두 가지를 한꺼번에 잃습니다.
+
+        sent_alerts가 사라져 이미 보낸 알림이 다시 나가고, 이어지는 save_state가
+        깨진 파일을 정상 파일로 덮어써 되돌릴 원본까지 사라집니다.
+        조용히 넘어가는 대신 멈춰서, 워크플로 실패 알림으로 사람이 알게 해야 합니다.
+        """
+        mercari.SEEN_FILE.write_text("{이건 JSON이 아닙니다")
+        before = mercari.SEEN_FILE.read_text()
+
+        with self.assertRaises(RuntimeError):
+            mercari.load_state()
+
+        self.assertEqual(mercari.SEEN_FILE.read_text(), before)  # 원본은 그대로 남습니다
+
+    def test_missing_state_file_still_starts_clean(self):
+        # 파일이 아예 없는 건 정상적인 첫 실행입니다. 이때는 멈추면 안 됩니다.
+        seen, pending, sent, fingerprints, _known, checked_at = mercari.load_state()
+        self.assertEqual((seen, pending, sent, fingerprints, checked_at), ({}, [], [], {}, {}))
+
+    def test_fingerprints_with_unexpected_values_are_dropped(self):
+        # 지문 값에서 item_id와 가격을 꺼내 쓰므로, dict가 아닌 값이 섞이면
+        # 조회가 통째로 죽고 다음 실행도 같은 자리에서 다시 죽습니다.
+        pruned = mercari.prune_fingerprints(
+            {"seller:1:t": {"item_id": "m1"}, "seller:2:t": "m2", "title:t:100": None}
+        )
+        self.assertEqual(sorted(pruned), ["seller:1:t"])
+
+    def test_pending_entries_without_a_caption_are_dropped(self):
+        """본문 없는 항목은 전송 시 터지고, 터지면 대기열에 남아 다음 실행도 터집니다.
+
+        즉 한 번 섞여 들어오면 전송 단계가 영영 멈춥니다. 대기열을 만들 때 걸러 냅니다.
+        """
+        pending = [
+            {"alert_id": "new:broken"},
+            {"alert_id": "new:empty", "caption": "   "},
+            {"alert_id": "new:ok", "caption": "정상"},
+        ]
+        kept = mercari.deduplicate_pending(pending, [])
+        self.assertEqual([entry["alert_id"] for entry in kept], ["new:ok"])
+
+    async def test_a_caption_less_entry_does_not_crash_the_send_step(self):
+        # 어떤 경로로든 본문 없는 항목이 상태 파일에 남아 있었다면, 전송 단계가
+        # 예외로 죽는 대신 그 항목만 버리고 나머지를 정상적으로 보내야 합니다.
+        mercari.save_state({}, [{"alert_id": "new:broken"}, {"alert_id": "new:ok", "caption": "정상"}], [], {}, set())
+
+        with patch.object(mercari, "send_telegram", new=AsyncMock(return_value=(True, None))), patch.object(
+            mercari, "push_state", return_value=True
+        ):
+            await mercari.send_pending()
+
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        self.assertEqual(state["pending"], [])
+        self.assertEqual(state["sent_alerts"], ["new:ok"])
 
     def test_save_state_removes_duplicate_and_already_sent_alerts(self):
         pending = [
@@ -674,6 +732,50 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sent_alerts), mercari.MAX_SEND_ATTEMPTS_PER_RUN)
         self.assertEqual(len(remaining), 10)  # 나머지는 대기열에 그대로 보존
 
+    async def test_send_stops_when_the_run_time_budget_is_spent(self):
+        """건수 상한만으로는 실행 시간이 묶이지 않습니다.
+
+        텔레그램이 레이트리밋을 걸면 한 건마다 최대 1분을 기다리므로 상한 40건이
+        곧 40분이 될 수 있고, concurrency 그룹 때문에 그동안 조회까지 전부 멈춥니다.
+        시간 상한에 닿으면 남은 대기열을 그대로 두고 이번 실행을 끝내야 합니다.
+        """
+        pending = [{"alert_id": f"new:{i}", "caption": str(i)} for i in range(5)]
+        # 한 번 볼 때마다 100초씩 흐르는 시계: 예산(4분)이 곧 바닥납니다.
+        elapsed = {"now": 0.0}
+
+        def ticking_clock():
+            elapsed["now"] += 100.0
+            return elapsed["now"]
+
+        with patch.object(mercari, "send_telegram", new=AsyncMock(return_value=(True, None))), patch.object(
+            mercari, "push_state", return_value=True
+        ), patch.object(mercari, "current_time", side_effect=ticking_clock):
+            remaining, sent_alerts = await mercari.flush_pending({}, pending, [], {}, set(), {})
+
+        self.assertEqual(sent_alerts, ["new:0", "new:1"])
+        # 남은 건은 한 건도 잃지 않고 다음 실행으로 넘어갑니다.
+        self.assertEqual([e["alert_id"] for e in remaining], ["new:2", "new:3", "new:4"])
+
+    async def test_rate_limit_wait_never_exceeds_the_run_time_budget(self):
+        # 429가 이어질 때 "기다렸다 재시도"만 반복하면 한 실행이 수십 분을 잡아먹습니다.
+        pending = [{"alert_id": f"new:{i}", "caption": str(i)} for i in range(5)]
+        elapsed = {"now": 0.0}
+
+        def ticking_clock():
+            elapsed["now"] += 60.0
+            return elapsed["now"]
+
+        with patch.object(
+            mercari, "send_telegram", new=AsyncMock(return_value=(False, 60))
+        ), patch.object(mercari, "push_state", return_value=True), patch.object(
+            mercari, "current_time", side_effect=ticking_clock
+        ):
+            remaining, sent_alerts = await mercari.flush_pending({}, pending, [], {}, set(), {})
+
+        self.assertEqual(sent_alerts, [])
+        self.assertEqual(len(remaining), 5)  # 대기열은 그대로 보존
+        self.assertLess(mercari.asyncio.sleep.await_count, 5)  # 예산을 넘겨 가며 기다리지 않음
+
     async def test_photo_failure_falls_back_to_a_text_message(self):
         # 메루카리 썸네일은 webp라 텔레그램이 사진으로 거부하는 경우가 있습니다.
         # 사진 때문에 알림 자체를 놓치면 안 됩니다.
@@ -952,7 +1054,9 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_repeated_failures_reuse_one_alert_id_within_the_cooldown(self):
         # 고장이 계속돼도 1분마다 알림이 쏟아지면 안 됩니다.
-        base = bucket_safe_now()
+        # base와 base+300초는 벽시계 구간 경계를 사이에 두고 있습니다. 예전처럼 절대
+        # 시각으로 구간을 나누면 여기서 id가 갈라집니다(2026-09-12 사고).
+        base = just_before_a_wall_clock_boundary()
         checked_at = {mercari.LAST_SEARCH_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 60}
         searched = [("kw", [], False, False, 0.0)]
 
@@ -964,6 +1068,32 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             searched, dict(checked_at), base + mercari.HEALTH_ALERT_COOLDOWN_SECONDS
         )[0]["alert_id"]
         self.assertNotEqual(first, after_cooldown)  # 쿨다운이 지나면 다시 알립니다
+
+    async def test_a_long_outage_alerts_exactly_once_per_cooldown(self):
+        """고장이 이어지는 동안 알림은 '고장 시작 시점 기준'으로 쿨다운마다 한 번입니다.
+
+        예전에는 벽시계 절대 시각으로 구간을 나눠서, 경계를 넘는 순간 고장이 이어지는
+        중인데도 한 건이 더 나갔습니다(최악의 경우 1분 간격으로 두 건).
+        """
+        searched = [("kw", [], False, False, 0.0)]
+        start = just_before_a_wall_clock_boundary() - mercari.HEALTH_ALERT_AFTER_SECONDS
+        cooldown = mercari.HEALTH_ALERT_COOLDOWN_SECONDS
+
+        delivered = []
+        for minute in range(24 * 60 + 1):  # 24시간을 1분 간격으로 재현
+            for alert in mercari.health_alerts(
+                searched, {mercari.LAST_SEARCH_OK_KEY: start}, start + minute * 60
+            ):
+                if alert["alert_id"] not in delivered:  # sent_alerts가 하는 일과 동일
+                    delivered.append(alert["alert_id"])
+
+        # 10분째 첫 알림, 이후 6시간마다 한 번 -> 24시간에 5건.
+        self.assertEqual(len(delivered), 5)
+        self.assertEqual(len(set(delivered)), 5)
+        self.assertEqual(
+            delivered[0], f"health:search-down:{int(start)}:0"
+        )
+        self.assertEqual(delivered[-1], f"health:search-down:{int(start)}:{24 * 3600 // cooldown}")
 
     async def test_recovery_alert_after_an_outage(self):
         base = datetime.now().timestamp()
@@ -1076,6 +1206,27 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(alerts[0]["alert_id"].startswith("health:keyword-up:kw:"))
         self.assertIn("재개", alerts[0]["caption"])
 
+    async def test_bot_wide_outage_does_not_fire_a_recovery_alert_per_keyword(self):
+        """봇 전체가 멈췄다 살아나면 모든 키워드가 동시에 '오래 막혀 있었다'가 됩니다.
+
+        막아 두지 않으면 복구되는 순간 "✅ [키워드] 검색 재개"가 키워드 수만큼
+        한꺼번에 쏟아집니다. 같은 소식을 health_alerts가 이미 한 건으로 알립니다.
+        """
+        base = datetime.now().timestamp()
+        outage_started = base - mercari.KEYWORD_STUCK_AFTER_SECONDS - 600
+        keywords = [f"kw-{i}" for i in range(18)]
+        searched = [(k, [], True, True, 0.0) for k in keywords]
+        previous = {k: outage_started for k in keywords}
+        previous[mercari.LAST_SEARCH_OK_KEY] = outage_started
+
+        self.assertEqual(mercari.keyword_health_alerts(searched, previous, base), [])
+
+        # 전체 고장이 아니었다면(봇은 계속 돌고 있었다면) 평소대로 그 키워드만 알립니다.
+        previous[mercari.LAST_SEARCH_OK_KEY] = base - 60
+        alerts = mercari.keyword_health_alerts(searched[:1], previous, base)
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("재개", alerts[0]["caption"])
+
     async def test_keyword_without_a_baseline_is_not_judged(self):
         # 처음 추가한 키워드는 기준선이 없으므로 고장으로 오인하면 안 됩니다.
         base = datetime.now().timestamp()
@@ -1083,7 +1234,8 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mercari.keyword_health_alerts(searched, {}, base), [])
 
     async def test_stuck_keyword_alert_is_rate_limited(self):
-        base = bucket_safe_now()
+        # base와 base+600초가 벽시계 구간 경계를 사이에 둡니다(위 헬퍼 설명 참고).
+        base = just_before_a_wall_clock_boundary()
         stuck = base - mercari.KEYWORD_STUCK_AFTER_SECONDS - 120
         previous = {"kw": stuck}
         searched = [("kw", [], False, False, 0.0), ("other", [], True, True, 0.0)]
@@ -1177,7 +1329,8 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(alerts[0]["alert_id"].startswith("health:created-missing:"))
 
     async def test_created_alert_is_rate_limited_and_recovers(self):
-        base = bucket_safe_now()
+        # base와 base+600초가 벽시계 구간 경계를 사이에 둡니다(위 헬퍼 설명 참고).
+        base = just_before_a_wall_clock_boundary()
         stale = base - mercari.HEALTH_ALERT_AFTER_SECONDS - 120
         first = mercari.created_coverage_alerts(
             self._items(0, 50), {mercari.LAST_CREATED_OK_KEY: stale}, base
