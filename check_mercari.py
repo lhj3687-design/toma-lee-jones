@@ -103,6 +103,19 @@ NEW_ITEM_GRACE_SECONDS = 15 * 60
 FIRST_RUN_LOOKBACK_SECONDS = 60 * 60
 MAX_LOOKBACK_SECONDS = 24 * 60 * 60
 
+
+class SendBlocked(RuntimeError):
+    """이번 실행의 텔레그램 전송이 통째로 막혔습니다(토큰 오류, 텔레그램 장애 등).
+
+    개별 알림의 문제와 구분해서 다뤄야 합니다. 한 건만 실패하는 건 그 알림을 포기하면
+    되지만, 전부 실패하는 건 사람이 손을 써야 하는 고장입니다. 그런데 전송 경로가
+    막힌 상태에서는 고장을 알릴 수단(텔레그램)도 같이 막혀 있어서, 대기열만 조용히
+    소모되고 워크플로는 초록색으로 남습니다. 이 예외로 전송 단계를 실패시켜서
+    Actions 탭과 기존 실행-실패 알림(scripts/notify_failure.sh, 별도의 curl 경로)에
+    드러나게 합니다.
+    """
+
+
 SEARCHES = [
     {"query": "Carol Christian Poell", "categories": []},
     {"query": "Martin Margiela", "categories": [30]},
@@ -608,6 +621,17 @@ async def flush_pending(
     한 건이 막혀서 뒤에 쌓인 정상 알림까지 지연되지 않게 하려는 것이며,
     같은 알림을 한 실행에서 두 번 시도하지는 않습니다(재시도는 다음 실행에서).
     전부 실패하거나 한 실행 전송 상한에 도달하면 남은 알림은 그대로 보존한 채 끝냅니다.
+
+    '이 알림만의 문제'와 '전송 경로가 막힌 것'은 한 실행에서 한 건이라도 전송됐는지로
+    가릅니다. 다른 알림은 잘 나갔는데 이 건만 실패했다면 그 알림 쪽 문제이므로 재시도
+    횟수를 세고 MAX_ALERT_ATTEMPTS에서 포기합니다. 반대로 한 건도 못 보냈다면 어느
+    알림 탓이라고 할 근거가 없으므로, 이번 실행에서 올린 재시도 횟수를 되돌리고
+    SendBlocked를 올립니다.
+
+    되돌리지 않으면 장애가 이어지는 동안 멀쩡한 알림들이 차례로 MAX_ALERT_ATTEMPTS에
+    걸려 폐기됩니다. 봇이 1분마다 도니까 텔레그램이나 토큰이 몇 시간 막히면 대기열이
+    소리 없이 비어 버리는데, 전송 경로가 막힌 상태에서는 그 사실을 알릴 수단도 같이
+    막혀 있어서 워크플로만 초록색으로 남습니다.
     """
     remaining = list(pending)
     sent_keys = set(sent_alerts)
@@ -617,6 +641,12 @@ async def flush_pending(
     attempted = 0
     started_at = current_time()
     out_of_time = False
+    # 이번 실행에서 재시도 횟수를 올린 알림들입니다. 한 건도 전송되지 않은 채 실행이
+    # 끝나면 되돌립니다(개별 알림의 잘못이라고 볼 근거가 없으므로).
+    failed_entries: list[dict] = []
+    # 재시도 한도를 다 써서 버린 알림들. 로그는 '막힌 실행'인지 판정된 뒤에 남깁니다
+    # (막힌 실행에서는 한도를 되돌리므로 버리지 않습니다).
+    abandoned: list[dict] = []
     while remaining and attempted < MAX_SEND_ATTEMPTS_PER_RUN:
         if current_time() - started_at >= MAX_SEND_SECONDS_PER_RUN:
             out_of_time = True
@@ -661,9 +691,10 @@ async def flush_pending(
         consecutive_failures += 1
         failed_keys.add(key)
         entry["attempts"] = entry.get("attempts", 0) + 1
+        failed_entries.append(entry)
         remaining.pop(0)
         if entry["attempts"] >= MAX_ALERT_ATTEMPTS:
-            print(f"[알림 포기: {MAX_ALERT_ATTEMPTS}회 실패] {entry['caption'][:50]}", file=sys.stderr)
+            abandoned.append(entry)
         else:
             # 실패한 알림을 맨 앞에 그대로 두면 그 한 건 때문에 뒤에 쌓인 알림이 전부
             # 막혀서(매 실행 1회 재시도 -> 15분 정체) 정상 알림까지 늦어집니다.
@@ -689,6 +720,24 @@ async def flush_pending(
         )
     if sent:
         print(f"텔레그램 알림 {sent}건 전송 완료")
+    if failed_entries and not sent:
+        # 한 건도 못 보냈으니 어느 알림 탓이라고 볼 근거가 없습니다. 재시도 횟수를
+        # 되돌려서, 장애가 이어지는 동안 멀쩡한 알림이 폐기되지 않게 합니다.
+        for entry in failed_entries:
+            attempts = entry.get("attempts", 1) - 1
+            if attempts > 0:
+                entry["attempts"] = attempts
+            else:
+                entry.pop("attempts", None)
+        # 대기열은 호출한 쪽이 넘겨준 그대로 남습니다(remaining을 돌려주지 않으므로
+        # 이번 실행에서 뒤로 미뤄 둔 순서 변경도 함께 사라집니다).
+        raise SendBlocked(
+            f"{len(failed_entries)}건을 시도했지만 한 건도 전송되지 않았습니다. "
+            "토큰/채팅 ID 설정이나 텔레그램 상태를 확인해 주세요."
+        )
+    for entry in abandoned:
+        caption = str(entry.get("caption", ""))[:50]
+        print(f"[알림 포기: {MAX_ALERT_ATTEMPTS}회 실패] {caption}", file=sys.stderr)
     return remaining, unique_recent(sent_alerts, MAX_SENT_ALERTS)
 
 
@@ -730,6 +779,14 @@ async def search_items(
     마지막 값을 따로 두는 이유: 새 매물을 책임지는 건 '등록순' 조회입니다. 등록순이
     실패했는데 추천순만 성공했다고 조회 시각을 갱신해 버리면, 그 구간에 올라온 매물이
     다음 실행에서 '오래된 매물'로 분류돼 영영 알림이 오지 않습니다.
+
+    같은 이유로, 등록순 조회가 '끝까지' 갔을 때만 훑었다고 인정합니다. 1페이지는
+    받았는데 2페이지에서 터진 경우는 훑지 못한 것입니다 — 2페이지를 요청했다는 건
+    1페이지가 전부 기준선 이후 등록분이어서 "뒤에 새 매물이 더 있다"고 판단했다는
+    뜻이므로, 거기서 실패하면 놓친 새 매물이 있을 가능성이 높습니다.
+    (페이지 상한 MAX_SEARCH_PAGES까지 다 쓴 경우는 예외로 인정합니다. 인정하지 않으면
+    매물이 쏟아지는 키워드의 기준선이 영영 전진하지 못해 매 실행 같은 구간을 다시 훑고,
+    키워드 단위 고장 알림까지 헛되게 울립니다.)
     """
     merged: dict = {}
     succeeded = False
@@ -740,6 +797,9 @@ async def search_items(
         if index:
             await asyncio.sleep(1)
         results = None
+        # 이 정렬 패스를 중간에 터지지 않고 끝까지 봤는지. 신규 매물 구간을 훑었다고
+        # 인정하는 조건입니다(위 docstring 참고).
+        pass_completed = False
         for page_number in range(MAX_SEARCH_PAGES):
             try:
                 if page_number == 0:
@@ -753,8 +813,6 @@ async def search_items(
                 )
                 break
             succeeded = True
-            if pass_name == NEW_ITEM_SORT_PASS:
-                new_item_coverage = True
             page = [item_fields(item) for item in list(getattr(results, "items", []) or [])]
             page = page[:MAX_ITEMS_PER_KEYWORD]
             for fields in page:
@@ -762,9 +820,16 @@ async def search_items(
                 if item_id and item_id not in merged:
                     merged[item_id] = fields
             if not wants_another_page(pass_name, results, page, created_cutoff):
+                pass_completed = True
                 break
             print(f"[{keyword}] 신규 매물이 한 페이지를 가득 채워 다음 페이지도 확인합니다")
             await asyncio.sleep(1)
+        else:
+            # 페이지 상한까지 다 쓴 경우입니다. 더 볼 수 있는 페이지가 남았을 수는 있지만,
+            # 이건 설계상 받아들인 상한이므로 '훑었다'로 인정합니다.
+            pass_completed = True
+        if pass_completed and pass_name == NEW_ITEM_SORT_PASS:
+            new_item_coverage = True
     if NEW_ITEM_SORT_PASS not in passes:
         # 등록순 조회를 쓸 수 없는 예외 상황(정렬 옵션 준비 실패)에서는
         # 예전처럼 '한 번이라도 성공했는지'로 판단합니다.
@@ -1194,9 +1259,35 @@ def report_feed_health(searched: list) -> None:
         )
 
 
+def forget_removed_keywords(known_keywords: set, keyword_checked_at: dict) -> None:
+    """SEARCHES에서 빠진 키워드의 기록을 지웁니다.
+
+    두 가지를 막습니다.
+      - 상태 파일이 조용히 커지는 것. 지우지 않으면 한 번 쓴 키워드의 조회 시각이
+        영영 남습니다(다른 항목들과 달리 여기에는 용량 상한이 없습니다).
+      - 키워드를 지웠다가 나중에 되살릴 때의 알림 폭탄. 예전 조회 시각이 남아 있으면
+        그 키워드는 '첫 조회'로 취급되지 않아서, 기준선만 저장하고 넘어가는 장치가
+        동작하지 않습니다. 그러면 되살린 순간 최대 MAX_LOOKBACK_SECONDS(24시간)치
+        매물이 한꺼번에 신규 알림으로 쏟아집니다.
+    """
+    configured = {search["query"] for search in SEARCHES}
+    removed = sorted(
+        (known_keywords | set(keyword_checked_at))
+        - configured
+        - set(RESERVED_STATE_KEYS)
+    )
+    if not removed:
+        return
+    for keyword in removed:
+        known_keywords.discard(keyword)
+        keyword_checked_at.pop(keyword, None)
+    print(f"[정리] SEARCHES에 없는 키워드 {len(removed)}개의 기록을 지웠습니다: {', '.join(removed)}")
+
+
 async def collect_updates() -> None:
     mercari = Mercapi()
     seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at = load_state()
+    forget_removed_keywords(known_keywords, keyword_checked_at)
     is_first_run = len(seen) == 0
     new_items: list = []
     now = current_time()
@@ -1312,6 +1403,10 @@ async def send_pending() -> None:
             seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at
         )
     finally:
+        # flush_pending이 SendBlocked로 끝난 경우에도 이 저장은 정확합니다.
+        # sent_alerts는 제자리에서 갱신되므로 이미 보낸 건이 반영되고, pending은 호출 전
+        # 값이라 이번 실행에서 건드린 순서 변경이 남지 않습니다. 그리고 save_state가
+        # sent_alerts에 있는 항목을 대기열에서 걸러 내므로 재전송도 생기지 않습니다.
         save_state(seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at)
 
     if pending:
@@ -1333,8 +1428,14 @@ async def main() -> None:
     args = parse_args()
     if args.mode == "collect":
         await collect_updates()
-    else:
+        return
+    try:
         await send_pending()
+    except SendBlocked as exc:
+        # 대기열과 전송 기록은 send_pending이 이미 저장했습니다. 여기서는 실행을
+        # 실패로 끝내서, 조용히 지나가지 않게만 합니다(SendBlocked 주석 참고).
+        print(f"[전송 단계 실패] {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":
