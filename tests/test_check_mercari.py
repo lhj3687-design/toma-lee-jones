@@ -20,6 +20,23 @@ sys.path.insert(0, str(ROOT))
 mercari = importlib.import_module("check_mercari")
 
 
+def bucket_safe_now() -> float:
+    """쿨다운 버킷 경계에 걸리지 않는 '지금'을 돌려줍니다.
+
+    고장 알림의 alert_id에는 int(now // HEALTH_ALERT_COOLDOWN_SECONDS)로 계산한
+    시간 구간이 들어갑니다. 기준 시각을 실제 벽시계로 잡으면, 하루 네 번 찾아오는
+    구간 경계(UTC 00/06/12/18시) 직전에 테스트가 돌 때 base와 base+오프셋이 서로
+    다른 구간에 떨어져 "고장이 이어지는 동안은 같은 alert_id"라는 단언이 깨집니다.
+    코드가 멀쩡한데도 경계 앞 10분 동안만 봇 워크플로가 통째로 실패했습니다.
+
+    그래서 기준 시각을 구간 시작 직후로 내려 둡니다. 검사하려는 성질(같은 구간
+    안에서는 id가 같다)은 그대로 두면서 시계에 대한 의존만 없앱니다.
+    """
+    now = datetime.now().timestamp()
+    cooldown = mercari.HEALTH_ALERT_COOLDOWN_SECONDS
+    return (now // cooldown) * cooldown + 60
+
+
 def keyword_checkpoints(state: dict) -> dict:
     """상태 파일의 키워드별 조회 시각만 추립니다(예약 키 제외)."""
     return {
@@ -935,7 +952,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_repeated_failures_reuse_one_alert_id_within_the_cooldown(self):
         # 고장이 계속돼도 1분마다 알림이 쏟아지면 안 됩니다.
-        base = datetime.now().timestamp()
+        base = bucket_safe_now()
         checked_at = {mercari.LAST_SEARCH_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 60}
         searched = [("kw", [], False, False, 0.0)]
 
@@ -1066,7 +1083,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mercari.keyword_health_alerts(searched, {}, base), [])
 
     async def test_stuck_keyword_alert_is_rate_limited(self):
-        base = datetime.now().timestamp()
+        base = bucket_safe_now()
         stuck = base - mercari.KEYWORD_STUCK_AFTER_SECONDS - 120
         previous = {"kw": stuck}
         searched = [("kw", [], False, False, 0.0), ("other", [], True, True, 0.0)]
@@ -1160,7 +1177,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(alerts[0]["alert_id"].startswith("health:created-missing:"))
 
     async def test_created_alert_is_rate_limited_and_recovers(self):
-        base = datetime.now().timestamp()
+        base = bucket_safe_now()
         stale = base - mercari.HEALTH_ALERT_AFTER_SECONDS - 120
         first = mercari.created_coverage_alerts(
             self._items(0, 50), {mercari.LAST_CREATED_OK_KEY: stale}, base
