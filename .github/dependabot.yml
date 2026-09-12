@@ -1,0 +1,35 @@
+# 새 릴리스가 나오면 Dependabot이 PR을 열어 줍니다. 그 PR에 tests.yml이 그대로 돌기
+# 때문에, 초록불이면 머지하시면 됩니다.
+#
+# 왜 이게 필요하냐면, 정기적으로 확인하는 게 사람에게 맞지 않는 주기이기 때문입니다.
+# mercapi 릴리스는 4년간 9개, 최근에는 연 1~2회이고 0.4.2 -> 0.5.0 사이에는 22개월
+# 공백이 있었습니다. 달력에 "분기마다 확인"을 걸어 두면 대부분 헛수고입니다.
+#
+# 그렇다고 범위를 열어 둘 수도 없습니다. 이 봇은 1분마다 스스로 배포되는 구조라,
+# 상한이 없으면 새 릴리스가 나온 그 실행부터 검증 없이 운영에 들어갑니다.
+# 그래서 상한은 그대로 두고(requirements.txt 주석 참고), 올릴 시점만 알려 주게 합니다.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: sunday
+      time: "05:00"
+      timezone: Etc/UTC
+    # 봇이 1분마다 상태를 커밋하는 저장소라 PR이 쌓이면 눈에 띄지 않습니다. 한 번에 하나만.
+    open-pull-requests-limit: 1
+    commit-message:
+      prefix: "chore(deps)"
+    labels: []
+
+  # 액션도 같이 봅니다. 지금은 메이저 태그(@v7)를 써서 패치는 자동으로 따라오지만,
+  # 메이저가 올라가면(v8) 알려 줘야 합니다 — Node 지원 종료 경고가 그렇게 왔습니다.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    commit-message:
+      prefix: "chore(actions)"
+    labels: []

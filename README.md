@@ -17,6 +17,7 @@
 | `.github/workflows/mercari-check.yml` | 알림 봇 본체 |
 | `.github/workflows/squash-history.yml` | 저장소가 커지면 이력을 자동 압축 |
 | `.github/workflows/tests.yml` | PR에서 테스트와 시계 스캔을 돌림(아래 "테스트" 참고) |
+| `.github/dependabot.yml` | 의존성 새 버전이 나오면 PR을 열어 줌(아래 "버전 고정" 참고) |
 
 ## 키워드 추가하기
 
@@ -362,9 +363,40 @@ record alert delivery    공통접두 0.47MB  공통접미 0.93MB  변경  137KB
 
 ### 파이썬 의존성
 
-`requirements.txt`는 상한을 둡니다(`mercapi~=0.4.2`, `httpx~=0.27`). 이 봇은 1분마다
-스스로 배포되는 구조라, 범위를 열어 두면 새 메이저 릴리스가 나온 그 실행부터 검증 없이
-운영에 들어갑니다. 올릴 때는 사람이 직접 바꾸고 테스트를 돌립니다.
+`requirements.txt`는 상한을 둡니다(`mercapi~=0.5.0`, `httpx~=0.28.1`). 이 봇은 1분마다
+스스로 배포되는 구조라, 범위를 열어 두면 새 릴리스가 나온 그 실행부터 검증 없이 운영에
+들어갑니다. **올릴 때는 반드시 PR로 올려서 CI(`tests.yml`)를 거칩니다** — `main`에 직접
+고치면 그 다음 실행이 곧 배포입니다.
+
+**두 줄은 함께 움직입니다.** `mercapi 0.5.0`이 `httpx>=0.28.1,<0.29`를 요구하므로
+한쪽만 올릴 수 없습니다. 2026-09-12에 `0.4.2 → 0.5.0`을 올릴 때 실제로 그랬습니다.
+
+#### 언제 올려야 하나
+
+**정기적으로 확인할 필요는 없습니다.** mercapi 릴리스는 4년간 9개, 최근에는 연 1~2회이고
+`0.4.2 → 0.5.0` 사이에는 22개월 공백이 있었습니다. 달력에 걸어 두면 헛수고가 대부분입니다.
+
+대신 `.github/dependabot.yml`이 **새 버전이 나오면 PR을 열어 줍니다**(주 1회 확인).
+그 PR에 기존 CI가 그대로 돌기 때문에, 초록불이면 머지하시면 됩니다.
+
+그 초록불이 실제로 의미를 가지려면 mercapi 표면을 검사해야 합니다 —
+`tests/test_mercapi_surface.py`가 그 역할입니다(아래 "테스트" 참고). 없으면 심볼이
+옮겨진 업그레이드도 그대로 통과합니다.
+
+#### 업그레이드할 때 확인한 것 (2026-09-12 기준)
+
+라이브러리가 바뀌면 봇이 기대는 표면이 그대로인지부터 봅니다.
+
+| 확인 | 방법 |
+|---|---|
+| `mercapi.requests`의 정렬·상태 상수 | `SortBy` / `SortOrder` / `Status` 심볼 존재 확인 |
+| `Mercapi.search()` 인자 | `categories` / `sort_by` / `sort_order` / `status` |
+| 응답 모델 필드 | `id_` `name` `price` `created` `thumbnails` `item_type` `seller_id` |
+| 봇의 httpx 사용 경로 | 로컬 서버를 텔레그램 대역으로 세워 `_telegram_post`를 실제로 태움 |
+
+정렬 상수는 특히 중요합니다. `build_search_options()`가 import 실패 시 **조용히 기본
+검색으로 물러나기** 때문에, 이름이 바뀌어도 봇은 죽지 않고 정렬 없이 돕니다(stderr 로그만
+남습니다). 즉 업그레이드가 깨져도 눈에 잘 띄지 않으니 미리 확인해야 합니다.
 
 ### 액션 버전
 
@@ -455,6 +487,13 @@ python -m unittest discover -s tests
 확인합니다(대기 시간만 가짜로 바꿔 1초 안에 끝납니다).
 `tests/test_notify_failure.py`는 실패 알림 스크립트를 `gh`·`curl`을 바꿔 끼운 채 돌려,
 **전송되지 않았는데 '보냈습니다'라고 하지 않는지** 확인합니다(위 "전송이 막혔을 때" 참고).
+`tests/test_mercapi_surface.py`는 봇이 기대는 mercapi의 표면(정렬 상수, `search()` 인자,
+결과 필드)이 그대로인지 확인합니다.
+
+이 파일만 **깨끗한 인터프리터를 따로 띄웁니다.** `test_check_mercari.py`가 mercapi를
+스텁으로 바꿔치기하기 때문에, 같은 프로세스에서는 진짜 라이브러리를 볼 수 없습니다.
+그래서 예전에는 **테스트 전체가 초록이어도 mercapi 호환성은 하나도 검증되지 않았고**,
+Dependabot이 mercapi를 올린 PR도 심볼이 옮겨졌든 말든 그대로 초록불이 됐습니다.
 
 ### 언제 도는가
 
