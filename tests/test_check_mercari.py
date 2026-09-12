@@ -1104,5 +1104,110 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(i.startswith("health:keyword-down:broken:") for i in ids), ids)
 
 
+    def _items(self, n_with_created, n_without):
+        rows = [
+            {"id_": f"c{i}", "created": datetime.now()} for i in range(n_with_created)
+        ] + [{"id_": f"n{i}"} for i in range(n_without)]
+        return [("kw", rows, True, True, 0.0)]
+
+    async def test_no_alert_while_created_is_healthy(self):
+        base = datetime.now().timestamp()
+        checked_at = {mercari.LAST_CREATED_OK_KEY: base - 60}
+        self.assertEqual(
+            mercari.created_coverage_alerts(self._items(100, 0), checked_at, base), []
+        )
+        self.assertEqual(checked_at[mercari.LAST_CREATED_OK_KEY], base)
+
+    async def test_single_bad_run_does_not_alert(self):
+        # 한 번 어긋났다고 바로 알리면 일시적인 응답 이상에 헛알림이 갑니다.
+        base = datetime.now().timestamp()
+        checked_at = {mercari.LAST_CREATED_OK_KEY: base - 60}
+        self.assertEqual(
+            mercari.created_coverage_alerts(self._items(0, 100), checked_at, base), []
+        )
+
+    async def test_alert_when_created_stays_missing(self):
+        base = datetime.now().timestamp()
+        checked_at = {
+            mercari.LAST_CREATED_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 120
+        }
+        alerts = mercari.created_coverage_alerts(self._items(0, 100), checked_at, base)
+        self.assertEqual(len(alerts), 1)
+        self.assertTrue(alerts[0]["alert_id"].startswith("health:created-missing:"))
+        self.assertIn("0%", alerts[0]["caption"])
+        # 이상이 이어지는 동안 마지막 정상 시각을 갱신하면 안 됩니다(경과 시간이 멈춥니다).
+        self.assertLess(checked_at[mercari.LAST_CREATED_OK_KEY], base)
+
+    async def test_partial_coverage_above_the_floor_is_tolerated(self):
+        # 일부 매물에 등록 시각이 없는 건 정상 변동 범위로 봅니다.
+        # 직전까지 정상이었으므로 알림도 복구 알림도 나오면 안 됩니다.
+        base = datetime.now().timestamp()
+        checked_at = {mercari.LAST_CREATED_OK_KEY: base - 60}
+        self.assertEqual(
+            mercari.created_coverage_alerts(self._items(80, 20), checked_at, base), []
+        )
+        # 정상 범위이므로 마지막 정상 시각이 갱신됩니다.
+        self.assertEqual(checked_at[mercari.LAST_CREATED_OK_KEY], base)
+
+    async def test_coverage_below_the_floor_is_treated_as_broken(self):
+        # 절반 아래로 떨어지면 방어선이 사실상 동작하지 않는 상태로 봅니다.
+        base = datetime.now().timestamp()
+        checked_at = {
+            mercari.LAST_CREATED_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 120
+        }
+        alerts = mercari.created_coverage_alerts(self._items(30, 70), checked_at, base)
+        self.assertEqual(len(alerts), 1)
+        self.assertTrue(alerts[0]["alert_id"].startswith("health:created-missing:"))
+
+    async def test_created_alert_is_rate_limited_and_recovers(self):
+        base = datetime.now().timestamp()
+        stale = base - mercari.HEALTH_ALERT_AFTER_SECONDS - 120
+        first = mercari.created_coverage_alerts(
+            self._items(0, 50), {mercari.LAST_CREATED_OK_KEY: stale}, base
+        )[0]["alert_id"]
+        soon = mercari.created_coverage_alerts(
+            self._items(0, 50), {mercari.LAST_CREATED_OK_KEY: stale}, base + 600
+        )[0]["alert_id"]
+        self.assertEqual(first, soon)
+
+        checked_at = {mercari.LAST_CREATED_OK_KEY: stale}
+        recovery = mercari.created_coverage_alerts(self._items(50, 0), checked_at, base)
+        self.assertEqual(len(recovery), 1)
+        self.assertIn("복구", recovery[0]["caption"])
+        self.assertEqual(checked_at[mercari.LAST_CREATED_OK_KEY], base)
+
+    async def test_failed_search_does_not_trigger_a_created_alert(self):
+        # 검색 자체가 실패해 표본이 없는 실행은 판단하지 않습니다(다른 알림이 다룹니다).
+        base = datetime.now().timestamp()
+        checked_at = {
+            mercari.LAST_CREATED_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 120
+        }
+        searched = [("kw", [], False, False, 0.0)]
+        self.assertEqual(mercari.created_coverage_alerts(searched, checked_at, base), [])
+
+    async def test_created_alert_reaches_the_queue(self):
+        mercari.SEARCHES = [{"query": "test", "categories": []}]
+        base = datetime.now().timestamp()
+        mercari.save_state(
+            {"x": 1}, [], [], {}, {"test"},
+            {
+                "test": base - 60,
+                mercari.LAST_SEARCH_OK_KEY: base - 60,
+                mercari.FULL_SCAN_STATE_KEY: base - 60,
+                mercari.LAST_CREATED_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 120,
+            },
+        )
+        api = FakeMercapi({"test": [FakeItem("m1", "등록시각 없음", 1000, created=None)]})
+
+        with patch.object(mercari, "Mercapi", return_value=api), patch.object(
+            mercari, "current_time", return_value=base
+        ), patch("sys.stderr", new=io.StringIO()):
+            await mercari.collect_updates()
+
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        ids = [e["alert_id"] for e in state["pending"]]
+        self.assertTrue(any(i.startswith("health:created-missing:") for i in ids), ids)
+
+
 if __name__ == "__main__":
     unittest.main()
