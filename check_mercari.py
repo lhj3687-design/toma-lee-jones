@@ -370,6 +370,35 @@ def remember(store: dict, key, value) -> None:
     store[key] = value
 
 
+def state_update_order(fields: dict) -> tuple:
+    """상태를 갱신할 순서. 매 실행 같아야 합니다.
+
+    remember()는 항목을 dict 맨 뒤로 보냅니다. 그래서 '어떤 순서로 갱신하는지'가 곧
+    상태 파일의 바이트 배치를 결정합니다. 지금까지는 검색 결과 순서대로 갱신했는데,
+    메루카리 결과 순서는 매 실행 흔들립니다(새 매물이 끼어들고 추천순이 바뀜).
+    그러면 **같은 매물을 같은 집합으로 다시 봤을 때도** 1.5MB 한 줄 JSON이 통째로
+    다시 쓰이고, 그게 커밋당 델타의 대부분을 차지했습니다.
+
+        queue Mercari alerts   공통접두 0.00MB 공통접미 0.00MB 변경 1503KB (파일 100%)
+
+    실측 커밋당 9.3KB / 1년 약 11.5GB였습니다. 실제 코드를 정렬 전/후로 각각 20회
+    돌려 비교하면 커밋당 20.35 -> 3.45KB(-83%)이고, 이 비율을 실측에 적용하면
+    약 1.6KB / 1년 약 2GB입니다.
+
+    매물에 붙어 있는 값(등록 시각, ID)으로 정렬하면 순서가 실행과 무관해집니다.
+    오름차순이라서 갓 올라온 매물이 dict 맨 뒤, 즉 용량 상한에서 가장 먼 자리에
+    놓입니다 — 예전에는 검색 결과 위치에 따라 아무 데나 놓였으니 이쪽이 더 안전합니다.
+
+    등록 시각을 모르는 매물은 앞쪽으로 보냅니다. 신규 판정에서도 가장 약한 근거를
+    가진 항목이라, 상한에 먼저 닿는 자리에 두는 편이 맞습니다.
+    """
+    created = listing_created_at(fields)
+    item_id = extract_item_id(fields) or ""
+    if created is None:
+        return (0, 0.0, item_id)
+    return (1, created, item_id)
+
+
 def save_state(
     seen: dict,
     pending: list,
@@ -891,7 +920,10 @@ def process_items(
     relist_count = 0
     stale_count = 0
     deferred_count = 0
-    for fields in items:
+    # 상태 갱신은 실행과 무관한 순서로 합니다(state_update_order 주석 참고).
+    # 알림 순서는 아래에서 최신 매물이 먼저 나가도록 되돌립니다.
+    alerts_start = len(new_items)
+    for fields in sorted(items, key=state_update_order):
         item_id = extract_item_id(fields)
         if not item_id:
             continue
@@ -1008,6 +1040,9 @@ def process_items(
                     "last_seen_price": seen[item_id]["last_seen_price"],
                 },
             )
+
+    # 갱신은 오래된 매물부터 했지만, 알림은 예전처럼 갓 올라온 매물이 먼저 나갑니다.
+    new_items[alerts_start:] = reversed(new_items[alerts_start:])
 
     print(
         f"[{keyword}] 검색 {len(items)}개 확인 "
