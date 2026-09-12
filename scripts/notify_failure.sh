@@ -37,8 +37,15 @@ if [ -z "$previous" ] || [ "$previous" = "null" ]; then
 fi
 
 run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-text="⚠️ 메루카리 알림봇 실행 실패
-워크플로가 실패했습니다. 알림이 멈춰 있을 수 있습니다.
+# 어느 워크플로가 실패했는지 구분해서 알립니다(알림 봇 본체 / 이력 압축).
+if [ "$workflow_file" = "mercari-check.yml" ]; then
+  headline="⚠️ 메루카리 알림봇 실행 실패
+알림이 멈춰 있을 수 있습니다."
+else
+  headline="⚠️ 메루카리 저장소 이력 압축 실패
+알림 자체에는 영향이 없지만 저장소 용량 정리가 밀립니다."
+fi
+text="${headline}
 ${run_url}"
 
 if curl -sS -X POST \

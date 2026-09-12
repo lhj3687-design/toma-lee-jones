@@ -11,7 +11,7 @@ import json
 
 MAX_SEEN_ITEMS = 15000
 MAX_RELIST_FINGERPRINTS = 6000
-MAX_SENT_ALERTS = 8000
+MAX_SENT_ALERTS = 20000
 MAX_PENDING_ALERTS = 500
 SUPPORTED_FINGERPRINT_PREFIXES = ("seller:", "title:")
 # 숍스 상품은 sellerId가 0으로 내려옵니다. 그 시절 지문은 지금 조회되지 않습니다.

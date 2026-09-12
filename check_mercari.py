@@ -49,7 +49,11 @@ MAX_SEEN_ITEMS = 15000
 MAX_RELIST_FINGERPRINTS = 6000
 PRICE_DROP_ALERT_THRESHOLD = 1000  # 마지막 알림 가격보다 이 금액(엔) 이상 떨어졌을 때만 알립니다.
 MAX_PENDING_ALERTS = 500
-MAX_SENT_ALERTS = 8000
+# 이미 보낸 알림 목록. 같은 알림이 두 번 나가는 걸 막는 마지막 방어선입니다.
+# 실측 전송량(시간당 약 52건) 기준으로 약 2.6일치였는데, 상한에 닿으면 오래된 기록부터
+# 잘려 나가면서 그만큼 방어선이 얇아집니다. 한 건이 24바이트 남짓이라 올리는 비용이
+# 거의 없어 약 6.5일치로 늘렸습니다.
+MAX_SENT_ALERTS = 20000
 
 # keyword_checked_at 안에 같이 보관하는 예약 키들입니다(키워드 이름과 겹치지 않도록 표시를 붙였습니다).
 FULL_SCAN_STATE_KEY = "__full_scan__"      # 마지막 '전체 조회' 시각
@@ -63,6 +67,12 @@ RESERVED_STATE_KEYS = (FULL_SCAN_STATE_KEY, LAST_SEARCH_OK_KEY)
 HEALTH_ALERT_AFTER_SECONDS = 10 * 60
 # 고장이 계속되는 동안 1분마다 알림이 쏟아지지 않도록, 이 간격당 최대 한 번만 알립니다.
 HEALTH_ALERT_COOLDOWN_SECONDS = 6 * 60 * 60
+
+# 키워드 하나만 막히는 경우를 잡는 기준입니다.
+# 전량 실패는 위 HEALTH_ALERT_AFTER_SECONDS가 잡지만, '다른 키워드는 멀쩡한데 이 키워드만
+# 계속 실패'하면 그 키워드 알림만 조용히 멈춥니다. 일시적인 실패와 구분하기 위해
+# 한참 동안 한 번도 성공하지 못했을 때만 알립니다.
+KEYWORD_STUCK_AFTER_SECONDS = 60 * 60
 
 # 전송 단계는 알림 하나마다 git push까지 하기 때문에 한 건당 수 초가 걸립니다.
 # 한 실행이 5분 크론을 넘겨 다음 실행이 줄줄이 밀리지 않도록 한 번에 보낼 양을 제한하고,
@@ -929,6 +939,56 @@ def health_alerts(searched: list, keyword_checked_at: dict, now: float) -> list:
     ]
 
 
+def keyword_health_alerts(searched: list, previous_checked_at: dict, now: float) -> list:
+    """키워드 하나가 오래 막혀 있으면 알립니다.
+
+    전량 실패는 health_alerts가 따로 다룹니다. 여기서 잡으려는 건
+    "다른 키워드는 멀쩡한데 이 키워드만 계속 실패"하는 상황입니다.
+    그대로 두면 그 키워드 알림만 조용히 멈추고, 로그를 열어 보기 전에는 알 수 없습니다.
+
+    판정 기준은 keyword_checked_at입니다. 이 값은 새 매물을 책임지는 '등록순' 조회가
+    성공했을 때만 전진하므로, 오래 멈춰 있다는 건 그 키워드의 새 매물을 못 보고 있다는 뜻입니다.
+
+    봇 전체가 죽은 실행에서는 아무것도 내보내지 않습니다. 그런 실행에서 키워드마다
+    알림을 만들면 한 번에 17건이 쏟아지기 때문입니다(그 상황은 health_alerts가 한 건으로 알립니다).
+    """
+    alive = any(coverage for _k, _i, _c, coverage, _cut in searched)
+    if not alive:
+        return []
+
+    alerts = []
+    for keyword, _items, _checked, coverage, _cutoff in searched:
+        last_ok = previous_checked_at.get(keyword)
+        if not isinstance(last_ok, (int, float)):
+            continue  # 기준선이 없는 키워드(첫 조회)는 판단하지 않습니다.
+        stuck_for = now - float(last_ok)
+        if stuck_for < KEYWORD_STUCK_AFTER_SECONDS:
+            continue
+
+        minutes = int(stuck_for // 60)
+        if coverage:
+            alerts.append(
+                {
+                    "alert_id": f"health:keyword-up:{keyword}:{int(last_ok)}",
+                    "caption": f"✅ [{keyword}] 검색 재개 (약 {minutes}분 만에 정상)",
+                    "photo": None,
+                }
+            )
+        else:
+            bucket = int(now // HEALTH_ALERT_COOLDOWN_SECONDS)
+            alerts.append(
+                {
+                    "alert_id": f"health:keyword-down:{keyword}:{bucket}",
+                    "caption": (
+                        f"⚠️ [{keyword}] 검색이 약 {minutes}분째 실패하고 있습니다.\n"
+                        f"다른 키워드는 정상이라 이 키워드 알림만 멈춘 상태입니다."
+                    ),
+                    "photo": None,
+                }
+            )
+    return alerts
+
+
 def report_feed_health(searched: list) -> None:
     """메루카리 응답이 기대대로 오는지 실행마다 한 줄로 요약합니다.
 
@@ -973,6 +1033,8 @@ async def collect_updates() -> None:
     is_first_run = len(seen) == 0
     new_items: list = []
     now = current_time()
+    # 키워드별 조회 시각은 아래 루프에서 갱신되므로, 판정에 쓸 '갱신 전' 값을 미리 떠 둡니다.
+    previous_checked_at = dict(keyword_checked_at)
 
     # 짧은 주기(예: 1분)로 돌릴 때, 매번 추천순까지 조회하면 실행이 주기를 넘겨
     # 트리거가 버려지고 메루카리 API 호출량만 두 배가 됩니다.
@@ -1054,6 +1116,7 @@ async def collect_updates() -> None:
 
     # 봇 고장/복구 알림은 매물 알림과 달리 첫 실행에서도 내보냅니다.
     warnings = health_alerts(searched, keyword_checked_at, now)
+    warnings += keyword_health_alerts(searched, previous_checked_at, now)
     for entry in warnings:
         print(entry["caption"].splitlines()[0], file=sys.stderr)
 

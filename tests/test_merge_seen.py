@@ -60,6 +60,24 @@ class MergeSeenTests(unittest.TestCase):
         merged = merge.prune_fingerprints({"seller:0:shop": {}, "seller:9:real": {}})
         self.assertEqual(sorted(merged), ["seller:9:real"])
 
+    def test_caps_match_the_bot(self):
+        """상한이 양쪽에 따로 적혀 있어 어긋나기 쉽습니다.
+
+        merge_seen.py 쪽이 더 작으면 push 충돌 병합이 일어날 때마다 상태가 조용히
+        깎여 나가고, 더 크면 상한이 무의미해집니다. 값이 어긋나면 여기서 잡습니다.
+        """
+        import importlib, sys, types
+
+        stub = types.ModuleType("mercapi")
+        stub.Mercapi = object
+        sys.modules.setdefault("mercapi", stub)
+        bot = importlib.import_module("check_mercari")
+
+        for name in ("MAX_SEEN_ITEMS", "MAX_RELIST_FINGERPRINTS", "MAX_SENT_ALERTS", "MAX_PENDING_ALERTS"):
+            self.assertEqual(getattr(merge, name), getattr(bot, name), name)
+        self.assertEqual(merge.SUPPORTED_FINGERPRINT_PREFIXES, bot.SUPPORTED_FINGERPRINT_PREFIXES)
+        self.assertEqual(merge.UNKNOWN_SELLER_IDS, bot.UNKNOWN_SELLER_IDS)
+
     def test_sent_alerts_are_deduplicated_and_capped(self):
         merged = merge.unique_recent(["a", "b", "a", "c"], limit=2)
         self.assertEqual(merged, ["b", "c"])
