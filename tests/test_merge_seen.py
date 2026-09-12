@@ -55,6 +55,11 @@ class MergeSeenTests(unittest.TestCase):
         )
         self.assertEqual(sorted(merged), ["seller:1:t", "title:t:100"])
 
+    def test_unknown_seller_fingerprints_are_dropped(self):
+        # check_mercari.py와 같은 기준이어야 합니다. 한쪽만 정리하면 충돌 병합 때 되살아납니다.
+        merged = merge.prune_fingerprints({"seller:0:shop": {}, "seller:9:real": {}})
+        self.assertEqual(sorted(merged), ["seller:9:real"])
+
     def test_sent_alerts_are_deduplicated_and_capped(self):
         merged = merge.unique_recent(["a", "b", "a", "c"], limit=2)
         self.assertEqual(merged, ["b", "c"])

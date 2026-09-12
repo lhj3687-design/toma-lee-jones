@@ -17,14 +17,23 @@ if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
   exit 0
 fi
 
-# 지금 실행 중인 이 run은 아직 completed가 아니므로, 아래 조회는 '직전 실행'을 돌려줍니다.
+# 지금 실행 중인 이 run은 아직 completed가 아니므로, 아래 조회는 지난 실행들을 돌려줍니다.
+#
+# cancelled는 건너뜁니다. 1분 주기로 돌리면 실행이 겹칠 때마다 대기 중이던 run이
+# 취소되는데(실측 약 9%), 이걸 '정상이 아님'으로 세면 취소 직후에 생긴 진짜 실패가
+# 조용히 묻혀 버립니다. 성공/실패로 끝난 가장 최근 실행만 기준으로 삼습니다.
 previous="$(gh api \
-  "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_file}/runs?status=completed&per_page=1" \
-  --jq '.workflow_runs[0].conclusion' 2>/dev/null || true)"
+  "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_file}/runs?status=completed&per_page=20" \
+  --jq '[.workflow_runs[].conclusion | select(. == "success" or . == "failure")][0]' \
+  2>/dev/null || true)"
 
-if [ "$previous" != "success" ]; then
-  echo "[실패 알림 생략] 직전 실행도 정상이 아니었습니다(직전: ${previous:-알 수 없음}). 중복 알림을 보내지 않습니다."
+if [ "$previous" = "failure" ]; then
+  echo "[실패 알림 생략] 직전 실행도 실패했습니다. 중복 알림을 보내지 않습니다."
   exit 0
+fi
+
+if [ -z "$previous" ] || [ "$previous" = "null" ]; then
+  echo "[실패 알림 진행] 직전 실행 결과를 확인하지 못했습니다. 놓치는 것보다 낫도록 알립니다."
 fi
 
 run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"

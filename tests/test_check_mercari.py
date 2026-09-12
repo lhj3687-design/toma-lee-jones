@@ -5,7 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -37,7 +37,10 @@ class FakeItem:
     thumbnails: list[str] | None = None
     item_type: str = "ITEM"
     seller_id: str | None = None
-    created: datetime | None = None
+    # 실제 메루카리 응답은 등록 시각을 항상 채워 줍니다(운영 로그에서 2861/2861 확인).
+    # 기본값을 비워 두면 테스트가 "등록 시각이 하나도 없다"는 경고를 CI 로그에 쏟아내
+    # 진짜 경고와 구분이 안 됩니다. 그 경로를 검증하는 테스트만 created=None을 명시합니다.
+    created: datetime | None = field(default_factory=datetime.now)
     is_no_price: bool = False
 
 
@@ -806,7 +809,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         # created가 비어 있으면 방어선 하나가 조용히 사라집니다. 로그로 드러나야 합니다.
         mercari.SEARCHES = [{"query": "test", "categories": []}]
         mercari.save_state({"x": 1}, [], [], {}, {"test"}, {"test": 1000.0})
-        api = FakeMercapi({"test": [FakeItem("m1", "created 없음", 1000)]})
+        api = FakeMercapi({"test": [FakeItem("m1", "created 없음", 1000, created=None)]})
 
         with patch.object(mercari, "Mercapi", return_value=api), patch(
             "sys.stderr", new=io.StringIO()
@@ -985,6 +988,33 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         for key in mercari.RESERVED_STATE_KEYS:
             cutoff = mercari.new_item_cutoff({key: 0}, key, 10_000.0)
             self.assertEqual(cutoff, 10_000.0 - mercari.FIRST_RUN_LOOKBACK_SECONDS, key)
+
+
+    def test_unknown_seller_fingerprints_are_pruned(self):
+        # 숍스 상품의 sellerId가 0으로 내려오던 시절 만들어진 지문입니다.
+        # 지금은 같은 매물을 'title:' 지문으로 다루므로 영영 조회되지 않습니다.
+        # 남겨 두면 용량 상한만 차지하므로 정리합니다.
+        self.assertFalse(mercari.is_usable_fingerprint("seller:0:어떤제목"))
+        self.assertFalse(mercari.is_usable_fingerprint("seller::어떤제목"))
+        self.assertFalse(mercari.is_usable_fingerprint("seller-photo:1:제목:url"))
+        self.assertTrue(mercari.is_usable_fingerprint("seller:123456:어떤제목"))
+        self.assertTrue(mercari.is_usable_fingerprint("title:어떤제목:5000"))
+
+    def test_load_state_drops_unknown_seller_fingerprints(self):
+        mercari.SEEN_FILE.write_text(
+            json.dumps(
+                {
+                    "seen": {},
+                    "relist_fingerprints": {
+                        "seller:0:shop": {"item_id": "s1"},
+                        "seller:777:real": {"item_id": "m1"},
+                        "title:shop:5000": {"item_id": "s2"},
+                    },
+                }
+            )
+        )
+        _, _, _, fingerprints, _, _ = mercari.load_state()
+        self.assertEqual(sorted(fingerprints), ["seller:777:real", "title:shop:5000"])
 
 
 if __name__ == "__main__":

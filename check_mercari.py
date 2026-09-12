@@ -213,13 +213,27 @@ def load_state() -> tuple[dict, list, list, dict, set, dict]:
     )
 
 
+def is_usable_fingerprint(key: str) -> bool:
+    """지금 코드가 실제로 다시 조회하게 될 지문인지 판단합니다.
+
+    두 가지를 걸러냅니다.
+      - 현재 코드가 만들지 않는 형식(예전 버전이나 외부 도구가 남긴 것).
+      - 판매자 ID를 0으로 적어 둔 지문. 숍스 상품의 sellerId가 0으로 내려오던 때
+        만들어진 것들인데, 지금은 그런 매물을 'title:' 지문으로 다루므로 영영 조회되지
+        않습니다. 남겨 두면 용량 상한만 차지합니다.
+    """
+    key = str(key)
+    if not key.startswith(SUPPORTED_FINGERPRINT_PREFIXES):
+        return False
+    parts = key.split(":")
+    if parts[0] == "seller" and len(parts) > 1 and parts[1].strip().lower() in UNKNOWN_SELLER_IDS:
+        return False
+    return True
+
+
 def prune_fingerprints(relist_fingerprints: dict) -> dict:
-    """현재 코드가 조회하지 않는 형식의 재출품 지문을 걸러냅니다."""
-    return {
-        key: value
-        for key, value in relist_fingerprints.items()
-        if str(key).startswith(SUPPORTED_FINGERPRINT_PREFIXES)
-    }
+    """다시 조회될 일이 없는 재출품 지문을 걸러냅니다."""
+    return {key: value for key, value in relist_fingerprints.items() if is_usable_fingerprint(key)}
 
 
 def alert_key(entry: dict) -> str:

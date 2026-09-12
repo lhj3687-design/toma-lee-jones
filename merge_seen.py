@@ -14,6 +14,8 @@ MAX_RELIST_FINGERPRINTS = 6000
 MAX_SENT_ALERTS = 8000
 MAX_PENDING_ALERTS = 500
 SUPPORTED_FINGERPRINT_PREFIXES = ("seller:", "title:")
+# 숍스 상품은 sellerId가 0으로 내려옵니다. 그 시절 지문은 지금 조회되지 않습니다.
+UNKNOWN_SELLER_IDS = {"", "0", "none", "null"}
 
 
 def read_json(path: str) -> dict:
@@ -82,12 +84,23 @@ def merge_checked_at(theirs: dict, mine: dict) -> dict:
     return merged
 
 
+def is_usable_fingerprint(key: str) -> bool:
+    """check_mercari.py와 같은 기준. 현재 코드가 조회하지 않는 지문을 걸러냅니다.
+
+    'seller:0:'처럼 판매자 ID를 모르던 시절의 지문은 지금 'title:' 형식으로 대체되어
+    영영 조회되지 않으므로 함께 버립니다.
+    """
+    key = str(key)
+    if not key.startswith(SUPPORTED_FINGERPRINT_PREFIXES):
+        return False
+    parts = key.split(":")
+    if parts[0] == "seller" and len(parts) > 1 and parts[1].strip().lower() in UNKNOWN_SELLER_IDS:
+        return False
+    return True
+
+
 def prune_fingerprints(fingerprints: dict) -> dict:
-    return {
-        key: value
-        for key, value in fingerprints.items()
-        if str(key).startswith(SUPPORTED_FINGERPRINT_PREFIXES)
-    }
+    return {key: value for key, value in fingerprints.items() if is_usable_fingerprint(key)}
 
 
 def main() -> None:
