@@ -1,0 +1,76 @@
+name: Tests
+
+# PR에서만 돕니다. main 브랜치 push에는 절대 걸지 마세요 —
+# 봇이 상태 파일을 시간당 약 140번 커밋하므로, push 트리거를 달면 테스트 실행도
+# 시간당 140번 돌면서 러너를 잡아먹고 봇 실행과 자리를 다툽니다.
+# main의 검증은 봇 워크플로가 매 실행 전에 돌리는 같은 테스트가 맡습니다.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# 같은 PR에 새 커밋이 올라오면 이전 실행은 취소합니다. 봇 워크플로와 달리 여기서는
+# 마지막 커밋 결과만 의미가 있고, 중간 실행을 끝까지 돌릴 이유가 없습니다.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 봇 워크플로가 매 실행 전에 돌리는 것과 **같은 명령**입니다.
+  # 여기서 깨지면 머지 후 봇이 조회·전송을 건너뛰기 시작합니다.
+  unit:
+    name: 유닛 테스트
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests
+
+  # 시계 의존성 전수 스캔(tests/test_check_mercari.py 대상).
+  # 봇은 1분마다 도는 실행 경로에 이걸 넣을 수 없어서
+  # (몇 분 걸립니다) PR이 그 자리입니다. README "시계 의존성" 절 참고.
+  #
+  # 왜 따로 도느냐면, 이 봇은 테스트가 깨지면 그 실행의 조회·전송을 건너뛰기 때문입니다.
+  # 하루 중 특정 시각에만 깨지는 테스트가 머지되면 곧바로 반복 장애가 됩니다
+  # (실제로 2026-09-12에 두 번 났습니다).
+  #
+  # 실측(개발 머신): --day 1분 44초 + --repeat 100 36초. 상한 30분은 러너가 느려도
+  # 걸리지 않을 만큼 넉넉히 둔 값이지, 그만큼 걸린다는 뜻이 아닙니다.
+  clock:
+    name: 시계 의존성 스캔
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 하루를 5분 간격으로 훑습니다(288개 시각). 벽시계 구간 경계에 묶인 판정을 잡습니다.
+      - name: Scan a full day of wall-clock positions
+        run: python scripts/clock_scan.py --day
+
+      # 시계를 건드리지 않고 반복합니다. 위 모드는 now()에 계산을 한 겹 더 얹는 탓에
+      # 시계 해상도 경합을 가리므로, 그 축은 이쪽이 담당합니다(도구 docstring 참고).
+      - name: Repeat the suite on the real clock
+        run: python scripts/clock_scan.py --repeat 100

@@ -16,6 +16,7 @@
 | `tests/` | 봇 워크플로가 매 실행 전에 돌리는 회귀 테스트 |
 | `.github/workflows/mercari-check.yml` | 알림 봇 본체 |
 | `.github/workflows/squash-history.yml` | 저장소가 커지면 이력을 자동 압축 |
+| `.github/workflows/tests.yml` | PR에서 테스트와 시계 스캔을 돌림(아래 "테스트" 참고) |
 
 ## 키워드 추가하기
 
@@ -328,6 +329,21 @@ python -m unittest discover -s tests
 `tests/test_push_state.py`는 상태 저장 셸 스크립트를 임시 git 저장소에서 실제로 돌려
 확인합니다(대기 시간만 가짜로 바꿔 1초 안에 끝납니다).
 
+### 언제 도는가
+
+| | 무엇을 | 왜 거기서 |
+|---|---|---|
+| 봇 실행마다 (`mercari-check.yml`) | 유닛 테스트 | 깨진 코드로 알림을 보내지 않기 위해 |
+| PR마다 (`tests.yml`) | 유닛 테스트 + 시계 스캔 전량 | 머지 **전에** 잡기 위해 |
+
+PR 워크플로는 **`main` push에 걸지 않았습니다.** 봇이 상태 파일을 시간당 약 140번
+커밋하므로, push 트리거를 달면 테스트도 시간당 140번 돌면서 러너를 잡아먹고 봇 실행과
+자리를 다툽니다. `main`의 검증은 봇이 매 실행 전에 돌리는 같은 테스트가 맡습니다.
+
+시계 스캔을 PR에만 둔 이유도 같습니다 — 몇 분이 걸려서 1분 주기 실행 경로에는 들어갈 수
+없습니다. 상시 방어선은 매 실행 도는 유닛 테스트 안의
+`test_outage_alert_ids_never_depend_on_the_wall_clock`이 맡습니다(아래 참고).
+
 봇 워크플로가 매 실행 전에 이 테스트를 돌리므로, 실패하면 그 실행은 알림을 보내지 않습니다.
 **그래서 테스트가 시계에 의존하면 곧바로 봇 장애가 됩니다.** 두 번 겪었습니다.
 
@@ -365,9 +381,11 @@ python -m unittest discover -s tests
 새 고장 알림을 추가하면 `OUTAGE_ALERT_FAMILIES`에 한 줄 더해 주세요. 그 한 줄이
 그 알림을 같은 방어선 안에 넣습니다.
 
-**2) 필요할 때 — `scripts/clock_scan.py`**
+**2) PR마다 — `scripts/clock_scan.py`**
 
-테스트 **전체**를 여러 가짜 시각에서 돌립니다. 시각을 다루는 코드를 건드렸을 때 씁니다.
+`tests/test_check_mercari.py` **전체**를 여러 가짜 시각에서 돌립니다(나머지 두 테스트
+파일은 시각을 쓰지 않습니다). `tests.yml`이 PR마다 `--day`와
+`--repeat 100`을 돌리고, 시각을 다루는 코드를 건드렸을 때 직접 돌려 볼 수도 있습니다.
 
 ```bash
 python scripts/clock_scan.py --day        # 하루를 5분 간격으로 (288개 시각)
@@ -375,7 +393,7 @@ python scripts/clock_scan.py --week       # 7일을 31분 간격으로 (325개 �
 python scripts/clock_scan.py --repeat 200 # 시계를 그대로 두고 200회 (경합 탐지)
 ```
 
-몇 분 걸리므로 매분 실행 경로에는 넣지 않았습니다.
+몇 분 걸리므로 봇의 매분 실행 경로에는 넣지 않았습니다. PR이 그 자리입니다.
 
 **두 모드는 서로를 대체하지 못합니다.** `--day`/`--week`는 `datetime.now()`를 계산이
 한 겹 더 붙은 함수로 바꿔 끼우는데, 그 계산이 연속 호출 사이에 시간을 벌어 주는 탓에
