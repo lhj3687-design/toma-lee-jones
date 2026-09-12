@@ -430,6 +430,77 @@ def save_state(
     temporary_file.replace(SEEN_FILE)
 
 
+def absorb_pushed_state(
+    seen: dict,
+    pending: list,
+    sent_alerts: list,
+    relist_fingerprints: dict,
+    known_keywords: set,
+    keyword_checked_at: dict | None = None,
+) -> None:
+    """push_state가 원격과 병합했다면 그 결과를 메모리로 되가져옵니다.
+
+    push_state.sh는 push가 거부되면 원격 상태를 받아 merge_seen.py로 병합하고
+    seen_items.json을 그 결과로 고쳐 씁니다. 그런데 전송 루프는 알림 하나마다
+    **자기 메모리 값으로** 파일을 다시 쓰므로, 병합으로 들어온 상대편 기록이 바로
+    다음 저장에서 사라집니다. 그리고 그 다음 push는 충돌 없이 통과하기 때문에
+    병합 경로가 다시 불려 복구될 기회도 없습니다.
+
+    특히 sent_alerts가 사라지면 상대편이 이미 보낸 알림이 대기열에 되살아나
+    다음 실행에서 다시 나갑니다. 병합 로직이 막으려던 바로 그 일입니다.
+
+    병합이 없었다면 파일은 방금 save_state가 쓴 그대로이므로 이 함수는 아무것도
+    바꾸지 않습니다. 즉 정상 경로의 동작은 달라지지 않습니다.
+
+    파일의 값이 곧 '병합된 결과'이므로 그대로 옮겨 씁니다(호출한 쪽이 같은 객체를
+    들고 있으므로 새 객체를 만들지 않고 제자리에서 바꿉니다). 대기열만은 예외로,
+    이미 순회 중이라 상대편에게서 새로 들어온 알림을 **뒤에 덧붙이기만** 합니다.
+    """
+    if not SEEN_FILE.exists():
+        return  # 바로 앞 save_state가 쓴 파일이 없다면 되읽을 병합 결과도 없습니다.
+    try:
+        data = json.loads(SEEN_FILE.read_text())
+    except Exception as exc:
+        # 여기서 멈출 일은 아닙니다. 메모리 상태를 그대로 쓰면 기존 동작과 같고,
+        # 저장이 정말 깨졌다면 다음 push_state가 실행을 실패로 끝냅니다.
+        print(f"[경고] 병합된 상태를 되읽지 못했습니다: {exc}", file=sys.stderr)
+        return
+    if not isinstance(data, dict):
+        return
+
+    for target, key in (
+        (seen, "seen"),
+        (relist_fingerprints, "relist_fingerprints"),
+        (keyword_checked_at, "keyword_checked_at"),
+    ):
+        merged = data.get(key)
+        if target is not None and isinstance(merged, dict):
+            target.clear()
+            target.update(merged)
+
+    merged_sent = data.get("sent_alerts")
+    if isinstance(merged_sent, list):
+        sent_alerts[:] = [str(value) for value in merged_sent]
+
+    merged_keywords = data.get("known_keywords")
+    if isinstance(merged_keywords, list):
+        known_keywords.clear()
+        known_keywords.update(merged_keywords)
+
+    merged_pending = data.get("pending")
+    if isinstance(merged_pending, list):
+        queued = {alert_key(entry) for entry in pending if isinstance(entry, dict)}
+        delivered = set(sent_alerts)
+        for entry in merged_pending:
+            if not isinstance(entry, dict):
+                continue
+            key = alert_key(entry)
+            if key in queued or key in delivered:
+                continue
+            pending.append(entry)
+            queued.add(key)
+
+
 def push_state(commit_message: str) -> bool:
     """scripts/push_state.sh를 호출해 현재 상태 파일을 원격 저장소에 즉시 반영합니다.
 
@@ -720,6 +791,13 @@ async def flush_pending(
                     file=sys.stderr,
                 )
                 break
+            # push가 거부돼 원격과 병합됐다면 그 결과를 메모리로 되가져옵니다.
+            # 이걸 빼먹으면 다음 알림의 save_state가 병합 결과를 덮어써서, 상대편이
+            # 이미 보낸 알림이 다시 나갑니다(absorb_pushed_state 주석 참고).
+            absorb_pushed_state(
+                seen, remaining, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at
+            )
+            sent_keys = set(sent_alerts)
             await asyncio.sleep(SEND_INTERVAL_SECONDS)
             continue
         if retry_after and retry_after <= 60:

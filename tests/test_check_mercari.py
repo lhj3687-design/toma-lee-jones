@@ -901,6 +901,64 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         state = json.loads(mercari.SEEN_FILE.read_text())
         self.assertEqual([e["alert_id"] for e in state["pending"]], ["new:a"])
 
+    async def test_a_merged_push_result_is_not_overwritten_by_the_next_alert(self):
+        """push_state가 원격과 병합한 결과를 다음 알림이 덮어쓰면 안 됩니다.
+
+        push_state.sh는 push가 거부되면 원격 상태를 받아 병합하고 seen_items.json을
+        그 결과로 고쳐 씁니다. 그런데 전송 루프는 알림 하나마다 자기 메모리 값으로
+        파일을 다시 쓰므로, 되읽지 않으면 병합으로 들어온 상대편 기록이 사라집니다.
+        그리고 그 다음 push는 충돌이 없어 통과하기 때문에 병합 경로가 다시 불려
+        복구될 기회도 없습니다 — 상대편이 이미 보낸 알림이 다시 나갑니다.
+        """
+        pending = [
+            {"alert_id": "new:a", "caption": "a"},
+            {"alert_id": "new:b", "caption": "b"},
+        ]
+
+        def merging_push(_message):
+            # 첫 push만 거부돼 원격과 병합된 상태가 파일에 남은 상황을 만듭니다.
+            state = json.loads(mercari.SEEN_FILE.read_text())
+            if "new:theirs" not in state["sent_alerts"]:
+                state["sent_alerts"].append("new:theirs")
+                state["pending"].append({"alert_id": "new:theirs-queued", "caption": "그쪽 대기열"})
+                state["seen"]["m-theirs"] = {"last_alert_price": 1, "last_seen_price": 1}
+                mercari.SEEN_FILE.write_text(json.dumps(state, ensure_ascii=False))
+            return True
+
+        seen = {}
+        with patch.object(mercari, "send_telegram", new=AsyncMock(return_value=(True, None))), \
+             patch.object(mercari, "push_state", side_effect=merging_push):
+            remaining, sent_alerts = await mercari.flush_pending(seen, pending, [], {}, set(), {})
+
+        # 상대편의 전송 기록이 살아 있어야 그 알림이 다시 나가지 않습니다.
+        self.assertIn("new:theirs", sent_alerts)
+        # 상대편이 본 매물도 남아야 다음 조회에서 '신규'로 오인하지 않습니다.
+        self.assertIn("m-theirs", seen)
+        # 상대편 대기열도 잃지 않습니다(이번에 보내거나 다음 실행으로 넘깁니다).
+        queued = [entry["alert_id"] for entry in remaining]
+        self.assertTrue(
+            "new:theirs-queued" in sent_alerts or "new:theirs-queued" in queued,
+            (sent_alerts, queued),
+        )
+
+    def test_absorbing_a_push_changes_nothing_when_there_was_no_merge(self):
+        """병합이 없었다면 되읽기는 아무것도 바꾸지 않아야 합니다.
+
+        이 성질이 깨지면 평소(충돌 없는) 실행의 동작까지 달라집니다.
+        """
+        seen = {"m1": {"last_alert_price": 1, "last_seen_price": 1}}
+        pending = [{"alert_id": "new:x", "caption": "x"}]
+        sent_alerts = ["new:done"]
+        fingerprints = {"seller:1:제목": {"item_id": "m1", "last_alert_price": 1, "last_seen_price": 1}}
+        known = {"kw"}
+        checked_at = {"kw": 1000.0}
+        mercari.save_state(seen, pending, sent_alerts, fingerprints, known, checked_at)
+        before = (dict(seen), list(pending), list(sent_alerts), dict(fingerprints), set(known), dict(checked_at))
+
+        mercari.absorb_pushed_state(seen, pending, sent_alerts, fingerprints, known, checked_at)
+
+        self.assertEqual((seen, pending, sent_alerts, fingerprints, known, checked_at), before)
+
     async def test_flush_pending_caps_how_much_it_sends_in_one_run(self):
         # 한 실행이 5분 크론을 넘겨 다음 실행들이 줄줄이 밀리지 않도록 상한을 둡니다.
         count = mercari.MAX_SEND_ATTEMPTS_PER_RUN + 10

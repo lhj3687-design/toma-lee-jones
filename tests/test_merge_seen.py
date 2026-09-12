@@ -1,5 +1,7 @@
 """push 충돌 시 상태 병합(merge_seen.py)이 알림을 잃거나 되살리지 않는지 검증합니다."""
 import importlib
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -127,6 +129,20 @@ class MergeSeenTests(unittest.TestCase):
     def test_sent_alerts_are_deduplicated_and_capped(self):
         merged = merge.unique_recent(["a", "b", "a", "c"], limit=2)
         self.assertEqual(merged, ["b", "c"])
+
+
+    def test_dropping_pending_alerts_at_the_cap_is_reported(self):
+        # 상한을 넘겨 알림이 버려지는 상황을 여기서만 조용히 넘기면,
+        # 보낸 적도 없는 알림이 말없이 사라집니다(check_mercari는 이미 알립니다).
+        over = merge.MAX_PENDING_ALERTS + 3
+        theirs = [{"alert_id": f"new:t{i}", "caption": str(i)} for i in range(over)]
+
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            result = merge.merge_pending(theirs, [], [])
+
+        self.assertEqual(len(result), merge.MAX_PENDING_ALERTS)
+        self.assertIn("상한", captured.getvalue())
 
 
 if __name__ == "__main__":
