@@ -27,6 +27,7 @@ on:
 permissions:
   contents: write
   actions: read   # 실패 알림에서 직전 실행의 성공 여부를 확인하는 데 씁니다
+  issues: write   # 텔레그램이 막혔을 때 이슈로 알리는 마지막 경로에 씁니다
 
 jobs:
   squash:
