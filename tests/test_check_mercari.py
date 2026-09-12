@@ -1,5 +1,6 @@
 import importlib
 import io
+import itertools
 import json
 import random
 import sys
@@ -50,6 +51,27 @@ def keyword_checkpoints(state: dict) -> dict:
     }
 
 
+# 픽스처의 등록 시각은 인스턴스마다 반드시 달라야 합니다.
+#
+# 상태 갱신 순서가 (등록 시각, ID)로 정해지므로(state_update_order), 두 매물의 등록
+# 시각이 같으면 ID가 동점을 가릅니다. 그러면 '나중에 만든 매물이 더 최근'이라는
+# 픽스처의 전제가 깨져서, 순서를 단정하는 테스트가 ID 사전순에 따라 뒤집힙니다.
+#
+# datetime.now()를 그대로 쓰면 그 일이 실제로 일어납니다. 시계 해상도가 연속 호출을
+# 구분하지 못해, 실측 약 1.7%(60회 중 1회) 확률로 두 매물이 같은 값을 받았습니다.
+# 봇은 1분마다 이 테스트를 돌리고, 실패하면 그 실행은 조회·전송을 건너뜁니다.
+# 즉 1.7%는 하루 스무 번 넘는 봇 장애입니다 — 2026-09-12 13:18에 실제로 났습니다
+# (run #6358: "Run unit tests" 실패 -> 조회·전송 건너뜀 + 실패 알림 발송).
+#
+# 생성 순서대로 1마이크로초씩 벌려 두면 시계 해상도와 무관해집니다.
+_created_sequence = itertools.count()
+
+
+def distinct_created() -> datetime:
+    """생성 순서대로 서로 다른 등록 시각(위 주석 참고)."""
+    return datetime.now() + timedelta(microseconds=next(_created_sequence))
+
+
 @dataclass
 class FakeItem:
     id_: str
@@ -61,7 +83,7 @@ class FakeItem:
     # 실제 메루카리 응답은 등록 시각을 항상 채워 줍니다(운영 로그에서 2861/2861 확인).
     # 기본값을 비워 두면 테스트가 "등록 시각이 하나도 없다"는 경고를 CI 로그에 쏟아내
     # 진짜 경고와 구분이 안 됩니다. 그 경로를 검증하는 테스트만 created=None을 명시합니다.
-    created: datetime | None = field(default_factory=datetime.now)
+    created: datetime | None = field(default_factory=distinct_created)
     is_no_price: bool = False
 
 
@@ -410,11 +432,14 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         mercari.save_state(
             {"old-item": 12000}, [], [], {}, {"test"}, {"test": datetime.now().timestamp() - 300}
         )
+        # 등록 시각을 명시합니다. 기대 순서가 '어느 쪽이 더 최근인지'에 달려 있으므로
+        # 픽스처가 그걸 분명히 정해야 합니다(기본값에 맡기면 시계 해상도에 휘둘립니다).
+        now = datetime.now()
         fake_api = FakeMercapi(
             {
                 "test": [
-                    FakeItem("old-item", "Price drop", 9000),
-                    FakeItem("new-item", "New listing", 15000),
+                    FakeItem("old-item", "Price drop", 9000, created=now - timedelta(minutes=10)),
+                    FakeItem("new-item", "New listing", 15000, created=now),
                 ]
             }
         )
@@ -425,8 +450,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
 
         collected = json.loads(mercari.SEEN_FILE.read_text())
         # 대기열은 갓 올라온 매물이 먼저입니다. 상태 갱신은 등록 시각 오름차순으로 하고
-        # (state_update_order), 알림만 되돌려 내보내기 때문입니다. 이 픽스처에서는
-        # new-item이 나중에 만들어져 created가 더 늦으므로 앞에 옵니다.
+        # (state_update_order), 알림만 되돌려 내보내기 때문입니다.
         self.assertEqual(
             [entry["alert_id"] for entry in collected["pending"]],
             ["new:new-item", "drop:old-item:12000:9000"],
@@ -506,20 +530,20 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         relist_fingerprints = {}
         new_items: list = []
 
-        api = FakeMercapi(
-            {
-                "test": [
-                    FakeItem("old", "오래 올라와 있는 매물", 10000, seller_id="A"),
-                    FakeItem("fresh", "방금 올라온 매물", 20000, seller_id="B"),
-                ]
-            }
+        # 등록 시각을 명시합니다. seen의 순서가 (등록 시각, ID)로 정해지므로,
+        # 기본값에 맡기면 두 매물이 같은 시각을 받는 순간 ID 사전순으로 뒤집힙니다.
+        now = datetime.now()
+        old_listing = FakeItem(
+            "old", "오래 올라와 있는 매물", 10000, seller_id="A", created=now - timedelta(days=2)
         )
+        fresh_listing = FakeItem("fresh", "방금 올라온 매물", 20000, seller_id="B", created=now)
+        api = FakeMercapi({"test": [old_listing, fresh_listing]})
         await mercari.check_keyword(api, "test", [], seen, relist_fingerprints, new_items)
         self.assertEqual(list(seen), ["old", "fresh"])
 
         # "old"만 다시 관찰되면 목록 맨 뒤로 이동해야 합니다.
         new_items.clear()
-        api2 = FakeMercapi({"test": [FakeItem("old", "오래 올라와 있는 매물", 10000, seller_id="A")]})
+        api2 = FakeMercapi({"test": [old_listing]})
         await mercari.check_keyword(api2, "test", [], seen, relist_fingerprints, new_items)
         self.assertEqual(list(seen), ["fresh", "old"])
 
@@ -1169,6 +1193,18 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [e["alert_id"] for e in alerts], ["new:m-new", "new:m-mid", "new:m-old"]
         )
+
+    def test_fixture_listings_never_share_a_created_time(self):
+        """이 성질이 깨지면 순서를 단정하는 테스트들이 시계 해상도에 휘둘립니다.
+
+        예전에는 FakeItem의 기본 등록 시각이 datetime.now()였고, 연속 생성이 같은 값을
+        받는 일이 실측 약 1.7% 있었습니다. 봇은 1분마다 테스트를 돌리고 실패하면 그 실행은
+        조회·전송을 건너뛰므로 하루 스무 번 넘는 장애였습니다(2026-09-12 13:18 run #6358).
+        """
+        created = [FakeItem(f"m{i}", "매물", 1000).created for i in range(300)]
+        self.assertEqual(len(set(created)), len(created))
+        # 생성 순서 = 등록 시각 순서 (픽스처가 '나중에 만든 게 더 최근'을 보장)
+        self.assertEqual(created, sorted(created))
 
     def test_state_update_order_is_independent_of_search_position(self):
         # 정렬 키가 매물에 붙어 있는 값만 쓰는지(=실행과 무관한지) 확인합니다.
