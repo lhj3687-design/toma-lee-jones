@@ -42,6 +42,79 @@ def just_before_a_wall_clock_boundary() -> float:
     return (datetime.now().timestamp() // cooldown + 1) * cooldown - 60
 
 
+def wall_clock_positions_across_a_day() -> list[float]:
+    """하루를 훑는 절대 시각들. 쿨다운 경계 바로 앞뒤를 반드시 포함합니다.
+
+    just_before_a_wall_clock_boundary()는 경계 '한 지점'만 봅니다. 사고가 그 지점에서
+    났으니 당연한 선택이었지만, 새로 추가되는 고장 알림은 그 한 지점을 지나갈 뿐
+    자동으로 보호받지 못합니다. 아래 목록은 하루 전체를 훑어서, 어느 시각에 고장이
+    시작되든 같은 판정이 나오는지 확인하는 데 씁니다.
+    """
+    cooldown = mercari.HEALTH_ALERT_COOLDOWN_SECONDS
+    day = 24 * 60 * 60
+    midnight = (datetime.now().timestamp() // day) * day
+    positions = {midnight + half_hour * 1800 for half_hour in range(day // 1800)}
+    for period in range(day // cooldown):
+        edge = midnight + period * cooldown
+        # 경계 자체와 그 앞뒤 1초, 그리고 '첫 알림까지 10분'이 경계를 걸치는 자리.
+        positions.update({edge - 1, edge, edge + 1, edge - 599, edge + 599})
+    return sorted(positions)
+
+
+# 고장이 24시간 이어지는 동안 20분 간격으로 관찰합니다. 첫 알림(10분)과 쿨다운(6시간)이
+# 몇 번 돌아가는지 보려면 이 정도 간격이면 충분합니다.
+OUTAGE_PROBES = [minutes * 60 for minutes in range(0, 24 * 60 + 1, 20)]
+
+
+def delivered_alert_ids(make_alerts, start: float) -> list[str]:
+    """고장이 start에 시작해 24시간 이어질 때 실제로 전송되는 alert_id 목록.
+
+    같은 id를 걸러 내는 sent_alerts의 동작을 그대로 재현합니다. 고장 시작 시각은
+    id 안에 그대로 박히므로(벽시계 위치마다 달라집니다) 자리표시자로 바꿔서,
+    '언제 시작했든 같은 순서로 같은 수만큼 나간다'만 남게 합니다.
+    """
+    delivered = []
+    for elapsed in OUTAGE_PROBES:
+        for alert in make_alerts(start, start + elapsed):
+            token = alert["alert_id"].replace(str(int(start)), "<고장시작>")
+            if token not in delivered:
+                delivered.append(token)
+    return delivered
+
+
+def search_down_alerts(start: float, now: float) -> list:
+    """모든 키워드 검색이 start부터 실패하고 있는 상황."""
+    return mercari.health_alerts(
+        [("kw", [], False, False, 0.0)], {mercari.LAST_SEARCH_OK_KEY: start}, now
+    )
+
+
+def created_missing_alerts(start: float, now: float) -> list:
+    """등록 시각을 start부터 절반 미만만 받아오고 있는 상황."""
+    rows = [{"id_": f"n{i}"} for i in range(50)]
+    return mercari.created_coverage_alerts(
+        [("kw", rows, True, True, 0.0)], {mercari.LAST_CREATED_OK_KEY: start}, now
+    )
+
+
+def keyword_stuck_alerts(start: float, now: float) -> list:
+    """봇은 멀쩡한데 키워드 하나만 start부터 막혀 있는 상황."""
+    return mercari.keyword_health_alerts(
+        [("kw", [], False, False, 0.0), ("other", [], True, True, 0.0)],
+        {"kw": start, mercari.LAST_SEARCH_OK_KEY: now - 60},
+        now,
+    )
+
+
+# 쿨다운을 거는 고장 알림 전부. 새 고장 알림을 추가하면 여기에도 추가해 주세요 —
+# 아래 테스트가 그 알림도 벽시계에 묶이지 않았는지 확인합니다.
+OUTAGE_ALERT_FAMILIES = [
+    ("전량 검색 실패", search_down_alerts),
+    ("등록 시각 방어선", created_missing_alerts),
+    ("키워드 하나만 막힘", keyword_stuck_alerts),
+]
+
+
 def keyword_checkpoints(state: dict) -> dict:
     """상태 파일의 키워드별 조회 시각만 추립니다(예약 키 제외)."""
     return {
@@ -1205,6 +1278,39 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(set(created)), len(created))
         # 생성 순서 = 등록 시각 순서 (픽스처가 '나중에 만든 게 더 최근'을 보장)
         self.assertEqual(created, sorted(created))
+
+    def test_outage_alert_ids_never_depend_on_the_wall_clock(self):
+        """고장 알림의 쿨다운은 '고장이 시작된 시점'으로만 세야 합니다.
+
+        2026-09-12 사고의 일반화된 재발 방지선입니다. 그때 alert_id는
+        int(now // HEALTH_ALERT_COOLDOWN_SECONDS), 즉 벽시계 절대 시각으로 만든 구간
+        번호를 달고 있었습니다. 그래서 고장이 이어지는 중에 경계(UTC 00/06/12/18시)를
+        넘으면 id가 갈라져 알림이 한 건 더 나갔고, 그 성질을 검사하는 테스트가 경계 앞
+        10분에만 깨졌습니다. 봇은 1분마다 테스트를 돌리고 실패하면 그 실행의 조회·전송을
+        건너뛰므로, 하루 네 번 10분씩 멈췄습니다(UTC 05:49~05:59, 11회 연속 실패).
+
+        기존 쿨다운 테스트들은 경계 '한 지점'만 걸칩니다. 하루 중 10분짜리 창에서만
+        어긋나는 결합(사고와 같은 모양)은 그 지점을 비껴가면 통과합니다. 여기서는 하루
+        전체를 훑으므로, 나중에 추가되는 고장 알림이 다시 벽시계에 묶여도 걸립니다.
+        """
+        positions = wall_clock_positions_across_a_day()
+        self.assertGreater(len(positions), 50)  # 하루를 실제로 훑고 있는지
+
+        for name, make_alerts in OUTAGE_ALERT_FAMILIES:
+            with self.subTest(알림=name):
+                reference_start = positions[0]
+                reference = delivered_alert_ids(make_alerts, reference_start)
+
+                # 쿨다운이 실제로 여러 번 돌아가는 표본이어야 의미가 있습니다.
+                self.assertGreaterEqual(len(reference), 3, reference)
+
+                for start in positions[1:]:
+                    self.assertEqual(
+                        delivered_alert_ids(make_alerts, start),
+                        reference,
+                        f"고장 시작 시각이 벽시계 어디냐에 따라 알림이 달라집니다 "
+                        f"({name}): {start} vs {reference_start}",
+                    )
 
     def test_state_update_order_is_independent_of_search_position(self):
         # 정렬 키가 매물에 붙어 있는 값만 쓰는지(=실행과 무관한지) 확인합니다.
