@@ -1,6 +1,7 @@
 import importlib
 import io
 import json
+import random
 import sys
 import tempfile
 import types
@@ -158,8 +159,14 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
 
         await mercari.check_keyword(fake_api, "test", [], seen, {}, new_items)
 
-        self.assertIn("https://jp.mercari.com/shops/product/2JUHeREMxTVqFa42uQFwEc", new_items[0]["caption"])
-        self.assertIn("https://jp.mercari.com/item/m90925725213", new_items[1]["caption"])
+        # 이 테스트의 주제는 링크 라우팅입니다. 대기열 순서는 별도 테스트에서 다루므로
+        # 여기서는 alert_id로 찾아 확인합니다.
+        caption = {entry["alert_id"]: entry["caption"] for entry in new_items}
+        self.assertIn(
+            "https://jp.mercari.com/shops/product/2JUHeREMxTVqFa42uQFwEc",
+            caption["new:2JUHeREMxTVqFa42uQFwEc"],
+        )
+        self.assertIn("https://jp.mercari.com/item/m90925725213", caption["new:m90925725213"])
 
     async def test_check_keyword_never_raises_alert_baseline_scenario_from_advisor(self):
         # 조언받은 시나리오 그대로 검증:
@@ -213,8 +220,9 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
                 "new-item": {"last_alert_price": 15000, "last_seen_price": 15000},
             },
         )
+        # 주제는 '신규'와 '가격 인하'가 서로 구분되는 고유 키를 갖는지입니다(순서 무관).
         self.assertEqual(
-            [entry["alert_id"] for entry in new_items],
+            sorted(entry["alert_id"] for entry in new_items),
             ["drop:old-item:12000:9000", "new:new-item"],
         )
 
@@ -416,9 +424,12 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             await mercari.collect_updates()
 
         collected = json.loads(mercari.SEEN_FILE.read_text())
+        # 대기열은 갓 올라온 매물이 먼저입니다. 상태 갱신은 등록 시각 오름차순으로 하고
+        # (state_update_order), 알림만 되돌려 내보내기 때문입니다. 이 픽스처에서는
+        # new-item이 나중에 만들어져 created가 더 늦으므로 앞에 옵니다.
         self.assertEqual(
             [entry["alert_id"] for entry in collected["pending"]],
-            ["drop:old-item:12000:9000", "new:new-item"],
+            ["new:new-item", "drop:old-item:12000:9000"],
         )
         self.assertEqual(
             collected["seen"],
@@ -437,7 +448,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delivered["pending"], [])
         self.assertEqual(
             delivered["sent_alerts"],
-            ["drop:old-item:12000:9000", "new:new-item"],
+            ["new:new-item", "drop:old-item:12000:9000"],
         )
 
         send_mock = AsyncMock(return_value=(True, None))
@@ -1063,6 +1074,117 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         state = json.loads(mercari.SEEN_FILE.read_text())
         self.assertEqual(state["pending"], [])
         self.assertIn("m-old", state["seen"])
+
+    async def test_same_listings_in_a_different_search_order_save_an_identical_file(self):
+        """이 PR의 핵심 성질입니다.
+
+        remember()는 항목을 dict 맨 뒤로 보내므로 '갱신 순서'가 곧 상태 파일의 바이트
+        배치입니다. 예전에는 검색 결과 순서대로 갱신했는데 메루카리 결과 순서는 매 실행
+        흔들려서, 같은 매물을 같은 집합으로 다시 봐도 1.5MB 파일이 통째로 다시 쓰였습니다
+        (실측 커밋당 9.3KB / 1년 약 11.5GB).
+
+        같은 매물 집합을 본 실행이라면 검색 순서가 어떻든 저장 결과가 같아야 합니다.
+        """
+        now = datetime.now()
+        listings = [
+            FakeItem(f"m{i}", f"매물 {i}", 10000 + i, created=now - timedelta(minutes=i))
+            for i in range(12)
+        ]
+
+        async def collect(order):
+            mercari.SEEN_FILE.unlink(missing_ok=True)
+            mercari.SEARCHES = [{"query": "kw", "categories": []}]
+            base = now.timestamp()
+            mercari.save_state(
+                {"기존": {"last_alert_price": 1, "last_seen_price": 1}}, [], [], {}, {"kw"},
+                {"kw": base - 60, mercari.FULL_SCAN_STATE_KEY: base - 60},
+            )
+            api = FakeMercapi({"kw": order})
+            with patch.object(mercari, "Mercapi", return_value=api), patch.object(
+                mercari, "current_time", return_value=base
+            ):
+                await mercari.collect_updates()
+            return mercari.SEEN_FILE.read_text()
+
+        forward = await collect(list(listings))
+        shuffled = list(listings)
+        random.Random(1).shuffle(shuffled)
+        reshuffled = await collect(shuffled)
+        reversed_order = await collect(list(reversed(listings)))
+
+        self.assertNotEqual(forward, "")
+        self.assertEqual(forward, reshuffled)
+        self.assertEqual(forward, reversed_order)
+
+    async def test_the_newest_listing_sits_furthest_from_the_capacity_cut(self):
+        """용량 상한은 dict 앞에서부터 잘라냅니다(save_state의 [-MAX:]).
+
+        갱신을 등록 시각 오름차순으로 하므로 갓 올라온 매물이 맨 뒤, 즉 잘릴 위험이
+        가장 적은 자리에 놓입니다. 예전에는 검색 결과 위치에 따라 아무 데나 놓였습니다.
+        """
+        now = datetime.now()
+        items = [
+            FakeItem("m-oldest", "가장 오래된", 1000, created=now - timedelta(days=3)),
+            FakeItem("m-newest", "방금", 2000, created=now),
+            FakeItem("m-middle", "중간", 3000, created=now - timedelta(hours=5)),
+        ]
+        seen: dict = {}
+        await mercari.check_keyword(
+            FakeMercapi({"kw": items}), "kw", [], seen, {}, [],
+            created_cutoff=(now - timedelta(minutes=5)).timestamp(),
+        )
+
+        self.assertEqual(list(seen), ["m-oldest", "m-middle", "m-newest"])
+
+    async def test_listings_without_a_created_time_are_cut_first(self):
+        # 등록 시각을 모르는 매물은 신규 판정에서도 근거가 가장 약합니다.
+        # 상한에 먼저 닿는 앞자리에 두는 편이 맞습니다.
+        now = datetime.now()
+        items = [
+            FakeItem("m-known", "등록시각 있음", 1000, created=now),
+            FakeItem("m-unknown", "등록시각 없음", 2000, created=None),
+        ]
+        seen: dict = {}
+        await mercari.check_keyword(FakeMercapi({"kw": items}), "kw", [], seen, {}, [])
+
+        self.assertEqual(list(seen), ["m-unknown", "m-known"])
+
+    async def test_alerts_still_go_out_newest_first(self):
+        """운영에서 등록순 조회는 최신 매물을 먼저 돌려줍니다.
+
+        상태 갱신 순서를 오름차순으로 바꿨지만 알림 순서는 예전과 같아야 합니다.
+        """
+        now = datetime.now()
+        newest_first = [
+            FakeItem("m-new", "방금", 1000, created=now),
+            FakeItem("m-mid", "조금 전", 1000, created=now - timedelta(minutes=3)),
+            FakeItem("m-old", "더 전", 1000, created=now - timedelta(minutes=9)),
+        ]
+        alerts: list = []
+        await mercari.check_keyword(
+            FakeMercapi({"kw": newest_first}), "kw", [], {}, {}, alerts,
+            created_cutoff=(now - timedelta(minutes=30)).timestamp(),
+        )
+
+        self.assertEqual(
+            [e["alert_id"] for e in alerts], ["new:m-new", "new:m-mid", "new:m-old"]
+        )
+
+    def test_state_update_order_is_independent_of_search_position(self):
+        # 정렬 키가 매물에 붙어 있는 값만 쓰는지(=실행과 무관한지) 확인합니다.
+        now = datetime.now()
+        a = {"id_": "m2", "created": now}
+        b = {"id_": "m1", "created": now - timedelta(hours=1)}
+        c = {"id_": "m3"}  # 등록 시각 없음
+        self.assertEqual(
+            [f["id_"] for f in sorted([a, b, c], key=mercari.state_update_order)],
+            ["m3", "m1", "m2"],
+        )
+        # 같은 등록 시각이면 ID로 갈라서 순서가 흔들리지 않게 합니다.
+        same = [{"id_": "m9", "created": now}, {"id_": "m8", "created": now}]
+        self.assertEqual(
+            [f["id_"] for f in sorted(same, key=mercari.state_update_order)], ["m8", "m9"]
+        )
 
     def test_pending_queue_overflow_is_reported(self):
         # 상한을 넘겨 알림이 버려지는 상황은 조용히 넘어가면 안 됩니다.
