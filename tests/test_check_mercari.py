@@ -72,12 +72,18 @@ class FakeMeta:
 
 
 class FakeResults:
-    def __init__(self, items, pages=None):
+    def __init__(self, items, pages=None, fail_next_page=False, has_next=None):
         self.items = items
         self.pages = list(pages or [])
-        self.meta = FakeMeta(next_page_token="next" if self.pages else "")
+        self.fail_next_page = fail_next_page
+        token = "next" if (self.pages or fail_next_page) else ""
+        if has_next is not None:
+            token = "next" if has_next else ""
+        self.meta = FakeMeta(next_page_token=token)
 
     async def next_page(self):
+        if self.fail_next_page:
+            raise RuntimeError("다음 페이지 조회 실패 시뮬레이션")
         return FakeResults(self.pages[0], self.pages[1:])
 
 
@@ -94,10 +100,13 @@ class FakeMercapi:
         fail_keywords=(),
         extra_pages_by_keyword=None,
         fail_call_indexes=None,
+        fail_next_page_keywords=(),
     ):
         self.items_by_keyword = items_by_keyword
         self.fail_keywords = set(fail_keywords)
         self.extra_pages_by_keyword = extra_pages_by_keyword or {}
+        # 1페이지는 주지만 2페이지 요청에서 터지는 키워드
+        self.fail_next_page_keywords = set(fail_next_page_keywords)
         # 키워드별로 "몇 번째 조회를 실패시킬지" (0=등록순, 1=추천순)
         self.fail_call_indexes = fail_call_indexes or {}
         self.call_counts = {}
@@ -110,7 +119,11 @@ class FakeMercapi:
         if keyword in self.fail_keywords or index in self.fail_call_indexes.get(keyword, ()):
             raise RuntimeError("검색 실패 시뮬레이션")
         pages = self.extra_pages_by_keyword.get(keyword)
-        return FakeResults(self.items_by_keyword[keyword], pages)
+        return FakeResults(
+            self.items_by_keyword[keyword],
+            pages,
+            fail_next_page=keyword in self.fail_next_page_keywords,
+        )
 
 
 class MercariStateTests(unittest.IsolatedAsyncioTestCase):
@@ -707,17 +720,78 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_flush_pending_stops_when_everything_keeps_failing(self):
         # 토큰 오류나 텔레그램 장애처럼 전부 실패하는 상황에서 대기열을 몇 바퀴씩
-        # 헛돌지 않아야 합니다.
+        # 헛돌지 않아야 합니다. 그리고 조용히 끝나면 안 됩니다 — 전송 경로가 막히면
+        # 고장을 알릴 수단도 같이 막히므로, 실행을 실패시켜 Actions 탭에 드러냅니다.
         pending = [{"alert_id": f"new:{i}", "caption": str(i)} for i in range(20)]
         send_mock = AsyncMock(return_value=(False, None))
 
         with patch.object(mercari, "send_telegram", new=send_mock), patch.object(
             mercari, "push_state", return_value=True
+        ), self.assertRaises(mercari.SendBlocked):
+            await mercari.flush_pending({}, pending, [], {}, set(), {})
+
+        self.assertEqual(send_mock.await_count, mercari.MAX_CONSECUTIVE_SEND_FAILURES)
+        self.assertEqual(len(pending), 20)  # 한 건도 잃지 않고 다음 실행으로 넘김
+
+    async def test_a_total_send_outage_does_not_burn_the_per_alert_retry_budget(self):
+        """전송이 통째로 막힌 건 개별 알림의 잘못이 아닙니다.
+
+        예전에는 막힌 실행에서도 재시도 횟수를 올렸습니다. 봇이 1분마다 도니까 텔레그램이
+        몇 시간 막히면 멀쩡한 알림들이 차례로 MAX_ALERT_ATTEMPTS에 걸려 폐기됐고,
+        워크플로는 초록색이라 아무도 알 수 없었습니다.
+        """
+        pending = [
+            {"alert_id": f"new:{i}", "caption": str(i)}
+            for i in range(mercari.MAX_CONSECUTIVE_SEND_FAILURES)
+        ]
+
+        for _run in range(mercari.MAX_ALERT_ATTEMPTS + 2):
+            with patch.object(
+                mercari, "send_telegram", new=AsyncMock(return_value=(False, None))
+            ), patch.object(mercari, "push_state", return_value=True), self.assertRaises(
+                mercari.SendBlocked
+            ):
+                await mercari.flush_pending({}, pending, [], {}, set(), {})
+
+        # 몇 번을 막혀도 재시도 횟수가 쌓이지 않고, 알림도 버려지지 않습니다.
+        self.assertEqual(len(pending), mercari.MAX_CONSECUTIVE_SEND_FAILURES)
+        self.assertEqual([e.get("attempts") for e in pending], [None] * len(pending))
+
+    async def test_an_alert_specific_failure_still_counts_toward_giving_up(self):
+        # 위와 달리 '이 알림만' 실패하는 경우는 그대로 재시도 횟수를 세야 합니다.
+        # (전체 장애와 구분하지 못하면 깨진 알림이 대기열에 영영 남습니다.)
+        pending = [
+            {"alert_id": "new:bad", "caption": "bad"},
+            {"alert_id": "new:good", "caption": "good"},
+        ]
+
+        async def send(caption, photo):
+            return caption != "bad", None
+
+        with patch.object(mercari, "send_telegram", new=AsyncMock(side_effect=send)), patch.object(
+            mercari, "push_state", return_value=True
         ):
             remaining, _ = await mercari.flush_pending({}, pending, [], {}, set(), {})
 
-        self.assertEqual(send_mock.await_count, mercari.MAX_CONSECUTIVE_SEND_FAILURES)
-        self.assertEqual(len(remaining), 20)  # 한 건도 잃지 않고 다음 실행으로 넘김
+        self.assertEqual([e["alert_id"] for e in remaining], ["new:bad"])
+        self.assertEqual(remaining[0]["attempts"], 1)
+
+    async def test_send_step_exits_non_zero_when_sending_is_blocked(self):
+        # 전송 단계가 실패로 끝나야 워크플로가 빨간색이 되고 기존 실행-실패 알림이
+        # 나갑니다. 상태(대기열·전송 기록)는 그 전에 저장되어 있어야 합니다.
+        mercari.save_state({}, [{"alert_id": "new:a", "caption": "a"}], [], {}, set())
+
+        with patch.object(
+            mercari, "send_telegram", new=AsyncMock(return_value=(False, None))
+        ), patch.object(mercari, "push_state", return_value=True), patch.object(
+            mercari.sys, "argv", ["check_mercari.py", "--mode", "send"]
+        ), patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                await mercari.main()
+
+        self.assertEqual(caught.exception.code, 1)
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        self.assertEqual([e["alert_id"] for e in state["pending"]], ["new:a"])
 
     async def test_flush_pending_caps_how_much_it_sends_in_one_run(self):
         # 한 실행이 5분 크론을 넘겨 다음 실행들이 줄줄이 밀리지 않도록 상한을 둡니다.
@@ -836,6 +910,159 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
 
         items, _, _ = await mercari.search_items(api, "test", [], created_cutoff=cutoff)
         self.assertNotIn("p2-0", {mercari.extract_item_id(f) for f in items})
+
+    async def test_a_failure_mid_pagination_does_not_advance_the_checkpoint(self):
+        """1페이지는 받았는데 2페이지에서 터진 경우는 '훑었다'가 아닙니다.
+
+        2페이지를 요청했다는 건 1페이지가 전부 기준선 이후 등록분이어서 "뒤에 새 매물이
+        더 있다"고 판단했다는 뜻입니다. 거기서 실패했는데도 조회 시각을 전진시키면,
+        못 읽은 페이지의 새 매물이 다음 실행에서 '오래된 매물'로 분류돼 영영 묻힙니다.
+        """
+        now = datetime.now()
+        cutoff = (now - timedelta(minutes=5)).timestamp()
+        full_fresh_page = [
+            FakeItem(f"p1-{i}", f"신규 {i}", 1000, created=now - timedelta(minutes=1))
+            for i in range(mercari.MAX_ITEMS_PER_KEYWORD)
+        ]
+        api = FakeMercapi({"test": full_fresh_page}, fail_next_page_keywords=["test"])
+
+        items, succeeded, coverage = await mercari.search_items(
+            api, "test", [], created_cutoff=cutoff, sort_passes=["created"]
+        )
+
+        self.assertTrue(succeeded)  # 1페이지는 받았으므로 그 결과는 그대로 씁니다
+        self.assertEqual(len(items), mercari.MAX_ITEMS_PER_KEYWORD)
+        self.assertFalse(coverage)  # 기준선은 전진하지 않습니다
+
+    async def test_a_complete_single_page_pass_advances_the_checkpoint(self):
+        # 평소(한 페이지로 끝나는 경우)에는 당연히 훑은 것으로 인정해야 합니다.
+        now = datetime.now()
+        api = FakeMercapi({"test": [FakeItem("m1", "신규", 1000, created=now)]})
+
+        _items, succeeded, coverage = await mercari.search_items(
+            api, "test", [], created_cutoff=(now - timedelta(minutes=5)).timestamp(),
+            sort_passes=["created"],
+        )
+
+        self.assertTrue(succeeded)
+        self.assertTrue(coverage)
+
+    async def test_exhausting_the_page_budget_still_counts_as_covered(self):
+        """페이지 상한까지 다 쓴 경우는 인정해야 합니다.
+
+        인정하지 않으면 매물이 쏟아지는 키워드의 기준선이 영영 전진하지 못해
+        매 실행 같은 구간을 다시 훑고, 키워드 단위 고장 알림까지 헛되게 울립니다.
+        """
+        now = datetime.now()
+        cutoff = (now - timedelta(minutes=5)).timestamp()
+
+        def full_page(tag):
+            return [
+                FakeItem(f"{tag}-{i}", f"신규 {i}", 1000, created=now - timedelta(minutes=1))
+                for i in range(mercari.MAX_ITEMS_PER_KEYWORD)
+            ]
+
+        # 어느 페이지에나 다음 페이지가 남아 있어서 상한에 걸려 멈추는 상황
+        pages = [full_page(f"p{n}") for n in range(1, mercari.MAX_SEARCH_PAGES + 2)]
+        api = FakeMercapi({"test": pages[0]}, extra_pages_by_keyword={"test": pages[1:]})
+
+        _items, succeeded, coverage = await mercari.search_items(
+            api, "test", [], created_cutoff=cutoff, sort_passes=["created"]
+        )
+
+        self.assertTrue(succeeded)
+        self.assertTrue(coverage)
+        self.assertEqual(api.call_counts["test"], 1)  # search 1회 + next_page 반복
+
+    async def test_mid_pagination_failure_keeps_the_keyword_checkpoint_in_place(self):
+        # 위 단위 동작이 실제 collect 흐름에서도 기준선을 지키는지 확인합니다.
+        mercari.SEARCHES = [{"query": "test", "categories": []}]
+        base = datetime.now().timestamp()
+        mercari.save_state(
+            {"x": 1}, [], [], {}, {"test"},
+            {"test": base - 60, mercari.FULL_SCAN_STATE_KEY: base - 60},
+        )
+        now = datetime.now()
+        full_fresh_page = [
+            FakeItem(f"p1-{i}", f"신규 {i}", 1000, created=now)
+            for i in range(mercari.MAX_ITEMS_PER_KEYWORD)
+        ]
+        api = FakeMercapi({"test": full_fresh_page}, fail_next_page_keywords=["test"])
+
+        with patch.object(mercari, "Mercapi", return_value=api), patch.object(
+            mercari, "current_time", return_value=base
+        ):
+            await mercari.collect_updates()
+
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        self.assertEqual(keyword_checkpoints(state), {"test": base - 60})
+
+    def test_state_for_removed_keywords_is_forgotten(self):
+        """SEARCHES에서 빠진 키워드 기록을 남겨 두면 두 가지가 따라옵니다.
+
+        상태 파일이 상한 없이 조금씩 커지고, 나중에 그 키워드를 되살릴 때
+        '첫 조회는 기준선만 저장' 장치가 동작하지 않아 최대 24시간치 매물이
+        한꺼번에 신규 알림으로 쏟아집니다.
+        """
+        mercari.SEARCHES = [{"query": "살아있는 키워드", "categories": []}]
+        known = {"살아있는 키워드", "지운 키워드"}
+        checked_at = {
+            "살아있는 키워드": 100.0,
+            "지운 키워드": 200.0,
+            mercari.FULL_SCAN_STATE_KEY: 300.0,
+            mercari.LAST_SEARCH_OK_KEY: 400.0,
+        }
+
+        mercari.forget_removed_keywords(known, checked_at)
+
+        self.assertEqual(known, {"살아있는 키워드"})
+        self.assertEqual(
+            checked_at,
+            {
+                "살아있는 키워드": 100.0,
+                mercari.FULL_SCAN_STATE_KEY: 300.0,
+                mercari.LAST_SEARCH_OK_KEY: 400.0,
+            },
+        )
+
+    def test_forgetting_keywords_never_touches_reserved_keys(self):
+        # 예약 키를 키워드로 오인해 지우면 전체 조회 간격과 고장 감지가 초기화됩니다.
+        mercari.SEARCHES = []
+        checked_at = {key: 1.0 for key in mercari.RESERVED_STATE_KEYS}
+        mercari.forget_removed_keywords(set(), checked_at)
+        self.assertEqual(sorted(checked_at), sorted(mercari.RESERVED_STATE_KEYS))
+
+    async def test_a_readded_keyword_only_records_a_baseline_again(self):
+        # 키워드를 지웠다가 되살리면 '첫 조회' 취급을 받아 알림이 생략되어야 합니다.
+        base = datetime.now().timestamp()
+        mercari.SEARCHES = [{"query": "kw", "categories": []}]
+        mercari.save_state(
+            {"x": 1}, [], [], {}, {"kw"},
+            {"kw": base - 60, mercari.FULL_SCAN_STATE_KEY: base - 60},
+        )
+
+        # 1) 키워드를 지운 상태로 한 번 실행 -> 기록이 정리됩니다.
+        mercari.SEARCHES = [{"query": "other", "categories": []}]
+        with patch.object(
+            mercari, "Mercapi", return_value=FakeMercapi({"other": []})
+        ), patch.object(mercari, "current_time", return_value=base):
+            await mercari.collect_updates()
+
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        self.assertNotIn("kw", state["keyword_checked_at"])
+        self.assertNotIn("kw", state["known_keywords"])
+
+        # 2) 되살린 뒤 첫 조회: 이미 올라와 있던 매물이 알림 폭탄이 되면 안 됩니다.
+        mercari.SEARCHES = [{"query": "kw", "categories": []}]
+        old_listing = FakeItem("m-old", "예전 매물", 5000, created=datetime.now())
+        with patch.object(
+            mercari, "Mercapi", return_value=FakeMercapi({"kw": [old_listing]})
+        ), patch.object(mercari, "current_time", return_value=base + 120):
+            await mercari.collect_updates()
+
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        self.assertEqual(state["pending"], [])
+        self.assertIn("m-old", state["seen"])
 
     def test_pending_queue_overflow_is_reported(self):
         # 상한을 넘겨 알림이 버려지는 상황은 조용히 넘어가면 안 됩니다.
