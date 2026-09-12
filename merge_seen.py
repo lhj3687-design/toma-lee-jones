@@ -8,6 +8,7 @@
 - keyword_checked_at: 키워드별 마지막 조회 시각은 더 늦은 쪽을 남깁니다.
 """
 import json
+import sys
 
 MAX_SEEN_ITEMS = 15000
 MAX_RELIST_FINGERPRINTS = 6000
@@ -18,13 +19,29 @@ SUPPORTED_FINGERPRINT_PREFIXES = ("seller:", "title:")
 UNKNOWN_SELLER_IDS = {"", "0", "none", "null"}
 
 
-def read_json(path: str) -> dict:
+def read_json(path: str, required: bool = False) -> dict:
+    """상태 파일을 읽습니다. required면 읽지 못할 때 조용히 넘어가지 않습니다.
+
+    /tmp/mine.json은 방금 이 실행이 모은 결과입니다. 읽지 못했을 때 빈 dict로
+    대신하면, 원격 상태만 남은 파일을 '병합 결과'라며 그대로 push해서 이번 실행의
+    알림과 가격 기록이 소리 없이 사라집니다. 그럴 바에는 병합을 실패시키는 편이
+    낫습니다 — push_state.sh가 실패로 받아 재시도하거나 멈추고, 상태는 보존됩니다.
+    (/tmp/theirs.json은 원격에 파일이 없을 때 정상적으로 비어 있을 수 있어 관대합니다.)
+    """
     try:
         with open(path) as file:
             data = json.load(file)
-            return data if isinstance(data, dict) else {}
-    except Exception:
+    except Exception as exc:
+        if required:
+            print(f"[병합 중단] {path}를 읽지 못했습니다: {exc}", file=sys.stderr)
+            raise SystemExit(1)
         return {}
+    if isinstance(data, dict):
+        return data
+    if required:
+        print(f"[병합 중단] {path}의 형식이 올바르지 않습니다(dict가 아님)", file=sys.stderr)
+        raise SystemExit(1)
+    return {}
 
 
 def alert_key(entry: dict) -> str:
@@ -51,6 +68,11 @@ def merge_pending(theirs: list, mine: list, sent_alerts: list) -> list:
     result = []
     for entry in theirs + mine:
         if not isinstance(entry, dict):
+            continue
+        # 본문이 없는 항목은 전송 단계에서 터지고, 터지면 대기열에 그대로 남아
+        # 다음 실행도 같은 자리에서 터집니다. check_mercari.py와 같은 기준으로 걸러 냅니다.
+        caption = entry.get("caption")
+        if not isinstance(caption, str) or not caption.strip():
             continue
         key = alert_key(entry)
         if key in sent_keys or key in pending_keys:
@@ -100,11 +122,16 @@ def is_usable_fingerprint(key: str) -> bool:
 
 
 def prune_fingerprints(fingerprints: dict) -> dict:
-    return {key: value for key, value in fingerprints.items() if is_usable_fingerprint(key)}
+    """check_mercari.py의 prune_fingerprints와 같은 기준(값이 dict인 것만 남김)."""
+    return {
+        key: value
+        for key, value in fingerprints.items()
+        if is_usable_fingerprint(key) and isinstance(value, dict)
+    }
 
 
 def main() -> None:
-    mine = read_json("/tmp/mine.json")
+    mine = read_json("/tmp/mine.json", required=True)
     theirs = read_json("/tmp/theirs.json")
 
     merged_seen = merge_ordered(theirs.get("seen", {}), mine.get("seen", {}), MAX_SEEN_ITEMS)

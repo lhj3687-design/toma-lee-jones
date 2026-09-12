@@ -17,6 +17,11 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # 한 실행은 보통 50~90초입니다. 상한이 없으면 GitHub 기본값인 6시간까지 붙잡고 있는데,
+    # concurrency 그룹이 실행을 하나로 묶어 두기 때문에 그동안 봇 전체가 멈춥니다
+    # (git push가 네트워크에서 멈추는 경우처럼 스스로 시간 제한이 없는 단계가 있습니다).
+    # 10분이면 정상 실행에는 여유가 충분하고, 멈춘 실행은 실패로 끝나 텔레그램 알림이 갑니다.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
