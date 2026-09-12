@@ -66,7 +66,15 @@ MAX_SENT_ALERTS = 20000
 FULL_SCAN_STATE_KEY = "__full_scan__"        # 마지막 '전체 조회' 시각
 LAST_SEARCH_OK_KEY = "__last_search_ok__"    # 마지막으로 검색에 성공한 시각
 LAST_CREATED_OK_KEY = "__last_created_ok__"  # 등록 시각을 정상적으로 받아온 마지막 시각
-RESERVED_STATE_KEYS = (FULL_SCAN_STATE_KEY, LAST_SEARCH_OK_KEY, LAST_CREATED_OK_KEY)
+LAST_ITEMS_OK_KEY = "__last_items_ok__"      # 검색이 매물을 한 건이라도 돌려준 마지막 시각
+LAST_CADENCE_OK_KEY = "__last_cadence_ok__"  # 실행 주기가 정상이었던 마지막 시각
+RESERVED_STATE_KEYS = (
+    FULL_SCAN_STATE_KEY,
+    LAST_SEARCH_OK_KEY,
+    LAST_CREATED_OK_KEY,
+    LAST_ITEMS_OK_KEY,
+    LAST_CADENCE_OK_KEY,
+)
 
 # 봇 고장 감지.
 # 검색이 이 시간 넘게 한 건도 성공하지 못하면 "봇이 멈춘 것 같다"고 알립니다.
@@ -88,6 +96,20 @@ KEYWORD_STUCK_AFTER_SECONDS = 60 * 60
 # 메루카리 응답에서 사라지면 그 방어선이 조용히 무력화되므로, 비율이 무너지면 알립니다.
 # 실측은 100%(2861/2861)라 50%면 정상 변동이 아니라 명백한 이상입니다.
 CREATED_COVERAGE_MIN_RATIO = 0.5
+
+# 실행 주기가 조용히 느려지는 것을 잡는 기준입니다.
+#
+# 이 봇의 1분 주기는 **저장소 밖의 cron 서비스**가 workflow_dispatch를 호출해서 만듭니다
+# (실측: 실행의 약 91%가 dispatch, 나머지 9%가 아래 워크플로의 5분 스케줄).
+# 그 cron이 멈추면 봇은 죽지 않고 **5분 주기로 조용히 떨어집니다.** 실행은 전부 성공하고
+# 검색도 정상이라 기존 고장 알림은 하나도 울리지 않는데, 새 매물 알림만 최대 5분 늦어집니다.
+# 5분 스케줄이 백업이자 동시에 이 저하를 가려 주는 셈이라, 따로 보지 않으면 알 수 없습니다.
+#
+# 주기를 바꾸면 이 값도 같이 바꿔 주세요(README "실행 주기 설정" 참고).
+EXPECTED_RUN_INTERVAL_SECONDS = 60
+# 기대 주기의 몇 배까지를 정상으로 볼지. 실행이 겹쳐 취소되는 일이 실측 약 6% 있어서
+# 한두 번 건너뛰는 건 정상입니다. 3배(3분)를 넘으면 주기 자체가 달라진 것으로 봅니다.
+RUN_INTERVAL_SLACK = 3
 
 # 전송 단계는 알림 하나마다 git push까지 하기 때문에 한 건당 수 초가 걸립니다.
 # 한 실행이 5분 크론을 넘겨 다음 실행이 줄줄이 밀리지 않도록 한 번에 보낼 양을 제한하고,
@@ -1287,6 +1309,130 @@ def created_coverage_alerts(searched: list, keyword_checked_at: dict, now: float
     ]
 
 
+def empty_feed_alerts(searched: list, keyword_checked_at: dict, now: float) -> list:
+    """검색은 성공하는데 매물이 한 건도 오지 않는 상태를 알립니다.
+
+    이게 왜 따로 필요하냐면, 기존 고장 감지가 전부 **검색 실패**를 기준으로 하기 때문입니다.
+    search_items는 예외만 나지 않으면 succeeded=True이므로, 메루카리가 200으로 빈 결과를
+    돌려주면 봇은 이렇게 판단합니다.
+
+      - health_alerts: any_success가 참 -> 정상, __last_search_ok__도 전진
+      - keyword_health_alerts: keyword_checked_at이 전진 -> 막힌 키워드 없음
+      - created_coverage_alerts: 표본이 없으니(total == 0) 판단 보류
+
+    즉 **모든 건강 신호가 초록인 채로 아무것도 찾지 못합니다.** 카테고리 ID가 바뀌거나
+    검색 조건이 무효가 되면 실제로 이 모양이 됩니다. 평소 전체 조회가 2,800건씩 나오는
+    봇에서 18개 키워드가 동시에 0건인 건 정상 변동이 아닙니다.
+
+    전량 검색 실패는 여기서 다루지 않습니다(그 상황은 health_alerts가 알립니다).
+    한 번 0건이라고 바로 알리지도 않습니다 — 다른 고장 알림과 같은 기준으로,
+    일정 시간 이상 이어질 때만, 정해진 간격당 한 번만 내보냅니다.
+    """
+    if not any(checked for _k, _i, checked, _c, _cut in searched):
+        return []
+
+    _with_created, total = created_coverage(searched)
+    last_ok = keyword_checked_at.get(LAST_ITEMS_OK_KEY)
+    last_ok = float(last_ok) if isinstance(last_ok, (int, float)) else None
+
+    if total > 0:
+        keyword_checked_at[LAST_ITEMS_OK_KEY] = now
+        if last_ok is not None and now - last_ok >= HEALTH_ALERT_AFTER_SECONDS:
+            minutes = int((now - last_ok) // 60)
+            return [
+                {
+                    "alert_id": f"health:feed-ok:{int(last_ok)}",
+                    "caption": (
+                        f"✅ 메루카리 알림봇 검색 결과 복구\n"
+                        f"다시 매물을 받아옵니다 (약 {minutes}분 만에)."
+                    ),
+                    "photo": None,
+                }
+            ]
+        return []
+
+    if last_ok is None:
+        # 기준이 없으면 이번 실행을 기준으로 삼고 넘어갑니다.
+        keyword_checked_at[LAST_ITEMS_OK_KEY] = now
+        return []
+    if now - last_ok < HEALTH_ALERT_AFTER_SECONDS:
+        return []
+
+    minutes = int((now - last_ok) // 60)
+    bucket = outage_bucket(now - last_ok)
+    return [
+        {
+            "alert_id": f"health:empty-feed:{int(last_ok)}:{bucket}",
+            "caption": (
+                f"⚠️ 메루카리 알림봇 검색 결과 없음\n"
+                f"검색은 성공하는데 매물이 약 {minutes}분째 한 건도 오지 않습니다.\n"
+                f"카테고리 ID나 검색 조건이 무효가 됐을 수 있습니다 — "
+                f"그동안 새 매물 알림은 나가지 않습니다."
+            ),
+            "photo": None,
+        }
+    ]
+
+
+def cadence_alerts(previous_checked_at: dict, keyword_checked_at: dict, now: float) -> list:
+    """실행 주기가 기대보다 느려진 상태를 알립니다.
+
+    1분 주기는 저장소 밖의 cron 서비스가 만듭니다(EXPECTED_RUN_INTERVAL_SECONDS 주석 참고).
+    그게 멈춰도 봇은 워크플로의 5분 스케줄로 계속 돌기 때문에 **실행은 전부 성공하고
+    검색도 정상**입니다. 기존 고장 알림은 하나도 울리지 않고, 새 매물 알림만 최대 5분
+    늦어집니다. 백업 스케줄이 저하를 가려 주는 셈입니다.
+
+    직전 실행과의 간격은 __last_search_ok__로 알 수 있습니다(이번 실행이 그 값을 덮어쓰기
+    전의 스냅샷을 씁니다). 한두 번 벌어지는 건 정상이므로 — 실행이 겹쳐 취소되는 일이
+    실측 약 6% 있습니다 — 벌어진 상태가 이어질 때만 알립니다.
+    """
+    previous = previous_checked_at.get(LAST_SEARCH_OK_KEY)
+    if not isinstance(previous, (int, float)):
+        return []  # 기준선이 없는 첫 실행입니다.
+
+    gap = now - float(previous)
+    last_ok = keyword_checked_at.get(LAST_CADENCE_OK_KEY)
+    last_ok = float(last_ok) if isinstance(last_ok, (int, float)) else None
+
+    if gap <= EXPECTED_RUN_INTERVAL_SECONDS * RUN_INTERVAL_SLACK:
+        keyword_checked_at[LAST_CADENCE_OK_KEY] = now
+        if last_ok is not None and now - last_ok >= HEALTH_ALERT_AFTER_SECONDS:
+            minutes = int((now - last_ok) // 60)
+            return [
+                {
+                    "alert_id": f"health:cadence-ok:{int(last_ok)}",
+                    "caption": (
+                        f"✅ 메루카리 알림봇 실행 주기 복구\n"
+                        f"다시 약 {int(EXPECTED_RUN_INTERVAL_SECONDS // 60)}분 주기로 돕니다 "
+                        f"(약 {minutes}분 만에)."
+                    ),
+                    "photo": None,
+                }
+            ]
+        return []
+
+    if last_ok is None:
+        keyword_checked_at[LAST_CADENCE_OK_KEY] = now
+        return []
+    if now - last_ok < HEALTH_ALERT_AFTER_SECONDS:
+        return []
+
+    bucket = outage_bucket(now - last_ok)
+    return [
+        {
+            "alert_id": f"health:cadence-slow:{int(last_ok)}:{bucket}",
+            "caption": (
+                f"⚠️ 메루카리 알림봇 실행 주기 저하\n"
+                f"실행 간격이 약 {int(gap // 60)}분으로 벌어졌습니다 "
+                f"(기대 {int(EXPECTED_RUN_INTERVAL_SECONDS // 60)}분).\n"
+                f"1분 주기를 만드는 외부 cron이 멈췄을 수 있습니다 — "
+                f"봇은 계속 돌지만 새 매물 알림이 그만큼 늦어집니다."
+            ),
+            "photo": None,
+        }
+    ]
+
+
 def keyword_health_alerts(searched: list, previous_checked_at: dict, now: float) -> list:
     """키워드 하나가 오래 막혀 있으면 알립니다.
 
@@ -1500,9 +1646,14 @@ async def collect_updates() -> None:
         keyword_checked_at[FULL_SCAN_STATE_KEY] = now
 
     # 봇 고장/복구 알림은 매물 알림과 달리 첫 실행에서도 내보냅니다.
-    warnings = health_alerts(searched, keyword_checked_at, now)
+    # cadence_alerts는 health_alerts보다 **먼저** 불러야 합니다. health_alerts가
+    # __last_search_ok__를 이번 실행 시각으로 덮어쓰기 때문에, 그 뒤에 부르면 직전
+    # 실행과의 간격이 0이 되어 주기 저하를 영영 못 봅니다.
+    warnings = cadence_alerts(previous_checked_at, keyword_checked_at, now)
+    warnings += health_alerts(searched, keyword_checked_at, now)
     warnings += keyword_health_alerts(searched, previous_checked_at, now)
     warnings += created_coverage_alerts(searched, keyword_checked_at, now)
+    warnings += empty_feed_alerts(searched, keyword_checked_at, now)
     for entry in warnings:
         print(entry["caption"].splitlines()[0], file=sys.stderr)
 
