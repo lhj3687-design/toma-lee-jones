@@ -81,6 +81,15 @@ def merge_pending(theirs: list, mine: list, sent_alerts: list) -> list:
         normalized.setdefault("alert_id", key)
         result.append(normalized)
         pending_keys.add(key)
+    if len(result) > MAX_PENDING_ALERTS:
+        # 상한을 넘겨 알림이 버려지는 상황은 조용히 넘어가면 안 됩니다.
+        # check_mercari.py의 deduplicate_pending과 같은 기준으로 알립니다 —
+        # 여기서만 말없이 버리면 '보낸 적도 없는데 사라진 알림'이 됩니다.
+        print(
+            f"[경고] 병합된 대기 알림이 상한({MAX_PENDING_ALERTS}건)을 넘어 "
+            f"오래된 {len(result) - MAX_PENDING_ALERTS}건을 버립니다",
+            file=sys.stderr,
+        )
     return result[-MAX_PENDING_ALERTS:]
 
 

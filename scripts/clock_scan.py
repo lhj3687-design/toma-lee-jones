@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""테스트를 여러 '가짜 벽시계' 시각에서 돌려, 시각에 따라 결과가 달라지는 곳을 찾습니다.
+"""봇 테스트를 여러 '가짜 벽시계' 시각에서 돌려, 시각에 따라 결과가 달라지는 곳을 찾습니다.
+
+대상은 tests/test_check_mercari.py입니다(판정·전송 로직). 나머지 두 테스트 파일은
+시각을 쓰지 않아 이 축에서 볼 것이 없습니다.
 
 왜 필요한가
 -----------
@@ -21,8 +24,9 @@
     python scripts/clock_scan.py --repeat 200   # 같은 시각에서 200회 (경합 탐지)
 
 --day/--week는 한 번에 몇 분 걸리므로 봇의 매분 실행 경로에는 넣지 않습니다.
-상시 방어선은 tests의 test_outage_alert_ids_never_depend_on_the_wall_clock이 맡고,
-이 스크립트는 시각을 다루는 코드를 건드렸을 때 사람이 직접 돌리는 용도입니다.
+대신 PR마다 .github/workflows/tests.yml이 --day와 --repeat 100을 돌립니다.
+봇 실행마다 도는 상시 방어선은 tests의
+test_outage_alert_ids_never_depend_on_the_wall_clock이 맡습니다(0.1초).
 
 한계 (중요)
 -----------
