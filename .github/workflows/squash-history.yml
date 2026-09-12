@@ -1,0 +1,71 @@
+name: Squash State History
+
+# seen_items.json을 매 실행마다 커밋하기 때문에 git 이력이 계속 쌓입니다.
+# 파일 자체는 상한이 있어 2MB 근처에서 멈추므로 정리 대상은 '이력'입니다.
+# 이 워크플로는 저장소가 임계치를 넘었을 때에만 이력을 커밋 하나로 압축하고,
+# 그 외에는 크기만 확인하고 아무것도 하지 않습니다.
+#
+# 알림 봇과 같은 concurrency 그룹을 쓰지 않습니다. 봇이 1분마다 실행되기 때문에
+# 같은 그룹에 넣으면 이 워크플로가 대기 중 취소되어 영영 돌지 못합니다.
+# 대신 --force-with-lease로 안전을 확보합니다(스크립트 주석 참고).
+
+on:
+  schedule:
+    # 매주 일요일 04:17 UTC (한국시간 월요일 13:17). 정각을 피해 혼잡을 줄입니다.
+    - cron: "17 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      threshold_mb:
+        description: "저장소가 이 크기(MB)를 넘을 때만 압축합니다"
+        required: false
+        default: "500"
+      dry_run:
+        description: "true면 크기만 확인하고 압축하지 않습니다"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+jobs:
+  squash:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 크기 확인
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          THRESHOLD_MB: ${{ github.event.inputs.threshold_mb || '500' }}
+        run: |
+          set -euo pipefail
+          size_kb="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.size')"
+          size_mb=$(( size_kb / 1024 ))
+          echo "저장소 크기 ${size_mb} MB / 임계치 ${THRESHOLD_MB} MB"
+          if [ "$size_mb" -lt "$THRESHOLD_MB" ]; then
+            echo "임계치 미만이므로 이번에는 압축하지 않습니다."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "임계치를 넘었습니다. 이력을 압축합니다."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "size_mb=${size_mb}" >> "$GITHUB_OUTPUT"
+
+      # 이력은 필요 없습니다. 최신 커밋 하나만 있으면 압축할 수 있습니다.
+      - uses: actions/checkout@v7
+        if: steps.check.outputs.proceed == 'true'
+        with:
+          fetch-depth: 1
+
+      - name: 이력 압축
+        if: steps.check.outputs.proceed == 'true' && github.event.inputs.dry_run != 'true'
+        run: bash scripts/squash_history.sh main
+
+      - name: 결과 확인
+        if: steps.check.outputs.proceed == 'true' && github.event.inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "압축 전 크기: ${{ steps.check.outputs.size_mb }} MB"
+          echo "실제 용량 회수는 GitHub가 내부 정리를 수행한 뒤에 반영되며, 보통 며칠 걸립니다."
+          echo "알림 봇은 다음 실행에서 새 이력을 그대로 이어받습니다(상태 파일 내용이 보존되므로 영향 없음)."

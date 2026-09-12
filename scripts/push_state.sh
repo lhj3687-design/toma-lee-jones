@@ -32,7 +32,9 @@ for attempt in 1 2 3 4 5; do
   echo "[재시도 $attempt] push 실패 -> 원격 상태와 병합 후 재시도"
   sleep "$((attempt * 2))"
   cp seen_items.json /tmp/mine.json
-  if ! git fetch origin "$branch"; then
+  # 이력 압축 직후에는 원격 이력이 통째로 바뀌어 원격추적 갱신이 비-fast-forward가 됩니다.
+  # --force를 주어야 그 경우에도 최신 상태를 확실히 받아옵니다.
+  if ! git fetch --force origin "$branch"; then
     echo "[재시도 $attempt] fetch 실패 -> 잠시 후 다시 시도"
     continue
   fi

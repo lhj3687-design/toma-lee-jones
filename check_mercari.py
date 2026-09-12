@@ -51,8 +51,18 @@ PRICE_DROP_ALERT_THRESHOLD = 1000  # 마지막 알림 가격보다 이 금액(�
 MAX_PENDING_ALERTS = 500
 MAX_SENT_ALERTS = 8000
 
-# 마지막 '전체 조회' 시각을 담는 예약 키입니다(키워드 이름과 겹치지 않도록 표시를 붙였습니다).
-FULL_SCAN_STATE_KEY = "__full_scan__"
+# keyword_checked_at 안에 같이 보관하는 예약 키들입니다(키워드 이름과 겹치지 않도록 표시를 붙였습니다).
+FULL_SCAN_STATE_KEY = "__full_scan__"      # 마지막 '전체 조회' 시각
+LAST_SEARCH_OK_KEY = "__last_search_ok__"  # 마지막으로 검색에 성공한 시각
+RESERVED_STATE_KEYS = (FULL_SCAN_STATE_KEY, LAST_SEARCH_OK_KEY)
+
+# 봇 고장 감지.
+# 검색이 이 시간 넘게 한 건도 성공하지 못하면 "봇이 멈춘 것 같다"고 알립니다.
+# 조용한 게 '새 매물이 없어서'인지 '봇이 죽어서'인지 구분할 수 없는 문제를 막기 위한 장치입니다.
+# 한 번 실패했다고 바로 알리지는 않습니다(일시적인 네트워크 오류로 헛알림이 가지 않도록).
+HEALTH_ALERT_AFTER_SECONDS = 10 * 60
+# 고장이 계속되는 동안 1분마다 알림이 쏟아지지 않도록, 이 간격당 최대 한 번만 알립니다.
+HEALTH_ALERT_COOLDOWN_SECONDS = 6 * 60 * 60
 
 # 전송 단계는 알림 하나마다 git push까지 하기 때문에 한 건당 수 초가 걸립니다.
 # 한 실행이 5분 크론을 넘겨 다음 실행이 줄줄이 밀리지 않도록 한 번에 보낼 양을 제한하고,
@@ -203,13 +213,27 @@ def load_state() -> tuple[dict, list, list, dict, set, dict]:
     )
 
 
+def is_usable_fingerprint(key: str) -> bool:
+    """지금 코드가 실제로 다시 조회하게 될 지문인지 판단합니다.
+
+    두 가지를 걸러냅니다.
+      - 현재 코드가 만들지 않는 형식(예전 버전이나 외부 도구가 남긴 것).
+      - 판매자 ID를 0으로 적어 둔 지문. 숍스 상품의 sellerId가 0으로 내려오던 때
+        만들어진 것들인데, 지금은 그런 매물을 'title:' 지문으로 다루므로 영영 조회되지
+        않습니다. 남겨 두면 용량 상한만 차지합니다.
+    """
+    key = str(key)
+    if not key.startswith(SUPPORTED_FINGERPRINT_PREFIXES):
+        return False
+    parts = key.split(":")
+    if parts[0] == "seller" and len(parts) > 1 and parts[1].strip().lower() in UNKNOWN_SELLER_IDS:
+        return False
+    return True
+
+
 def prune_fingerprints(relist_fingerprints: dict) -> dict:
-    """현재 코드가 조회하지 않는 형식의 재출품 지문을 걸러냅니다."""
-    return {
-        key: value
-        for key, value in relist_fingerprints.items()
-        if str(key).startswith(SUPPORTED_FINGERPRINT_PREFIXES)
-    }
+    """다시 조회될 일이 없는 재출품 지문을 걸러냅니다."""
+    return {key: value for key, value in relist_fingerprints.items() if is_usable_fingerprint(key)}
 
 
 def alert_key(entry: dict) -> str:
@@ -438,7 +462,7 @@ def new_item_cutoff(keyword_checked_at: dict, keyword: str, now: float) -> float
     - 조회 기록이 없으면(업그레이드 직후 첫 실행) 최근 1시간만 신규로 봅니다.
     - 봇이 오래 멈춰 있었다면 최대 24시간까지만 거슬러 올라갑니다.
     """
-    if keyword == FULL_SCAN_STATE_KEY:
+    if keyword in RESERVED_STATE_KEYS:
         return now - FIRST_RUN_LOOKBACK_SECONDS
     last_checked = keyword_checked_at.get(keyword)
     if not isinstance(last_checked, (int, float)):
@@ -849,6 +873,62 @@ def process_items(
     )
 
 
+def health_alerts(searched: list, keyword_checked_at: dict, now: float) -> list:
+    """봇이 멈춘 것 같으면 알림을 만들고, 다시 살아나면 복구 알림을 만듭니다.
+
+    이 봇은 평소에 조용한 게 정상이라, 고장이 나도 "새 매물이 없나 보다"와 구분되지 않습니다.
+    그래서 검색이 한동안 한 건도 성공하지 못하면 그 사실 자체를 알립니다.
+
+    알림 폭탄을 막는 장치가 두 겹입니다.
+      - 한 번 실패했다고 바로 알리지 않고, 마지막 성공으로부터 일정 시간이 지나야 알립니다.
+      - alert_id에 시간 구간을 넣어, 고장이 이어져도 그 구간당 한 번만 나갑니다
+        (이미 보낸 알림을 거르는 기존 sent_alerts 장치가 그대로 적용됩니다).
+    """
+    if not searched:
+        return []
+
+    any_success = any(checked for _k, _i, checked, _c, _cut in searched)
+    last_ok = keyword_checked_at.get(LAST_SEARCH_OK_KEY)
+    last_ok = float(last_ok) if isinstance(last_ok, (int, float)) else None
+
+    if any_success:
+        keyword_checked_at[LAST_SEARCH_OK_KEY] = now
+        # 한동안 죽어 있다가 살아난 경우에만 복구를 알립니다.
+        if last_ok is not None and now - last_ok >= HEALTH_ALERT_AFTER_SECONDS:
+            minutes = int((now - last_ok) // 60)
+            return [
+                {
+                    "alert_id": f"health:recovered:{int(last_ok)}",
+                    "caption": f"✅ 메루카리 알림봇 정상 복구 (약 {minutes}분 만에 검색 재개)",
+                    "photo": None,
+                }
+            ]
+        return []
+
+    # 이번 실행은 모든 키워드 검색이 실패했습니다.
+    if last_ok is None:
+        # 성공 기록이 없으면 기준이 없으므로 이번 실행을 기준으로 삼고 넘어갑니다.
+        keyword_checked_at[LAST_SEARCH_OK_KEY] = now
+        return []
+    down_for = now - last_ok
+    if down_for < HEALTH_ALERT_AFTER_SECONDS:
+        return []
+
+    minutes = int(down_for // 60)
+    bucket = int(now // HEALTH_ALERT_COOLDOWN_SECONDS)
+    return [
+        {
+            "alert_id": f"health:search-down:{bucket}",
+            "caption": (
+                f"⚠️ 메루카리 알림봇 이상\n"
+                f"약 {minutes}분째 모든 키워드 검색이 실패하고 있습니다.\n"
+                f"GitHub Actions 로그를 확인해 주세요."
+            ),
+            "photo": None,
+        }
+    ]
+
+
 def report_feed_health(searched: list) -> None:
     """메루카리 응답이 기대대로 오는지 실행마다 한 줄로 요약합니다.
 
@@ -972,10 +1052,16 @@ async def collect_updates() -> None:
     if full_scan and any(coverage for _k, _i, _c, coverage, _cut in searched):
         keyword_checked_at[FULL_SCAN_STATE_KEY] = now
 
+    # 봇 고장/복구 알림은 매물 알림과 달리 첫 실행에서도 내보냅니다.
+    warnings = health_alerts(searched, keyword_checked_at, now)
+    for entry in warnings:
+        print(entry["caption"].splitlines()[0], file=sys.stderr)
+
     if is_first_run:
         print(f"첫 실행: 기존 매물 {len(seen)}개를 기준으로 저장했습니다 (알림 생략)")
+        pending = deduplicate_pending(pending + warnings, sent_alerts)
     else:
-        pending = deduplicate_pending(pending + new_items, sent_alerts)
+        pending = deduplicate_pending(pending + new_items + warnings, sent_alerts)
         print(f"새 알림 {len(new_items)}건 발견 (저장될 대기열 {len(pending)}건)")
 
     save_state(seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at)
