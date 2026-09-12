@@ -106,12 +106,29 @@ def keyword_stuck_alerts(start: float, now: float) -> list:
     )
 
 
+def empty_feed_alerts_for(start: float, now: float) -> list:
+    """검색은 성공하는데 start부터 매물이 한 건도 오지 않는 상황."""
+    return mercari.empty_feed_alerts(
+        [("kw", [], True, True, 0.0)], {mercari.LAST_ITEMS_OK_KEY: start}, now
+    )
+
+
+def cadence_slow_alerts_for(start: float, now: float) -> list:
+    """start부터 실행 주기가 기대보다 느려진 상황."""
+    gap = mercari.EXPECTED_RUN_INTERVAL_SECONDS * mercari.RUN_INTERVAL_SLACK * 2
+    return mercari.cadence_alerts(
+        {mercari.LAST_SEARCH_OK_KEY: now - gap}, {mercari.LAST_CADENCE_OK_KEY: start}, now
+    )
+
+
 # 쿨다운을 거는 고장 알림 전부. 새 고장 알림을 추가하면 여기에도 추가해 주세요 —
 # 아래 테스트가 그 알림도 벽시계에 묶이지 않았는지 확인합니다.
 OUTAGE_ALERT_FAMILIES = [
     ("전량 검색 실패", search_down_alerts),
     ("등록 시각 방어선", created_missing_alerts),
     ("키워드 하나만 막힘", keyword_stuck_alerts),
+    ("검색 결과 없음", empty_feed_alerts_for),
+    ("실행 주기 저하", cadence_slow_alerts_for),
 ]
 
 
@@ -1336,6 +1353,100 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(set(created)), len(created))
         # 생성 순서 = 등록 시각 순서 (픽스처가 '나중에 만든 게 더 최근'을 보장)
         self.assertEqual(created, sorted(created))
+
+    async def test_an_empty_feed_is_not_mistaken_for_good_health(self):
+        """검색은 성공하는데 매물이 0건인 상태는 기존 감지에 전부 걸리지 않습니다.
+
+        search_items는 예외만 안 나면 succeeded=True라서, 메루카리가 빈 결과를
+        돌려주면 health_alerts는 정상, keyword_checked_at은 전진,
+        created_coverage_alerts는 표본이 없다며 판단 보류합니다. 모든 신호가 초록인 채로
+        아무것도 못 찾는 상태입니다.
+        """
+        base = datetime.now().timestamp()
+        empty = [("kw", [], True, True, 0.0)]
+
+        # 기존 감지는 전부 '정상'이라고 합니다.
+        # (직전 성공이 최근이라 '복구' 알림도 나올 이유가 없는 상태입니다.)
+        checked_at = {mercari.LAST_SEARCH_OK_KEY: base - 60}
+        self.assertEqual(mercari.health_alerts(empty, checked_at, base), [])
+        self.assertEqual(checked_at[mercari.LAST_SEARCH_OK_KEY], base)  # 정상으로 보고 전진까지 합니다
+        self.assertEqual(mercari.created_coverage_alerts(empty, {}, base), [])
+
+        # 새 감지는 잡습니다(단, 이어질 때만).
+        fresh = {mercari.LAST_ITEMS_OK_KEY: base - 60}
+        self.assertEqual(mercari.empty_feed_alerts(empty, fresh, base), [])
+
+        stale = {mercari.LAST_ITEMS_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 60}
+        alerts = mercari.empty_feed_alerts(empty, stale, base)
+        self.assertEqual(len(alerts), 1)
+        self.assertTrue(alerts[0]["alert_id"].startswith("health:empty-feed:"))
+
+    async def test_an_empty_feed_alert_needs_a_successful_search(self):
+        # 전량 검색 실패는 health_alerts가 다룹니다. 여기서 또 알리면 중복입니다.
+        base = datetime.now().timestamp()
+        failed = [("kw", [], False, False, 0.0)]
+        stale = {mercari.LAST_ITEMS_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 60}
+        self.assertEqual(mercari.empty_feed_alerts(failed, stale, base), [])
+
+    async def test_the_feed_recovery_is_announced(self):
+        base = datetime.now().timestamp()
+        got = [("kw", [{"id_": "m1", "created": datetime.now()}], True, True, 0.0)]
+        checked_at = {mercari.LAST_ITEMS_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 60}
+
+        alerts = mercari.empty_feed_alerts(got, checked_at, base)
+
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("복구", alerts[0]["caption"])
+        self.assertEqual(checked_at[mercari.LAST_ITEMS_OK_KEY], base)
+
+    async def test_a_slower_run_cadence_is_detected(self):
+        """1분 주기는 저장소 밖의 cron이 만듭니다.
+
+        그게 멈춰도 워크플로의 5분 스케줄 덕에 봇은 계속 돌고 검색도 성공합니다.
+        기존 고장 알림은 하나도 울리지 않는데 새 매물 알림만 최대 5분 늦어집니다.
+        """
+        base = datetime.now().timestamp()
+        slack = mercari.EXPECTED_RUN_INTERVAL_SECONDS * mercari.RUN_INTERVAL_SLACK
+
+        # 정상 주기: 알리지 않고 기준선만 전진합니다.
+        checked_at = {}
+        self.assertEqual(
+            mercari.cadence_alerts({mercari.LAST_SEARCH_OK_KEY: base - 60}, checked_at, base), []
+        )
+        self.assertEqual(checked_at[mercari.LAST_CADENCE_OK_KEY], base)
+
+        # 벌어졌지만 아직 짧으면 알리지 않습니다(취소로 한두 번 건너뛰는 건 정상).
+        previous = {mercari.LAST_SEARCH_OK_KEY: base - slack - 60}
+        self.assertEqual(
+            mercari.cadence_alerts(previous, {mercari.LAST_CADENCE_OK_KEY: base - 60}, base), []
+        )
+
+        # 이어지면 알립니다.
+        stale = {mercari.LAST_CADENCE_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 60}
+        alerts = mercari.cadence_alerts(previous, stale, base)
+        self.assertEqual(len(alerts), 1)
+        self.assertTrue(alerts[0]["alert_id"].startswith("health:cadence-slow:"))
+
+    async def test_the_first_run_never_reports_a_slow_cadence(self):
+        # 기준선이 없는 첫 실행을 '주기 저하'로 오인하면 안 됩니다.
+        base = datetime.now().timestamp()
+        self.assertEqual(mercari.cadence_alerts({}, {}, base), [])
+
+    async def test_the_cadence_check_runs_before_the_search_ok_timestamp_moves(self):
+        """순서가 뒤집히면 주기 저하를 영영 못 봅니다.
+
+        health_alerts가 __last_search_ok__를 이번 실행 시각으로 덮어쓰기 때문에,
+        그 뒤에 cadence_alerts를 부르면 간격이 0으로 보입니다.
+        """
+        base = datetime.now().timestamp()
+        searched = [("kw", [{"id_": "m1", "created": datetime.now()}], True, True, 0.0)]
+        checked_at = {mercari.LAST_SEARCH_OK_KEY: base - 600}
+
+        mercari.health_alerts(searched, checked_at, base)
+
+        # 덮어쓴 뒤의 값으로는 간격이 사라집니다 — 그래서 스냅샷을 써야 합니다.
+        self.assertEqual(checked_at[mercari.LAST_SEARCH_OK_KEY], base)
+        self.assertEqual(mercari.cadence_alerts(checked_at, {}, base), [])
 
     def test_outage_alert_ids_never_depend_on_the_wall_clock(self):
         """고장 알림의 쿨다운은 '고장이 시작된 시점'으로만 세야 합니다.
