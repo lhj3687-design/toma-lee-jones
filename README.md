@@ -6,6 +6,7 @@
 
 | 파일 | 역할 |
 |---|---|
+| `CLAUDE.md` | 새 세션이 시작할 때 자동으로 읽는 작업 규칙(이 README를 먼저 읽으라고 가리킵니다) |
 | `check_mercari.py` | 검색·판정(`--mode collect`)과 텔레그램 전송(`--mode send`) |
 | `seen_items.json` | 봇의 상태. 이미 본 매물, 보낸 알림, 키워드별 조회 시각 |
 | `merge_seen.py` | 실행이 겹쳐 push가 충돌했을 때 상태를 안전하게 병합 |
