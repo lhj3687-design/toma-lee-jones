@@ -708,6 +708,82 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         await mercari.check_keyword(api, "test", [], seen, {}, new_items)
         self.assertEqual(seen["m1"], {"last_alert_price": None, "last_seen_price": None})
 
+    async def test_no_price_observation_never_raises_an_existing_baseline(self):
+        """가격 비공개 관측 한 번이 이미 세워 둔 '역대 최저가'를 지우면 안 됩니다.
+
+        2026-09-13 감사에서 실제로 나간 틀린 알림의 원인입니다.
+        예전에는 가격을 모르는 관측에서도 last_alert_price = price(=None)를 해서 기준가를
+        지웠고, 바로 다음 관측의 가격이 그대로 새 기준가가 됐습니다. 기준가가 위로
+        올라가므로 그 다음 인하 알림이 '¥(올라간 값) → ¥(지금 값)'이라는, 사용자가 들은
+        적 없는 이전 가격을 말하게 됩니다.
+
+        운영 기록 그대로 재현합니다(m13662292434):
+          기준가 25000 / 관측가 29000 -> 비공개 관측 -> 29000 관측 -> 25000 관측
+          예전 코드: 기준가가 29000이 되고 'drop:...:29000:25000'이 실제로 전송됨
+        """
+        seen = {"m1": {"last_alert_price": 25000, "last_seen_price": 29000}}
+        relist_fingerprints: dict = {}
+        new_items: list = []
+
+        async def observe(price, no_price=False):
+            new_items.clear()
+            api = FakeMercapi(
+                {"test": [FakeItem("m1", "MMロゴ スウェット", price, is_no_price=no_price)]}
+            )
+            await mercari.check_keyword(api, "test", [], seen, relist_fingerprints, new_items)
+
+        await observe(9999999, no_price=True)
+        self.assertEqual(seen["m1"]["last_alert_price"], 25000)
+        self.assertEqual(new_items, [])
+
+        # 같은 실행의 다른 키워드가 정상 가격을 돌려주는 상황입니다.
+        await observe(29000)
+        self.assertEqual(seen["m1"]["last_alert_price"], 25000)
+        self.assertEqual(new_items, [])
+
+        # 사용자는 이미 25000을 들었으므로, 25000을 다시 봐도 알릴 것이 없습니다.
+        await observe(25000)
+        self.assertEqual(new_items, [])
+        self.assertEqual(seen["m1"]["last_alert_price"], 25000)
+
+    async def test_price_baseline_never_rises_under_any_observation_sequence(self):
+        """어떤 관측 순서에서도 기준가는 올라가지 않습니다.
+
+        위 테스트가 막는 것은 '고쳐 본 그 자리' 하나뿐입니다. 가격을 다루는 경로가
+        늘어나도 같은 성질이 지켜지도록, 값의 조합을 전수로 훑어 확인합니다.
+        """
+        prices = [30000, 50000, 45000, None]
+        for first in prices:
+            for second in prices:
+                for third in prices:
+                    seen = {"m1": {"last_alert_price": 30000, "last_seen_price": 30000}}
+                    relist_fingerprints: dict = {}
+                    new_items: list = []
+                    baseline = 30000
+                    for price in (first, second, third):
+                        new_items.clear()
+                        item = FakeItem(
+                            "m1",
+                            "가격 변동 매물",
+                            9999999 if price is None else price,
+                            is_no_price=price is None,
+                        )
+                        api = FakeMercapi({"test": [item]})
+                        await mercari.check_keyword(
+                            api, "test", [], seen, relist_fingerprints, new_items
+                        )
+                        current = seen["m1"]["last_alert_price"]
+                        self.assertIsNotNone(
+                            current,
+                            f"기준가가 지워졌습니다: {(first, second, third)}",
+                        )
+                        self.assertLessEqual(
+                            current,
+                            baseline,
+                            f"기준가가 올라갔습니다: {(first, second, third)}",
+                        )
+                        baseline = current
+
     async def test_search_failure_does_not_advance_keyword_checkpoint(self):
         # 검색이 실패했는데 조회 시각을 갱신해 버리면, 그 사이 올라온 매물이
         # 다음 실행에서 '오래된 매물'로 분류돼 영영 알림이 오지 않습니다.
