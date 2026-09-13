@@ -1393,10 +1393,19 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         got = [("kw", [{"id_": "m1", "created": datetime.now()}], True, True, 0.0)]
         checked_at = {mercari.LAST_ITEMS_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 60}
 
-        alerts = mercari.empty_feed_alerts(got, checked_at, base)
+        announced = [f"health:empty-feed:{int(checked_at[mercari.LAST_ITEMS_OK_KEY])}:0"]
+        alerts = mercari.empty_feed_alerts(got, checked_at, base, announced)
 
         self.assertEqual(len(alerts), 1)
         self.assertIn("복구", alerts[0]["caption"])
+        self.assertEqual(checked_at[mercari.LAST_ITEMS_OK_KEY], base)
+
+    async def test_the_feed_recovery_is_silent_when_nothing_was_announced(self):
+        base = datetime.now().timestamp()
+        got = [("kw", [{"id_": "m1", "created": datetime.now()}], True, True, 0.0)]
+        checked_at = {mercari.LAST_ITEMS_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 60}
+
+        self.assertEqual(mercari.empty_feed_alerts(got, checked_at, base, []), [])
         self.assertEqual(checked_at[mercari.LAST_ITEMS_OK_KEY], base)
 
     async def test_a_slower_run_cadence_is_detected(self):
@@ -1757,13 +1766,50 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_recovery_alert_after_an_outage(self):
         base = datetime.now().timestamp()
-        checked_at = {mercari.LAST_SEARCH_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 60}
+        down_since = base - mercari.HEALTH_ALERT_AFTER_SECONDS - 60
+        checked_at = {mercari.LAST_SEARCH_OK_KEY: down_since}
         searched = [("kw", [], True, True, 0.0)]
+        # 고장을 실제로 알린 뒤여야 복구를 알립니다(아래 ..._is_silent 테스트 참고).
+        announced = [f"health:search-down:{int(down_since)}:0"]
 
-        alerts = mercari.health_alerts(searched, checked_at, base)
+        alerts = mercari.health_alerts(searched, checked_at, base, announced)
         self.assertEqual(len(alerts), 1)
         self.assertIn("복구", alerts[0]["caption"])
         self.assertEqual(checked_at[mercari.LAST_SEARCH_OK_KEY], base)
+
+    async def test_recovery_is_silent_when_the_outage_was_never_announced(self):
+        """봇이 그냥 안 돌았을 때 "나았습니다"라고 말하지 않습니다.
+
+        복구 조건인 "마지막 정상으로부터 10분"은 고장났을 때뿐 아니라 **실행 자체가
+        없었을 때**도 참입니다. 실행이 없으면 경고를 보낼 주체도 없으므로, 막지 않으면
+        경고 없이 복구만 나갑니다. 실측(2026-09-13) 복구 11건이 전부 그랬습니다.
+        """
+        base = datetime.now().timestamp()
+        checked_at = {mercari.LAST_SEARCH_OK_KEY: base - mercari.HEALTH_ALERT_AFTER_SECONDS - 60}
+        searched = [("kw", [], True, True, 0.0)]
+
+        self.assertEqual(mercari.health_alerts(searched, checked_at, base, []), [])
+        # 알리지 않아도 기준선은 전진해야 합니다(다음 실행이 또 10분을 세면 안 됩니다).
+        self.assertEqual(checked_at[mercari.LAST_SEARCH_OK_KEY], base)
+
+    async def test_a_recovery_matches_its_outage_by_the_same_baseline(self):
+        """경고와 복구는 같은 기준 시각을 공유합니다. 다른 고장의 경고로는 안 열립니다."""
+        base = datetime.now().timestamp()
+        down_since = base - mercari.HEALTH_ALERT_AFTER_SECONDS - 60
+        searched = [("kw", [], True, True, 0.0)]
+        other = [f"health:search-down:{int(down_since) - 9999}:0"]
+
+        self.assertEqual(
+            mercari.health_alerts(searched, {mercari.LAST_SEARCH_OK_KEY: down_since}, base, other),
+            [],
+        )
+        # 고장이 길어져 쿨다운 구간이 넘어간 뒤(bucket 1)에도 복구는 열려야 합니다.
+        late = [f"health:search-down:{int(down_since)}:1"]
+        self.assertEqual(
+            len(mercari.health_alerts(
+                searched, {mercari.LAST_SEARCH_OK_KEY: down_since}, base, late)),
+            1,
+        )
 
     async def test_no_recovery_alert_during_normal_operation(self):
         base = datetime.now().timestamp()
@@ -2000,10 +2046,23 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         )[0]["alert_id"]
         self.assertEqual(first, soon)
 
+        # 위에서 실제로 만들어진 경고 id를 그대로 '보낸 것'으로 넘깁니다.
         checked_at = {mercari.LAST_CREATED_OK_KEY: stale}
-        recovery = mercari.created_coverage_alerts(self._items(50, 0), checked_at, base)
+        recovery = mercari.created_coverage_alerts(
+            self._items(50, 0), checked_at, base, [first]
+        )
         self.assertEqual(len(recovery), 1)
         self.assertIn("복구", recovery[0]["caption"])
+        self.assertEqual(checked_at[mercari.LAST_CREATED_OK_KEY], base)
+
+    async def test_the_created_recovery_is_silent_when_nothing_was_announced(self):
+        base = datetime.now().timestamp()
+        stale = base - mercari.HEALTH_ALERT_AFTER_SECONDS - 120
+        checked_at = {mercari.LAST_CREATED_OK_KEY: stale}
+
+        self.assertEqual(
+            mercari.created_coverage_alerts(self._items(50, 0), checked_at, base, []), []
+        )
         self.assertEqual(checked_at[mercari.LAST_CREATED_OK_KEY], base)
 
     async def test_failed_search_does_not_trigger_a_created_alert(self):
@@ -2037,6 +2096,69 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         state = json.loads(mercari.SEEN_FILE.read_text())
         ids = [e["alert_id"] for e in state["pending"]]
         self.assertTrue(any(i.startswith("health:created-missing:") for i in ids), ids)
+
+    # ── 2026-09-13 사고 재현 ────────────────────────────────────────────────
+    #
+    # 러너 배정이 막혀 봇이 15분간 돌지 못한 뒤 살아난 실행입니다. 검색·등록시각·매물
+    # 모두 정상인데, 세 기준선이 전부 15분 전이라 복구 조건("10분 지남")이 참이 됩니다.
+    # 고장 알림은 하나도 나간 적이 없습니다 - 보낼 실행 자체가 없었으니까요.
+
+    async def _run_after_a_15_minute_standstill(self, announce=lambda _baseline: []):
+        """15분 멈춰 있다가 살아난 실행 하나를 돌리고, 대기열에 쌓인 alert_id를 돌려줍니다.
+
+        announce는 기준선(멈추기 직전 마지막 정상 시각)을 받아 '이미 보낸 알림' 목록을
+        만듭니다. 기준선은 여기서 정해지므로 호출자가 미리 알 수 없어 콜백으로 받습니다.
+        """
+        mercari.SEARCHES = [{"query": "test", "categories": []}]
+        base = datetime.now().timestamp()
+        stood_still_since = base - 15 * 60
+        mercari.save_state(
+            {"x": 1}, [], list(announce(int(stood_still_since))), {}, {"test"},
+            {
+                "test": stood_still_since,
+                mercari.LAST_SEARCH_OK_KEY: stood_still_since,
+                mercari.FULL_SCAN_STATE_KEY: stood_still_since,
+                mercari.LAST_CREATED_OK_KEY: stood_still_since,
+                mercari.LAST_ITEMS_OK_KEY: stood_still_since,
+                mercari.LAST_CADENCE_OK_KEY: stood_still_since,
+            },
+        )
+        api = FakeMercapi({"test": [FakeItem("m1", "정상 매물", 1000)]})
+        with patch.object(mercari, "Mercapi", return_value=api), patch.object(
+            mercari, "current_time", return_value=base
+        ), patch("sys.stderr", new=io.StringIO()):
+            await mercari.collect_updates()
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        return [e["alert_id"] for e in state["pending"]]
+
+    async def test_a_standstill_does_not_produce_recoveries_nobody_asked_about(self):
+        """실측된 헛알림입니다.
+
+        2026-09-13까지 나간 복구 11건(recovered 4 / created-ok 4 / feed-ok 3)이 전부
+        이 경우였고, 같은 기간 짝이 되는 경고는 0건이었습니다. 러너 정체가 하루 두어 번
+        있어서 한 번에 세 건씩 나갔습니다.
+        """
+        ids = await self._run_after_a_15_minute_standstill()
+
+        for bogus in ("health:recovered:", "health:created-ok:", "health:feed-ok:"):
+            self.assertFalse([i for i in ids if i.startswith(bogus)], f"{bogus} -> {ids}")
+
+        # 실행이 멈춘 사실 자체는 여전히 알려야 합니다. 그건 cadence가 맡습니다.
+        self.assertTrue([i for i in ids if i.startswith("health:cadence-slow:")], ids)
+
+    async def test_a_real_outage_still_gets_its_recovery_announced(self):
+        """호출부가 sent_alerts를 실제로 넘기는지까지 확인합니다.
+
+        기본값 ()에 기대고 있으면 이 테스트가 깨집니다 - 넘기지 않으면 '알린 적 없음'이
+        되어 복구가 영영 나가지 않기 때문입니다. 위 테스트만으로는 그 구분이 안 됩니다.
+        """
+        ids = await self._run_after_a_15_minute_standstill(
+            announce=lambda baseline: [f"health:search-down:{baseline}:0"]
+        )
+        self.assertTrue([i for i in ids if i.startswith("health:recovered:")], ids)
+        # 짝이 없는 나머지 둘은 여전히 조용해야 합니다.
+        self.assertFalse([i for i in ids if i.startswith("health:created-ok:")], ids)
+        self.assertFalse([i for i in ids if i.startswith("health:feed-ok:")], ids)
 
 
 if __name__ == "__main__":

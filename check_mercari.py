@@ -1179,7 +1179,39 @@ def outage_bucket(down_for: float) -> int:
     return int(max(down_for, 0.0) // HEALTH_ALERT_COOLDOWN_SECONDS)
 
 
-def health_alerts(searched: list, keyword_checked_at: dict, now: float) -> list:
+def outage_was_announced(sent_alerts, alert_prefix: str) -> bool:
+    """이 고장에 대해 경고가 실제로 나간 적이 있는지 봅니다.
+
+    왜 필요한가:
+
+    복구 알림은 "마지막 정상으로부터 HEALTH_ALERT_AFTER_SECONDS가 지났다"만으로 판단합니다.
+    그런데 그 조건은 **고장이 났다 나았을 때**뿐 아니라 **봇이 아예 돌지 않았을 때**도 참입니다.
+    실행이 없으면 경고를 보낼 주체도 없으므로, 그 경우에는 경고 없이 복구만 단독으로 나가
+    "알린 적 없는 고장이 나았다"는 말이 됩니다.
+
+    실측(2026-09-13): 보낸 복구 11건(recovered 4 / created-ok 4 / feed-ok 3) 전부가
+    짝이 없었습니다. 같은 기간 search-down·created-missing·empty-feed는 **0건**입니다.
+    러너 배정이 막혀 봇이 10분 넘게 못 도는 일이 하루 두어 번 있는데, 그때마다 한 번에
+    세 건씩 나갔습니다.
+
+    keyword_health_alerts는 이 문제를 이미 다르게 막고 있습니다 - 봇 전체가 멈췄던
+    실행에서는 아예 아무것도 내보내지 않습니다(그 함수 독스트링 참고). 여기서는 같은
+    생각을 나머지 가족에 적용합니다.
+
+    경고와 복구의 alert_id는 같은 기준 시각(last_ok)을 공유하므로, 그 접두사로 보낸
+    적이 있는지만 보면 됩니다. 경고는 고장이 이어지는 동안 쿨다운 구간(bucket)마다
+    다른 id로 나가므로 접두사 일치로 찾습니다.
+
+    보는 것은 **실제로 나간 것**뿐이고 아직 대기열에 있는 경고는 세지 않습니다. 그래서
+    "경고를 만들었지만 전송이 막혀 못 보낸 사이에 복구된" 드문 경우에는 복구가 생략됩니다.
+    일부러 그렇게 뒀습니다 - 그 상황에서 둘 다 내보내면 ⚠️와 ✅가 한 번에 도착합니다.
+    """
+    return any(isinstance(a, str) and a.startswith(alert_prefix) for a in sent_alerts)
+
+
+def health_alerts(
+    searched: list, keyword_checked_at: dict, now: float, sent_alerts=()
+) -> list:
     """봇이 멈춘 것 같으면 알림을 만들고, 다시 살아나면 복구 알림을 만듭니다.
 
     이 봇은 평소에 조용한 게 정상이라, 고장이 나도 "새 매물이 없나 보다"와 구분되지 않습니다.
@@ -1200,8 +1232,13 @@ def health_alerts(searched: list, keyword_checked_at: dict, now: float) -> list:
 
     if any_success:
         keyword_checked_at[LAST_SEARCH_OK_KEY] = now
-        # 한동안 죽어 있다가 살아난 경우에만 복구를 알립니다.
-        if last_ok is not None and now - last_ok >= HEALTH_ALERT_AFTER_SECONDS:
+        # 한동안 죽어 있다가 살아난 경우에만, 그리고 그 고장을 실제로 알렸을 때에만
+        # 복구를 알립니다(outage_was_announced 참고).
+        if (
+            last_ok is not None
+            and now - last_ok >= HEALTH_ALERT_AFTER_SECONDS
+            and outage_was_announced(sent_alerts, f"health:search-down:{int(last_ok)}:")
+        ):
             minutes = int((now - last_ok) // 60)
             return [
                 {
@@ -1250,7 +1287,9 @@ def created_coverage(searched: list) -> tuple[int, int]:
     return with_created, total
 
 
-def created_coverage_alerts(searched: list, keyword_checked_at: dict, now: float) -> list:
+def created_coverage_alerts(
+    searched: list, keyword_checked_at: dict, now: float, sent_alerts=()
+) -> list:
     """매물 등록 시각을 받아오지 못하게 되면 알립니다.
 
     이 봇의 '오래된 매물을 신규로 오인하지 않는' 방어선은 등록 시각에 기대고 있습니다.
@@ -1271,7 +1310,11 @@ def created_coverage_alerts(searched: list, keyword_checked_at: dict, now: float
 
     if ratio >= CREATED_COVERAGE_MIN_RATIO:
         keyword_checked_at[LAST_CREATED_OK_KEY] = now
-        if last_ok is not None and now - last_ok >= HEALTH_ALERT_AFTER_SECONDS:
+        if (
+            last_ok is not None
+            and now - last_ok >= HEALTH_ALERT_AFTER_SECONDS
+            and outage_was_announced(sent_alerts, f"health:created-missing:{int(last_ok)}:")
+        ):
             minutes = int((now - last_ok) // 60)
             return [
                 {
@@ -1309,7 +1352,9 @@ def created_coverage_alerts(searched: list, keyword_checked_at: dict, now: float
     ]
 
 
-def empty_feed_alerts(searched: list, keyword_checked_at: dict, now: float) -> list:
+def empty_feed_alerts(
+    searched: list, keyword_checked_at: dict, now: float, sent_alerts=()
+) -> list:
     """검색은 성공하는데 매물이 한 건도 오지 않는 상태를 알립니다.
 
     이게 왜 따로 필요하냐면, 기존 고장 감지가 전부 **검색 실패**를 기준으로 하기 때문입니다.
@@ -1337,7 +1382,11 @@ def empty_feed_alerts(searched: list, keyword_checked_at: dict, now: float) -> l
 
     if total > 0:
         keyword_checked_at[LAST_ITEMS_OK_KEY] = now
-        if last_ok is not None and now - last_ok >= HEALTH_ALERT_AFTER_SECONDS:
+        if (
+            last_ok is not None
+            and now - last_ok >= HEALTH_ALERT_AFTER_SECONDS
+            and outage_was_announced(sent_alerts, f"health:empty-feed:{int(last_ok)}:")
+        ):
             minutes = int((now - last_ok) // 60)
             return [
                 {
@@ -1649,11 +1698,16 @@ async def collect_updates() -> None:
     # cadence_alerts는 health_alerts보다 **먼저** 불러야 합니다. health_alerts가
     # __last_search_ok__를 이번 실행 시각으로 덮어쓰기 때문에, 그 뒤에 부르면 직전
     # 실행과의 간격이 0이 되어 주기 저하를 영영 못 봅니다.
+    #
+    # cadence_alerts만 sent_alerts를 받지 않습니다. 이 가족은 '봇이 안 돌았다'를 실행
+    # 간격으로 직접 감지하므로 멈춰 있던 경우에도 경고가 정상적으로 나가기 때문입니다
+    # (실측 2026-09-13: 복구 4건 중 3건이 짝이 맞았고, 짝 없는 1건도 정당한 복구였습니다).
+    # 나머지 세 가족은 봇이 멈추면 경고를 낼 주체가 없어 복구만 단독으로 나갑니다.
     warnings = cadence_alerts(previous_checked_at, keyword_checked_at, now)
-    warnings += health_alerts(searched, keyword_checked_at, now)
+    warnings += health_alerts(searched, keyword_checked_at, now, sent_alerts)
     warnings += keyword_health_alerts(searched, previous_checked_at, now)
-    warnings += created_coverage_alerts(searched, keyword_checked_at, now)
-    warnings += empty_feed_alerts(searched, keyword_checked_at, now)
+    warnings += created_coverage_alerts(searched, keyword_checked_at, now, sent_alerts)
+    warnings += empty_feed_alerts(searched, keyword_checked_at, now, sent_alerts)
     for entry in warnings:
         print(entry["caption"].splitlines()[0], file=sys.stderr)
 
