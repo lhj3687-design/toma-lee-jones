@@ -4,6 +4,7 @@
 - sent_alerts: 합집합으로 보존해 이미 전송된 알림이 대기열에 되살아나도 재전송하지 않습니다.
 - pending: 고유 alert_id(구버전은 caption) 기준으로 합치되 sent_alerts에 있는 항목은 제거합니다.
 - relist_fingerprints: 재출품 감지용 지문 기록도 두 쪽 다 유지합니다(합집합, 최신 쪽 우선).
+- pending_relists: 판정을 미뤄 둔 재출품 후보도 합칩니다(먼저 시작한 쪽의 시각을 남깁니다).
 - known_keywords: 이미 한 번이라도 조회한 키워드 목록도 합집합으로 유지합니다.
 - keyword_checked_at: 키워드별 마지막 조회 시각은 더 늦은 쪽을 남깁니다.
 """
@@ -14,6 +15,7 @@ MAX_SEEN_ITEMS = 15000
 MAX_RELIST_FINGERPRINTS = 15000
 MAX_SENT_ALERTS = 20000
 MAX_PENDING_ALERTS = 500
+MAX_PENDING_RELISTS = 500
 SUPPORTED_FINGERPRINT_PREFIXES = ("seller:", "title:")
 # 숍스 상품은 sellerId가 0으로 내려옵니다. 그 시절 지문은 지금 조회되지 않습니다.
 UNKNOWN_SELLER_IDS = {"", "0", "none", "null"}
@@ -104,6 +106,36 @@ def merge_ordered(theirs: dict, mine: dict, limit: int) -> dict:
     return dict(list(merged.items())[-limit:])
 
 
+def merge_pending_relists(theirs: dict, mine: dict, seen: dict) -> dict:
+    """판정을 미뤄 둔 재출품 후보를 합칩니다.
+
+    두 쪽이 같은 매물을 보고 있으면 **먼저 시작한 쪽의 since와 더 많이 센 checks**를
+    남깁니다. 늦게 시작한 쪽을 그대로 쓰면 실행이 겹칠 때마다 확인 시계가 0으로
+    되돌아가, 판정이 영영 끝나지 않습니다.
+
+    이미 seen에 들어간 매물의 기록은 버립니다(상대 실행이 먼저 판정을 끝냈다는 뜻).
+    """
+    merged = {}
+    for source in (theirs, mine):
+        if not isinstance(source, dict):
+            continue
+        for item_id, entry in source.items():
+            if not isinstance(entry, dict) or item_id in seen:
+                continue
+            current = merged.get(item_id)
+            if current is None or current.get("matched_id") != entry.get("matched_id"):
+                merged[item_id] = dict(entry)
+                continue
+            combined = dict(current)
+            for key, pick in (("since", min), ("checks", max), ("checked_at", max)):
+                values = [v for v in (current.get(key), entry.get(key)) if isinstance(v, (int, float))]
+                if values:
+                    combined[key] = pick(values)
+            combined["fresh"] = bool(current.get("fresh")) or bool(entry.get("fresh"))
+            merged[item_id] = combined
+    return dict(list(merged.items())[-MAX_PENDING_RELISTS:])
+
+
 def merge_checked_at(theirs: dict, mine: dict) -> dict:
     merged = dict(theirs)
     for keyword, value in mine.items():
@@ -155,6 +187,11 @@ def main() -> None:
     merged_checked_at = merge_checked_at(
         theirs.get("keyword_checked_at", {}) or {}, mine.get("keyword_checked_at", {}) or {}
     )
+    merged_pending_relists = merge_pending_relists(
+        theirs.get("pending_relists", {}) or {},
+        mine.get("pending_relists", {}) or {},
+        merged_seen,
+    )
 
     with open("/tmp/merged.json", "w") as file:
         json.dump(
@@ -165,6 +202,7 @@ def main() -> None:
                 "relist_fingerprints": merged_fingerprints,
                 "known_keywords": merged_known_keywords,
                 "keyword_checked_at": merged_checked_at,
+                "pending_relists": merged_pending_relists,
             },
             file,
             ensure_ascii=False,

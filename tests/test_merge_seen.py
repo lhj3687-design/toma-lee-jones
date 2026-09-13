@@ -109,7 +109,8 @@ class MergeSeenTests(unittest.TestCase):
         sys.modules.setdefault("mercapi", stub)
         bot = importlib.import_module("check_mercari")
 
-        for name in ("MAX_SEEN_ITEMS", "MAX_RELIST_FINGERPRINTS", "MAX_SENT_ALERTS", "MAX_PENDING_ALERTS"):
+        for name in ("MAX_SEEN_ITEMS", "MAX_RELIST_FINGERPRINTS", "MAX_SENT_ALERTS",
+                     "MAX_PENDING_ALERTS", "MAX_PENDING_RELISTS"):
             self.assertEqual(getattr(merge, name), getattr(bot, name), name)
         self.assertEqual(merge.SUPPORTED_FINGERPRINT_PREFIXES, bot.SUPPORTED_FINGERPRINT_PREFIXES)
         self.assertEqual(merge.UNKNOWN_SELLER_IDS, bot.UNKNOWN_SELLER_IDS)
@@ -125,6 +126,35 @@ class MergeSeenTests(unittest.TestCase):
             sorted(merge.prune_fingerprints(dict(samples))),
             sorted(bot.prune_fingerprints(dict(samples))),
         )
+
+    def test_merge_keeps_the_earlier_disappearance_clock(self):
+        """재출품 판정 보류는 '언제부터 안 보였나'를 세는 시계입니다.
+
+        실행이 겹칠 때마다 늦게 시작한 쪽으로 덮어쓰면 시계가 0으로 되돌아가,
+        확인이 영영 끝나지 않습니다.
+        """
+        theirs = {"m-new": {"matched_id": "m-old", "since": 1000, "checks": 5, "fresh": True}}
+        mine = {"m-new": {"matched_id": "m-old", "since": 1400, "checks": 2, "fresh": False}}
+        merged = merge.merge_pending_relists(theirs, mine, seen={})
+        self.assertEqual(merged["m-new"]["since"], 1000)
+        self.assertEqual(merged["m-new"]["checks"], 5)
+        self.assertTrue(merged["m-new"]["fresh"])
+
+    def test_merge_restarts_the_clock_when_the_fingerprint_owner_changed(self):
+        # 지문의 주인이 바뀌었다면 다른 질문을 확인하고 있는 것이므로 합치면 안 됩니다.
+        theirs = {"m-new": {"matched_id": "m-old", "since": 1000, "checks": 5}}
+        mine = {"m-new": {"matched_id": "m-other", "since": 1400, "checks": 1}}
+        merged = merge.merge_pending_relists(theirs, mine, seen={})
+        self.assertEqual(merged["m-new"], mine["m-new"])
+
+    def test_merge_drops_pending_relists_already_judged_by_the_other_run(self):
+        # 상대 실행이 먼저 판정을 끝내 seen에 들어갔다면 보류 기록은 의미가 없습니다.
+        merged = merge.merge_pending_relists(
+            {"m-new": {"matched_id": "m-old", "since": 1000}},
+            {},
+            seen={"m-new": {"last_alert_price": 1}},
+        )
+        self.assertEqual(merged, {})
 
     def test_sent_alerts_are_deduplicated_and_capped(self):
         merged = merge.unique_recent(["a", "b", "a", "c"], limit=2)
