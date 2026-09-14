@@ -1094,6 +1094,10 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(seen, {})  # 빠른 조회만으로는 영영 판정하지 않습니다
         self.assertEqual(pending_relists["m-new"]["checks"], 0)
+        # 확인 횟수는 늘지 않아도 '마지막으로 본 실행'은 남아야 합니다. 이게 없으면
+        # 상태 파일만 보고는 확인이 진행 중인 보류와, 매물이 사라져 수명만 기다리는
+        # 보류를 구분할 수 없습니다(실제로 그것 때문에 Actions 로그를 뒤졌습니다).
+        self.assertEqual(pending_relists["m-new"]["checked_at"], 1000.0 + 19 * 60)
 
         # 같은 상황에서 예전 매물이 결과에 보이면 빠른 조회에서도 바로 판정합니다.
         new_items: list = []
