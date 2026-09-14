@@ -4,8 +4,12 @@
 통째로 틀립니다. 메루카리를 실제로 부르는 부분(walk)은 가짜 API로 돌려 확인합니다.
 """
 import asyncio
+import contextlib
 import importlib
+import io
+import json
 import sys
+import tempfile
 import types
 import unittest
 from dataclasses import dataclass, field
@@ -54,10 +58,12 @@ class FakeApi:
         self.pages_by_filter = pages_by_filter
         self.num_found_by_filter = num_found_by_filter
         self.calls = []
+        self.options = []
 
     async def search(self, keyword, categories=(), **options):
         key = "filtered" if categories else "all"
         self.calls.append((keyword, tuple(categories)))
+        self.options.append(options)
         return FakeResults(self.pages_by_filter[key], 0, self.num_found_by_filter[key])
 
 
@@ -248,3 +254,270 @@ class WindowDepthTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SortPassTests(unittest.TestCase):
+    """등록순과 추천순을 정말 가르고 있는지.
+
+    이 검사가 없으면 도구가 조용히 거짓말을 합니다 — 아래 두 가지가 겹치면
+    '등록순 대 추천순' 표가 같은 조회 두 벌이 됩니다.
+    """
+
+    def test_walk_sends_the_sort_options_of_the_pass_it_was_asked_for(self):
+        """--sort score가 정말 다른 조회를 부르는지. 안 그러면 표가 통째로 거짓입니다."""
+        original = dict(coverage_scan.SEARCH_SORT_OPTIONS)
+        coverage_scan.SEARCH_SORT_OPTIONS.update(
+            {"created": {"sort_by": "CREATED"}, "score": {"sort_by": "SCORE"}}
+        )
+        try:
+            pages = [[FakeItem("a")]]
+            api = FakeApi({"filtered": pages, "all": pages}, {"filtered": 1, "all": 1})
+            asyncio.run(coverage_scan.walk(api, "kw", [], pages=1, sort="score"))
+            asyncio.run(coverage_scan.walk(api, "kw", [], pages=1, sort="created"))
+            self.assertEqual(
+                [opts.get("sort_by") for opts in api.options], ["SCORE", "CREATED"]
+            )
+        finally:
+            coverage_scan.SEARCH_SORT_OPTIONS.clear()
+            coverage_scan.SEARCH_SORT_OPTIONS.update(original)
+
+    def test_empty_search_options_are_refused_instead_of_silently_measured(self):
+        """build_search_options()가 물러난 상태를 잡아냅니다.
+
+        mercapi import가 실패하면 그 함수는 예외를 삼키고 `{"created": {}, "score": {}}`로
+        물러납니다. 그러면 두 패스가 **옵션 없는 같은 조회**가 되는데, mercapi의 기본
+        정렬이 추천순이라 결과는 둘 다 추천순입니다. 그대로 돌리면 "추천순도 등록순과
+        똑같더라"는 결론이 나옵니다 — 재고 있는 도구로 이상 없다고 말하는 자리입니다.
+        """
+        original = dict(coverage_scan.SEARCH_SORT_OPTIONS)
+        try:
+            coverage_scan.SEARCH_SORT_OPTIONS.update({"created": {}, "score": {}})
+            ok, why = coverage_scan.sort_options_are_distinct()
+            self.assertFalse(ok)
+            self.assertIn("비어", why)
+
+            coverage_scan.SEARCH_SORT_OPTIONS.update(
+                {"created": {"sort_by": "SAME"}, "score": {"sort_by": "SAME"}}
+            )
+            ok, why = coverage_scan.sort_options_are_distinct()
+            self.assertFalse(ok)
+            self.assertIn("sort_by", why)
+
+            coverage_scan.SEARCH_SORT_OPTIONS.update(
+                {"created": {"sort_by": "CREATED"}, "score": {"sort_by": "SCORE"}}
+            )
+            self.assertEqual(coverage_scan.sort_options_are_distinct(), (True, ""))
+        finally:
+            coverage_scan.SEARCH_SORT_OPTIONS.clear()
+            coverage_scan.SEARCH_SORT_OPTIONS.update(original)
+
+
+class DwellMethodTests(unittest.TestCase):
+    """'창 밖으로 밀려난 것 중 가장 어린 것의 나이'를 써도 되는 자리인지 가립니다.
+
+    그 계산은 **컨베이어 가정** 위에 서 있습니다 — 새 매물은 맨 앞으로 들어와 뒤로만
+    밀린다는 가정입니다. 등록순에서는 서지만, 순위를 시각이 만들지 않는 정렬에서는
+    설 이유가 없습니다. 가정이 깨진 것을 못 잡으면 도구가 아무 숫자나 내놓습니다.
+    """
+
+    def _listing(self, minutes_old):
+        return {"created": datetime.now() - timedelta(minutes=minutes_old)}
+
+    def test_fresh_listings_sitting_at_the_front_keep_the_conveyor_assumption(self):
+        now = datetime.now().timestamp()
+        items = [self._listing(m) for m in range(0, 300)]  # 앞이 어리고 뒤가 오래됨
+        ranks = coverage_scan.young_item_ranks(items, now, max_age_minutes=60)
+        self.assertEqual(ranks, list(range(0, 61)))
+        self.assertTrue(coverage_scan.conveyor_holds(ranks))
+
+    def test_a_fresh_listing_ranked_outside_the_window_breaks_it(self):
+        """추천순에서 기대하는 모습입니다 — 갓 올라온 매물이 200등에 꽂힙니다."""
+        now = datetime.now().timestamp()
+        items = [self._listing(500) for _ in range(300)]
+        items[5] = self._listing(3)
+        items[200] = self._listing(4)     # 창(120) 밖인데 갓 올라옴
+        ranks = coverage_scan.young_item_ranks(items, now, max_age_minutes=60)
+        self.assertEqual(ranks, [5, 200])
+        self.assertFalse(coverage_scan.conveyor_holds(ranks))
+
+    def test_no_fresh_listing_at_all_is_not_treated_as_a_holding_assumption(self):
+        """어린 매물이 하나도 없으면 가정을 확인한 게 아닙니다 — 참으로 치면 안 됩니다."""
+        self.assertFalse(coverage_scan.conveyor_holds([]))
+
+    def test_predicted_survival_is_the_conveyor_arithmetic(self):
+        """깊이 D인 컨베이어는 lag 동안 lag/D 만큼 갈립니다."""
+        self.assertAlmostEqual(coverage_scan.predicted_survival(120, 30), 0.75)
+        self.assertAlmostEqual(coverage_scan.predicted_survival(120, 120), 0.0)
+        self.assertAlmostEqual(coverage_scan.predicted_survival(120, 500), 0.0)
+        self.assertIsNone(coverage_scan.predicted_survival(None, 10))
+
+
+class SurvivalCurveTests(unittest.TestCase):
+    """가정을 쓰지 않는 자 — 같은 창을 다시 찍어 누가 남았는지 직접 셉니다."""
+
+    def _snapshot(self, minute, order):
+        return (minute * 60.0, order, [(3, None)])
+
+    def test_survival_counts_how_many_of_the_window_are_still_there(self):
+        window = 3
+        shots = [
+            self._snapshot(0, ["a", "b", "c", "x"]),
+            self._snapshot(5, ["d", "a", "b", "c"]),   # c가 창 밖으로
+            self._snapshot(10, ["e", "d", "a", "b"]),  # b도 창 밖으로
+        ]
+        result = coverage_scan.survival_curve(shots, window=window)
+        by_step = {step: (round(lag), round(kept, 3)) for step, lag, kept in result["lags"]}
+        # 한 칸 뒤: {a,b,c}->{d,a,b} 2/3, {d,a,b}->{e,d,a} 2/3
+        self.assertEqual(by_step[1], (5, round(4 / 6, 3)))
+        # 두 칸 뒤: {a,b,c} 중 {e,d,a}에 남은 것은 a 하나
+        self.assertEqual(by_step[2], (10, round(1 / 3, 3)))
+
+    def test_an_item_that_leaves_the_window_and_comes_back_is_counted(self):
+        """컨베이어면 0이어야 하는 값입니다. 0이 아니면 '머무는 시간'이 한 구간이 아닙니다."""
+        shots = [
+            self._snapshot(0, ["a", "b", "c"]),
+            self._snapshot(5, ["x", "y", "c"]),        # a, b가 창 밖
+            self._snapshot(10, ["a", "b", "c"]),       # 둘 다 돌아옴
+        ]
+        result = coverage_scan.survival_curve(shots, window=3)
+        self.assertEqual(result["reentry"], 2)
+
+    def test_pushed_out_and_sold_off_are_told_apart(self):
+        """창에서 빠진 이유가 '순위에 밀림'인지 '아예 없어짐'인지 갈라야 처방이 갈립니다."""
+        shots = [
+            self._snapshot(0, ["a", "b", "c", "z"]),
+            self._snapshot(5, ["x", "y", "z", "a"]),   # a는 4등으로 밀림, b·c는 통째로 없음
+        ]
+        result = coverage_scan.survival_curve(shots, window=3)
+        self.assertEqual(result["window_size"], 3)
+        self.assertEqual(result["displaced"], 1)   # a
+        self.assertEqual(result["vanished"], 2)    # b, c
+
+    def test_a_still_window_reports_no_turnover(self):
+        shots = [self._snapshot(m, ["a", "b", "c"]) for m in (0, 5, 10)]
+        result = coverage_scan.survival_curve(shots, window=3)
+        self.assertEqual(result["reentry"], 0)
+        self.assertEqual((result["displaced"], result["vanished"]), (0, 0))
+        self.assertTrue(all(kept == 1.0 for _, _, kept in result["lags"]))
+
+
+class EndToEndTests(unittest.TestCase):
+    """scan()과 measure_residence()가 실제로 끝까지 도는지.
+
+    이 도구는 손으로만 돌리는 데다 메루카리를 수백 번 부릅니다. 본문이 중간에
+    터지면 그 사실을 **워크플로를 한 번 태우고 나서야** 알게 됩니다. 가짜 API로
+    본문을 통째로 한 번 돌려 둡니다.
+    """
+
+    def setUp(self):
+        self.saved = {
+            "searches": coverage_scan.SEARCHES,
+            "options": dict(coverage_scan.SEARCH_SORT_OPTIONS),
+            "pause": coverage_scan.PAGE_PAUSE_SECONDS,
+            "seen_file": coverage_scan.SEEN_FILE,
+            "mercapi": sys.modules["mercapi"].Mercapi,
+        }
+        coverage_scan.PAGE_PAUSE_SECONDS = 0
+        coverage_scan.SEARCHES = [{"query": "kw", "categories": [30]}]
+        coverage_scan.SEARCH_SORT_OPTIONS.update(
+            {"created": {"sort_by": "CREATED"}, "score": {"sort_by": "SCORE"}}
+        )
+        self.state = Path(tempfile.mkdtemp()) / "seen_items.json"
+        self.state.write_text(json.dumps({
+            "seen": {"보고 있는 매물": {}},
+            "keyword_checked_at": {"kw": datetime.now().timestamp()},
+        }))
+        coverage_scan.SEEN_FILE = self.state
+
+        now = datetime.now()
+        pages = [[FakeItem(f"item-{i}", created=now - timedelta(minutes=i))
+                  for i in range(150)]]
+        sys.modules["mercapi"].Mercapi = lambda: FakeApi(
+            {"filtered": pages, "all": pages}, {"filtered": 150, "all": 150}
+        )
+
+    def tearDown(self):
+        coverage_scan.SEARCHES = self.saved["searches"]
+        coverage_scan.SEARCH_SORT_OPTIONS.clear()
+        coverage_scan.SEARCH_SORT_OPTIONS.update(self.saved["options"])
+        coverage_scan.PAGE_PAUSE_SECONDS = self.saved["pause"]
+        coverage_scan.SEEN_FILE = self.saved["seen_file"]
+        sys.modules["mercapi"].Mercapi = self.saved["mercapi"]
+
+    def _run(self, coro):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            asyncio.run(coro)
+        return buffer.getvalue()
+
+    def test_scan_runs_both_passes_and_reports_each_separately(self):
+        output = self._run(
+            coverage_scan.scan(pages=1, fresh_hours=24, sorts=("created", "score"),
+                               check_filter=False, track={"item-3"})
+        )
+        self.assertIn("등록순(created) 패스", output)
+        self.assertIn("추천순(score) 패스", output)
+        self.assertIn("이름을 대고 쫓은 매물", output)
+        self.assertIn("item-3", output)
+        self.assertIn("한 번의 전체 조회에서 봇이 실제로 보는 것", output)
+        self.assertIn("완료", output)
+
+    def test_scan_stops_instead_of_measuring_two_identical_passes(self):
+        """정렬을 가를 수 없으면 표를 찍지 않고 멈춥니다."""
+        coverage_scan.SEARCH_SORT_OPTIONS.update({"created": {}, "score": {}})
+        with self.assertRaises(SystemExit):
+            asyncio.run(coverage_scan.scan(pages=1, fresh_hours=24,
+                                           sorts=("created", "score")))
+
+    def test_residence_mode_reports_the_longitudinal_numbers(self):
+        output = self._run(
+            coverage_scan.measure_residence(pages=1, snapshots=2, interval=0,
+                                            sorts=("score",), keywords=[])
+        )
+        self.assertIn("한 장짜리 추정 깊이", output)
+        self.assertIn("실측이 말하는 깊이", output)
+        self.assertIn("다시 들어온", output)
+
+
+class SellerVisibilityTests(unittest.TestCase):
+    """지목한 판매자의 매물이 창 안에 들어오는가.
+
+    재출품 오판 36건 중 32건이 판매자 한 명(119903670)에게서 나왔습니다. 그 판매자의
+    매물이 평소에 창 밖에 앉아 있다면, '이번 조회 결과에 없다'는 사라짐의 증거가
+    아니라 그 매물들의 **평소 상태**입니다.
+    """
+
+    def setUp(self):
+        self.saved_searches = coverage_scan.SEARCHES
+        self.saved_pause = coverage_scan.PAGE_PAUSE_SECONDS
+        self.saved_seen = coverage_scan.SEEN_FILE
+        coverage_scan.PAGE_PAUSE_SECONDS = 0
+        coverage_scan.SEARCHES = [{"query": "kw", "categories": []}]
+        self.state = Path(tempfile.mkdtemp()) / "seen_items.json"
+        self.state.write_text(json.dumps({"seen": {}, "keyword_checked_at": {}}))
+        coverage_scan.SEEN_FILE = self.state
+
+    def tearDown(self):
+        coverage_scan.SEARCHES = self.saved_searches
+        coverage_scan.PAGE_PAUSE_SECONDS = self.saved_pause
+        coverage_scan.SEEN_FILE = self.saved_seen
+
+    def test_the_seller_count_splits_at_the_window_edge(self):
+        window = coverage_scan.MAX_ITEMS_PER_KEYWORD
+        items = [{"id_": f"기타-{i}", "seller_id": "999"} for i in range(window + 10)]
+        items[0] = {"id_": "앞자리", "seller_id": "119903670"}
+        items[window] = {"id_": "창 밖 첫 자리", "seller_id": "119903670"}
+        items[window + 5] = {"id_": "더 뒤", "seller_id": "119903670"}
+
+        class Api(FakeApi):
+            async def search(self, keyword, categories=(), **options):
+                return FakeResults([items], 0, len(items))
+
+        api = Api({"filtered": [], "all": []}, {"filtered": 0, "all": 0})
+        rows, _, _, _ = asyncio.run(
+            coverage_scan.census(
+                api, "score", 1, 0.0, datetime.now().timestamp(), set(), {},
+                check_filter=False, sellers={"119903670"},
+            )
+        )
+        self.assertEqual((rows[0]["seller_in"], rows[0]["seller_out"]), (1, 2))
