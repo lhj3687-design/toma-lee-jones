@@ -140,19 +140,33 @@ class WindowDepthTests(unittest.TestCase):
         now = datetime.now().timestamp()
         return [{"id_": str(i), "created": now - m * 60} for i, m in enumerate(minutes_ago)]
 
-    def test_depth_is_the_age_of_the_last_item_the_window_reaches(self):
+    def test_dwell_is_how_long_a_listing_stays_inside_the_window(self):
+        """창 밖으로 밀려난 것 중 가장 최근 매물의 나이 = 창 안에 머무는 시간."""
         now = datetime.now().timestamp()
         fields = self.items([0, 10, 20, 30, 40])
-        profile = coverage_scan.window_depth(fields, now, sizes=(1, 3, 5))
-        self.assertEqual([size for size, _ in profile], [1, 3, 5])
-        self.assertAlmostEqual(profile[0][1], 0, delta=1)
-        self.assertAlmostEqual(profile[1][1], 20, delta=1)
-        self.assertAlmostEqual(profile[2][1], 40, delta=1)
+        profile = coverage_scan.window_dwell(fields, now, sizes=(1, 3))
+        self.assertEqual([size for size, _ in profile], [1, 3])
+        self.assertAlmostEqual(profile[0][1], 10, delta=1)
+        self.assertAlmostEqual(profile[1][1], 30, delta=1)
+
+    def test_an_old_listing_mixed_into_the_results_does_not_move_the_number(self):
+        """등록순 결과에는 예전 매물이 섞여 들어옵니다(실측 598건 중 253건이 역전).
+
+        '순위 N번째 매물의 나이'로 재면 그 자리에 앉은 예전 매물 때문에 값이 통째로
+        널뜁니다 — 실제로 '30건=2.1시간치 / 60건=16.7일치 / 120건=15.5시간치'처럼
+        창을 넓혔는데 깊이가 얕아지는 표가 나왔습니다. 밖으로 밀려난 쪽의 최솟값은
+        섞여 들어온 예전 매물에 흔들리지 않습니다.
+        """
+        now = datetime.now().timestamp()
+        fields = self.items([1, 2, 60 * 24 * 300, 4, 5])  # 세 번째가 300일 전 매물입니다
+        (_, minutes), = coverage_scan.window_dwell(fields, now, sizes=(3,))
+        self.assertAlmostEqual(minutes, 4, delta=1)
 
     def test_a_window_bigger_than_the_result_is_not_a_limit(self):
         """매물이 창보다 적으면 창이 제약이 아닙니다 — 0분으로 세면 정반대로 읽힙니다."""
         now = datetime.now().timestamp()
-        profile = coverage_scan.window_depth(self.items([0, 5]), now, sizes=(2, 120))
+        profile = coverage_scan.window_dwell(self.items([0, 5]), now, sizes=(2, 120))
+        self.assertIsNone(profile[0][1])
         self.assertIsNone(profile[1][1])
         self.assertEqual(coverage_scan.format_span(None), "창이 남음")
 

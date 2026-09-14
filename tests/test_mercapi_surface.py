@@ -15,6 +15,7 @@ Dependabot이 mercapi를 올린 PR도 그대로 초록불이 됩니다 — 심�
   1. 정렬·상태 상수 (build_search_options가 쓰는 것)
   2. Mercapi.search()가 받는 인자 이름
   3. 검색 결과 항목의 필드 이름 (item_fields가 읽는 것)
+  4. 한 페이지 크기 (MAX_ITEMS_PER_KEYWORD가 이 값과 같아야 합니다)
 
 1번이 특히 중요합니다. `build_search_options()`는 import에 실패하면 **조용히 기본
 검색으로 물러납니다.** 이름이 바뀌어도 봇은 죽지 않고 정렬 없이 돌기 때문에(stderr 로그만
@@ -23,6 +24,9 @@ Dependabot이 mercapi를 올린 PR도 그대로 초록불이 됩니다 — 심�
 import subprocess
 import sys
 import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
 
 # 깨끗한 인터프리터에서 돌 검사 본문입니다. 봇이 실제로 참조하는 것만 봅니다.
 PROBE = r"""
@@ -56,6 +60,27 @@ for field in ("id_", "name", "price", "created", "thumbnails", "item_type", "sel
     if field not in annotations and not hasattr(SearchResultItem, field):
         missing.append(f"SearchResultItem.{field}")
 
+# 4) 한 페이지 크기. mercapi가 요청에 박아 보내는 값이고 봇이 고를 수 없습니다.
+#    MAX_ITEMS_PER_KEYWORD는 '몇 건을 받을지'가 아니라 '받아 온 페이지에서 몇 건을
+#    쓸지'입니다. 그래서 이 값을 낮춰도 조회는 그대로 120건을 받아 옵니다 —
+#    호출도 트래픽도 줄지 않고, 오히려 wants_another_page()의 '한 페이지를 가득
+#    채웠는가' 판정이 항상 참이 되어 다음 페이지를 더 자주 부릅니다.
+#    둘이 어긋나면 그 전제가 깨지므로 여기서 잡습니다.
+sys.path.insert(0, ROOT)
+from check_mercari import MAX_ITEMS_PER_KEYWORD
+
+conditions = request_data.SearchConditions(
+    query="x",
+    sort_by=request_data.SortBy.SORT_CREATED_TIME,
+    sort_order=request_data.SortOrder.ORDER_DESC,
+    status=[request_data.Status.STATUS_ON_SALE],
+)
+page_size = request_data(search_conditions=conditions).data.get("pageSize")
+if page_size != MAX_ITEMS_PER_KEYWORD:
+    missing.append(
+        f"한 페이지 크기가 {page_size}인데 MAX_ITEMS_PER_KEYWORD는 {MAX_ITEMS_PER_KEYWORD}입니다"
+    )
+
 if missing:
     print("\n".join(missing))
     sys.exit(1)
@@ -71,7 +96,9 @@ _AVAILABLE = subprocess.run(
 class MercapiSurfaceTests(unittest.TestCase):
     def test_the_bot_still_finds_everything_it_uses_in_mercapi(self):
         result = subprocess.run(
-            [sys.executable, "-c", PROBE], capture_output=True, text=True
+            [sys.executable, "-c", f"ROOT = {str(ROOT)!r}\n" + PROBE],
+            capture_output=True,
+            text=True,
         )
 
         self.assertEqual(

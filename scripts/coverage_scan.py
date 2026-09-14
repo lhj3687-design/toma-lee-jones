@@ -147,25 +147,30 @@ def age_minutes(fields: dict, now: float) -> float | None:
     return None if created is None else (now - created) / 60.0
 
 
-def window_depth(fields_list: list, now: float, sizes: tuple = ()) -> list:
-    """'창 N건'이 이 키워드에서 **몇 분치인지** 돌려줍니다.
+def window_dwell(fields_list: list, now: float, sizes: tuple = ()) -> list:
+    """창 N건에 매물이 **얼마나 머무는지**를 분으로 돌려줍니다.
 
-    창 크기를 건수로만 보면 120은 그냥 큰 숫자입니다. 하지만 봇에게 중요한 것은
-    시간 깊이입니다 — 직전 조회 이후에 올라온 매물이 전부 창 안에 들어와야 놓치지
-    않기 때문입니다. 같은 120건이 매물이 쏟아지는 키워드에서는 몇 시간치고,
-    한산한 키워드에서는 몇 달치입니다. 그래서 '120건이면 충분한가'는 키워드마다
-    답이 다르고, 줄여도 되는지도 이 값으로만 말할 수 있습니다.
+    창을 건수로만 보면 120은 그냥 큰 숫자입니다. 봇에게 의미가 있는 것은 시간입니다 —
+    새 매물이 올라올수록 기존 매물은 뒤로 밀리므로, '창 밖으로 밀려난 것 중 가장 최근
+    매물의 나이'가 곧 매물이 창 안에 남아 있는 시간입니다. 봇이 그 시간 안에 한 번만
+    돌면 놓치지 않습니다.
 
-    돌려주는 값은 (창 크기, 분) 목록입니다. 매물 수가 그 크기에 못 미치면(창이 남으면)
-    분 대신 None입니다 — 그 키워드에서는 창이 제약이 아니라는 뜻입니다.
+    **순위 N번째 매물의 나이로 재면 안 됩니다.** 처음에 그렇게 쟀다가 'Hermes 30건=2.1시간치
+    / 60건=16.7일치 / 120건=15.5시간치'처럼 깊이가 들쭉날쭉한 표가 나왔습니다. 창을 넓혔는데
+    깊이가 얕아질 수는 없으니 도구가 틀린 것이고, 원인은 등록순 결과에 예전 매물이 섞여
+    들어오기 때문입니다(2026-09-14 실측: 598건 중 역전 253건). 그 자리에 예전 매물이 앉아
+    있으면 값이 통째로 널뜁니다. 아래 방식은 밖으로 밀려난 쪽의 **최솟값**을 보므로 섞여
+    들어온 예전 매물에 흔들리지 않습니다.
+
+    돌려주는 값은 (창 크기, 분) 목록입니다. 창 밖에 아무것도 없으면(창이 남으면) None입니다 —
+    그 키워드에서는 창이 제약이 아니라는 뜻입니다.
     """
     sizes = sizes or (30, 60, MAX_ITEMS_PER_KEYWORD)
     profile = []
     for size in sizes:
-        if len(fields_list) < size:
-            profile.append((size, None))
-            continue
-        profile.append((size, age_minutes(fields_list[size - 1], now)))
+        ages = [age_minutes(fields, now) for fields in fields_list[size:]]
+        ages = [age for age in ages if age is not None]
+        profile.append((size, min(ages) if ages else None))
     return profile
 
 
@@ -266,7 +271,7 @@ async def scan(pages: int, fresh_hours: float) -> None:
         inside, outside = split_by_window(filtered)
         fresh_in, missed_in = count_missed(inside, seen_ids, fresh_after)
         fresh_out, missed_out = count_missed(outside, seen_ids, fresh_after)
-        depth = window_depth(filtered, now)
+        dwell = window_dwell(filtered, now)
         inversions = order_inversions(filtered)
         beyond_newer = newer_beyond_window(filtered)
         ages = missed_ages(filtered, seen_ids, fresh_after, now)
@@ -307,7 +312,7 @@ async def scan(pages: int, fresh_hours: float) -> None:
                 "beyond_missed": missed_out,
                 "filter_fresh": filter_fresh,
                 "filter_missed": filter_missed,
-                "depth": depth,
+                "dwell": dwell,
                 "inversions": inversions,
                 "beyond_newer": beyond_newer,
                 "peak_1m": peak_arrivals(filtered, 60),
@@ -330,8 +335,8 @@ async def scan(pages: int, fresh_hours: float) -> None:
             + (f" | 필터가 뺀 최근 {filter_fresh}건 중 못 본 것 {filter_missed}건" if categories else "")
         )
         print(
-            "   └ 창 깊이: "
-            + " / ".join(f"{size}건={format_span(minutes)}" for size, minutes in depth)
+            "   └ 창에 머무는 시간: "
+            + " / ".join(f"{size}건={format_span(minutes)}" for size, minutes in dwell)
             + f" | 가장 몰렸을 때 1분 {rows[-1]['peak_1m']}건·5분 {rows[-1]['peak_5m']}건"
             + (f" | 등록순 역전 {inversions}건(창 밖이 창 안보다 최근인 것 {beyond_newer}건)"
                if inversions else "")
@@ -374,38 +379,41 @@ def report_window_sizes(rows: list) -> None:
     """창을 줄여도 되는지 판단할 근거를 한자리에 모읍니다.
 
     '1분마다 도는데 매번 120건까지 볼 필요가 있나'라는 질문의 답은 건수가 아니라
-    **시간 깊이**에 있습니다. 창을 줄이면 조회가 가벼워지는 것이 아니라(페이지 크기는
-    라이브러리가 120으로 고정), 거슬러 볼 수 있는 시간이 짧아집니다. 그 시간이 봇이
-    메꿔야 하는 구간(정상 1분, 긴 정지 뒤 최대 24시간)보다 짧아지면 그때 놓칩니다.
+    **시간**에 있습니다. 창을 줄이면 조회가 가벼워지는 것이 아니라(페이지 크기는
+    라이브러리가 120으로 고정), 매물이 창 안에 머무는 시간이 짧아집니다. 그 시간이
+    봇이 한 바퀴 도는 간격보다 짧아지는 순간부터 놓치기 시작합니다.
     """
-    sizes = [size for size, _ in (rows[0]["depth"] if rows else [])]
-    print("\n창을 줄여도 되는가 (건수가 아니라 '시간 깊이'로 봅니다):")
+    sizes = [size for size, _ in (rows[0]["dwell"] if rows else [])]
+    print("\n창을 줄여도 되는가 (건수가 아니라 '머무는 시간'으로 봅니다):")
     print(
         "   ※ 페이지 크기는 mercapi가 120으로 고정해 보냅니다. 상한을 낮춰도 120건을\n"
         "      받아 온 뒤 잘라낼 뿐이라 호출 수도 트래픽도 줄지 않습니다. 달라지는 것은\n"
-        "      '얼마나 거슬러 볼 수 있는가' 하나뿐입니다."
+        "      '올라온 매물이 창 안에 얼마나 남아 있는가' 하나뿐입니다.\n"
+        "   ※ 아래는 '창 밖으로 밀려난 것 중 가장 최근 매물의 나이'입니다. 순위 N번째\n"
+        "      매물의 나이로 재면 안 됩니다 — 등록순 결과에 예전 매물이 섞여 들어와서\n"
+        "      그 자리에 앉으면 값이 널뜁니다(위 '등록순 역전' 참고)."
     )
     header = "   " + f"{'키워드':<26}" + "".join(f"{str(size) + '건':>14}" for size in sizes)
     print(header)
-    for row in sorted(rows, key=lambda r: depth_sort_key(r)):
-        cells = "".join(f"{format_span(minutes):>14}" for _, minutes in row["depth"])
+    for row in sorted(rows, key=dwell_sort_key):
+        cells = "".join(f"{format_span(minutes):>14}" for _, minutes in row["dwell"])
         print(f"   {row['keyword']:<26}{cells}")
     print(
-        f"\n   봇이 메꿔야 하는 구간: 정상 실행 간격 1분"
+        f"\n   봇이 한 바퀴 도는 간격: 정상 1분"
         f" / 전체 조회 {FULL_SCAN_INTERVAL_SECONDS // 60}분"
         f" / 긴 정지 뒤 최대 {MAX_LOOKBACK_SECONDS // 3600}시간"
     )
-    worst = min(rows, key=depth_sort_key, default=None)
+    worst = min(rows, key=dwell_sort_key, default=None)
     if worst is not None:
         shallow = ", ".join(
-            f"{size}건={format_span(minutes)}" for size, minutes in worst["depth"]
+            f"{size}건={format_span(minutes)}" for size, minutes in worst["dwell"]
         )
-        print(f"   가장 얕은 키워드: [{worst['keyword']}] {shallow}")
+        print(f"   가장 빨리 밀려나는 키워드: [{worst['keyword']}] {shallow}")
 
 
-def depth_sort_key(row: dict) -> float:
-    """창이 가장 얕은(=빨리 차는) 키워드부터 오도록. 창이 남는 키워드는 맨 뒤로."""
-    last = row["depth"][-1][1] if row.get("depth") else None
+def dwell_sort_key(row: dict) -> float:
+    """매물이 가장 빨리 밀려나는 키워드부터 오도록. 창이 남는 키워드는 맨 뒤로."""
+    last = row["dwell"][-1][1] if row.get("dwell") else None
     return float("inf") if last is None else last
 
 
