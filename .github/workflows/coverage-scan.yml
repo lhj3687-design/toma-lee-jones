@@ -1,0 +1,52 @@
+name: Coverage Scan
+
+# **수동 실행 전용입니다.** 스케줄도 push 트리거도 달지 마세요 —
+# 이 저장소의 러너는 1분마다 도는 봇이 쓰고 있고, 이 스캔은 메루카리를 수백 번
+# 조회합니다(키워드 18개 × 페이지 × 필터 유무). 궁금할 때만 손으로 돌리는 도구입니다.
+#
+# 무엇을 재는가: 봇이 **애초에 볼 수 있는 범위**입니다. 판정 감사는 상태 파일에 들어온
+# 매물만 봤기 때문에, 상위 120건 창과 카테고리 필터 때문에 못 본 매물은 감사 범위
+# 밖이었습니다. 자세한 것은 scripts/coverage_scan.py의 docstring 참고.
+on:
+  workflow_dispatch:
+    inputs:
+      pages:
+        description: "키워드당 훑을 페이지 수 (1페이지 = 120건)"
+        required: false
+        default: "5"
+      fresh_hours:
+        description: "'최근 등록'으로 볼 시간"
+        required: false
+        default: "24"
+
+permissions:
+  contents: read
+
+# 봇 워크플로와 그룹을 나눕니다. 같은 그룹에 두면 이 스캔이 봇 실행을 취소합니다.
+concurrency:
+  group: coverage-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: 시야 범위 스캔
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 상태 파일은 읽기만 합니다(커밋도 push도 하지 않습니다).
+      - name: Scan what the bot can see
+        run: |
+          python scripts/coverage_scan.py \
+            --pages "${{ inputs.pages }}" \
+            --fresh-hours "${{ inputs.fresh_hours }}"
