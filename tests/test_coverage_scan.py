@@ -24,6 +24,18 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 coverage_scan = importlib.import_module("coverage_scan")
+check_mercari = importlib.import_module("check_mercari")
+
+
+class FakeHttpResponse:
+    """단건 조회의 HTTP 응답을 흉내 냅니다."""
+
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
 
 
 @dataclass
@@ -579,12 +591,33 @@ class OnSaleCheckTests(unittest.TestCase):
     """
 
     def _api(self, results):
-        class Api:
-            async def item(self, item_id):
+        """results: 매물 ID -> (상태코드, 본문) 또는 예외."""
+        class Client:
+            def __init__(self, owner):
+                self.owner = owner
+
+            async def send(self, request):
+                kind, item_id = request
+                self.owner.sent.append((kind, item_id))
                 value = results[item_id]
                 if isinstance(value, Exception):
                     raise value
-                return value
+                status, payload = value
+                return FakeHttpResponse(status, payload)
+
+        class Api:
+            def __init__(self):
+                self.sent = []
+                self._client = Client(self)
+
+            def _item(self, item_id):
+                assert not coverage_scan.is_shop_product_id(item_id), (
+                    f"숍스 ID {item_id}를 일반 매물 엔드포인트로 보냈습니다")
+                return ("item", item_id)
+
+            def _product(self, product_id):
+                return ("product", product_id)
+
         return Api()
 
     def test_statuses_are_translated_and_failures_do_not_kill_the_scan(self):
@@ -592,48 +625,47 @@ class OnSaleCheckTests(unittest.TestCase):
         coverage_scan.PAGE_PAUSE_SECONDS = 0
         try:
             api = self._api({
-                "m1": types.SimpleNamespace(status="ITEM_STATUS_ON_SALE"),
-                "m2": types.SimpleNamespace(status="ITEM_STATUS_SOLD_OUT"),
-                "m3": None,
+                "m1": (200, {"data": {"status": "on_sale"}}),
+                "m2": (200, {"data": {"status": "ITEM_STATUS_SOLD_OUT"}}),
+                # 없어진 일반 매물은 404가 아니라 403입니다(2026-09-14 실측).
+                "m3": (403, {"result": "error"}),
                 "m4": RuntimeError("boom"),
+                # 모르는 코드는 '없음'이 아니라 '확인 실패'입니다.
+                "m5": (429, {}),
             })
-            states = asyncio.run(coverage_scan.still_on_sale(api, {"m1", "m2", "m3", "m4"}))
+            states = asyncio.run(
+                coverage_scan.still_on_sale(api, {"m1", "m2", "m3", "m4", "m5"}))
             self.assertEqual(states["m1"], "판매중")
             self.assertEqual(states["m2"], "판매완료")
-            self.assertEqual(states["m3"], "없음(삭제)")
+            self.assertEqual(states["m3"], "없음(HTTP 403)")
             self.assertTrue(states["m4"].startswith("확인 실패"))
+            self.assertEqual(states["m5"], "확인 실패(HTTP 429)")
         finally:
             coverage_scan.PAGE_PAUSE_SECONDS = saved
 
     def test_shop_products_go_to_the_product_endpoint_not_the_item_one(self):
-        """숍스 ID로 item()을 부르면 mercapi가 KeyError로 터집니다.
+        """숍스 ID를 일반 매물 엔드포인트로 보내면 확인이 한 건도 답을 못 냅니다.
 
         2026-09-14 실측에서 쫓던 12건이 **전부** '확인 실패(KeyError)'였습니다.
-        전부 숍스 상품(m+숫자가 아닌 ID)이었기 때문입니다. 엔드포인트를 가르지 않으면
-        이 확인은 한 건도 답을 내지 못합니다.
+        전부 숍스 상품(m+숫자가 아닌 ID)인데 `Mercapi.item()`으로 물었기 때문입니다.
+
+        엔드포인트마다 '없음'의 모양도 다릅니다 — 숍스는 404, 일반 매물은 403입니다.
         """
         saved = coverage_scan.PAGE_PAUSE_SECONDS
         coverage_scan.PAGE_PAUSE_SECONDS = 0
-
-        class Api:
-            def __init__(self):
-                self.item_calls, self.product_calls = [], []
-
-            async def item(self, item_id):
-                self.item_calls.append(item_id)
-                raise KeyError("data")     # 숍스 응답에는 "data" 키가 없습니다
-
-            async def product(self, product_id):
-                self.product_calls.append(product_id)
-                return types.SimpleNamespace(name="숍스 상품")
-
         try:
-            api = Api()
+            api = self._api({
+                "m12345": (403, {"result": "error"}),
+                "2JSVsYv7PXtWWgyKzRoqP7": (200, {"name": "숍스 상품"}),
+            })
             states = asyncio.run(coverage_scan.still_on_sale(
                 api, {"m12345", "2JSVsYv7PXtWWgyKzRoqP7"}))
-            self.assertEqual(api.product_calls, ["2JSVsYv7PXtWWgyKzRoqP7"])
-            self.assertEqual(api.item_calls, ["m12345"])
+            self.assertEqual(
+                api.sent,
+                [("product", "2JSVsYv7PXtWWgyKzRoqP7"), ("item", "m12345")],
+            )
             self.assertEqual(states["2JSVsYv7PXtWWgyKzRoqP7"], "상품 페이지 있음")
+            self.assertEqual(states["m12345"], "없음(HTTP 403)")
         finally:
             coverage_scan.PAGE_PAUSE_SECONDS = saved
 
@@ -647,6 +679,66 @@ class OnSaleCheckTests(unittest.TestCase):
             )
         output = buffer.getvalue()
         self.assertIn("말할 수 없습니다", output)
+        self.assertNotIn("안 나오는 것", output)
+
+
+class SurvivalControlTests(unittest.TestCase):
+    """이 컬럼이 서 있는 전제는 '없는 매물은 404로 온다'입니다.
+
+    전제가 깨지면 표에는 "다 살아 있다"가 찍히는데, 그건 측정이 아니라 침묵입니다.
+    그래서 아는 답(있을 수 없는 ID)에 먼저 대 봅니다.
+    """
+
+    def _api(self, status_by_id):
+        class Client:
+            async def send(self, request):
+                _kind, item_id = request
+                return FakeHttpResponse(status_by_id[item_id], {})
+
+        class Api:
+            _client = Client()
+
+            def _item(self, item_id):
+                return ("item", item_id)
+
+            def _product(self, product_id):
+                return ("product", product_id)
+
+        return Api()
+
+    def test_controls_pass_when_missing_listings_come_back_missing(self):
+        """실측한 모양 그대로: 숍스는 404, 없어진 일반 매물은 403."""
+        api = self._api({"m99999999999": 403, "zzzzzzzzzzzzzzzzzzzzzz": 404})
+        answers, trustworthy = asyncio.run(coverage_scan.survival_controls(api))
+        self.assertTrue(trustworthy)
+        self.assertEqual(set(answers.values()), {False})
+
+    def test_a_control_that_comes_back_alive_makes_the_column_unreadable(self):
+        """없는 매물에게 물었는데 '있다'가 나오면 그 뒤 숫자는 전부 의미가 없습니다."""
+        api = self._api({"m99999999999": 403, "zzzzzzzzzzzzzzzzzzzzzz": 200})
+        _, trustworthy = asyncio.run(coverage_scan.survival_controls(api))
+        self.assertFalse(trustworthy)
+
+    def test_an_unknown_status_code_is_not_read_as_missing(self):
+        """400은 'ID 형식이 틀림'이지 '없는 매물'이 아닙니다.
+
+        처음 쓴 대조군 ID가 13자리라 HTTP 400이 왔고, 그걸 '없음'으로 읽었으면
+        대조군이 통과해 버렸을 것입니다.
+        """
+        api = self._api({"m99999999999": 400, "zzzzzzzzzzzzzzzzzzzzzz": 404})
+        answers, trustworthy = asyncio.run(coverage_scan.survival_controls(api))
+        self.assertFalse(trustworthy)
+        self.assertIsNone(answers["m99999999999"])
+
+    def test_a_broken_control_stops_the_survival_tally(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            coverage_scan.report_tracked(
+                {"가"}, {"created": {}}, set(), ("created",),
+                {"가": "상품 페이지 있음"}, trustworthy=False,
+            )
+        output = buffer.getvalue()
+        self.assertIn("집계하지 않습니다", output)
         self.assertNotIn("안 나오는 것", output)
 
 
