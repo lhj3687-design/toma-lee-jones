@@ -7,6 +7,15 @@ name: Coverage Scan
 # 무엇을 재는가: 봇이 **애초에 볼 수 있는 범위**입니다. 판정 감사는 상태 파일에 들어온
 # 매물만 봤기 때문에, 상위 120건 창과 카테고리 필터 때문에 못 본 매물은 감사 범위
 # 밖이었습니다. 자세한 것은 scripts/coverage_scan.py의 docstring 참고.
+#
+# 정렬 패스가 둘입니다(`sort` 입력). 봇은 등록순을 매 실행, 추천순을 전체 조회에서만
+# 돕니다. 두 패스는 **다른 질문**에 답하므로 집계도 따로 냅니다.
+#   created: "새로 올라온 매물을 놓쳤는가"
+#   score  : "이미 추적 중인 매물이 아직 보이는가" — 재출품 판정이 기대는 것
+#
+# `snapshots`를 2 이상으로 두면 집계 대신 **종단 측정**을 돕니다. 같은 창을 시간을 두고
+# 반복해 찍어 체류를 직접 세는 모드로, 한 장짜리 추정(창 밖 최연소 나이)이 그 정렬에
+# 통하는지 검산하는 데 씁니다.
 on:
   workflow_dispatch:
     inputs:
@@ -18,6 +27,37 @@ on:
         description: "'최근 등록'으로 볼 시간"
         required: false
         default: "24"
+      sort:
+        description: "어느 정렬 패스를 볼지 (created / score / both)"
+        required: false
+        default: "created"
+        type: choice
+        options: ["created", "score", "both"]
+      track:
+        description: "이름을 대고 쫓을 매물 ID (쉼표 구분, 비우면 안 함)"
+        required: false
+        default: ""
+      seller:
+        description: "이 판매자의 매물이 창 안에 얼마나 들어오는지 셈 (쉼표 구분)"
+        required: false
+        default: ""
+      no_filter_check:
+        description: "카테고리 필터 대조를 건너뜀 (조회량 절반)"
+        required: false
+        default: false
+        type: boolean
+      snapshots:
+        description: "종단 측정: 같은 창을 몇 번 반복해 찍을지 (2 이상일 때만 종단 모드)"
+        required: false
+        default: "0"
+      interval:
+        description: "종단 측정에서 스냅숏 사이 간격(초)"
+        required: false
+        default: "150"
+      keywords:
+        description: "종단 측정에서 볼 키워드 (쉼표 구분, 비우면 전부)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -31,7 +71,9 @@ jobs:
   scan:
     name: 시야 범위 스캔
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 종단 측정(--snapshots)은 스냅숏 간격 × 횟수만큼 그냥 기다립니다.
+    # 30분이면 12장 × 150초를 못 채우고 잘립니다.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
@@ -49,4 +91,11 @@ jobs:
         run: |
           python scripts/coverage_scan.py \
             --pages "${{ inputs.pages }}" \
-            --fresh-hours "${{ inputs.fresh_hours }}"
+            --fresh-hours "${{ inputs.fresh_hours }}" \
+            --sort "${{ inputs.sort }}" \
+            --snapshots "${{ inputs.snapshots }}" \
+            --interval "${{ inputs.interval }}" \
+            --keywords "${{ inputs.keywords }}" \
+            --track "${{ inputs.track }}" \
+            --seller "${{ inputs.seller }}" \
+            ${{ inputs.no_filter_check && '--no-filter-check' || '' }}
