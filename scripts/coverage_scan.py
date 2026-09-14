@@ -174,13 +174,44 @@ def window_dwell(fields_list: list, now: float, sizes: tuple = ()) -> list:
     return profile
 
 
-def order_inversions(fields_list: list) -> int:
-    """등록순 결과가 정말 등록 시각 내림차순인지 셉니다(바로 앞보다 최근인 항목 수).
+def oldest_in_window(fields_list: list, now: float, window: int = 0) -> float | None:
+    """창 안에서 가장 오래된 매물의 나이(분).
 
-    이 값이 0이 아니면 '앞 120건 = 가장 최근 120건'이라는 전제가 깨집니다. 창을
-    시간으로 환산하는 계산은 전부 그 전제 위에 서 있으므로, 먼저 이것부터 봐야 합니다.
+    봇의 '다음 페이지도 본다'(wants_another_page)는 **페이지 전체가 기준선 이후
+    등록분일 때만** 발동합니다. 즉 이 값이 조회 간격보다 작아야 발동할 수 있습니다.
+    등록순 결과에 예전 매물이 섞여 들어오면 이 값이 며칠 단위가 되고, 그러면 그
+    장치는 영영 발동하지 않습니다. 그게 문제인지 아닌지는 '가장 몰렸을 때' 값과
+    함께 봐야 합니다 — 한 번에 120건 넘게 쏟아지지 않는다면 발동할 필요도 없습니다.
     """
-    times = [listing_created_at(fields) for fields in fields_list]
+    window = window or MAX_ITEMS_PER_KEYWORD
+    ages = [age_minutes(fields, now) for fields in fields_list[:window]]
+    ages = [age for age in ages if age is not None]
+    return max(ages) if ages else None
+
+
+def field_time(fields: dict, key: str) -> float | None:
+    """dict에서 시각 필드 하나를 epoch 초로 꺼냅니다(datetime이든 숫자든)."""
+    value = fields.get(key)
+    if isinstance(value, datetime):
+        try:
+            return value.timestamp()
+        except Exception:
+            return None
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    return None
+
+
+def order_inversions(fields_list: list, key: str = "created") -> int:
+    """조회 결과가 정말 그 시각의 내림차순인지 셉니다(바로 앞보다 최근인 항목 수).
+
+    `created`로 셌을 때 0이 아니면 '앞 120건 = 가장 최근 120건'이라는 전제가 깨집니다.
+    창을 시간으로 환산하는 계산은 전부 그 전제 위에 서 있으므로, 먼저 이것부터 봐야
+    합니다. `updated`로도 함께 세는 이유는 원인을 가리기 위해서입니다 — 이쪽이 0에
+    가깝다면 메루카리의 '새로운 순'은 등록 시각이 아니라 **마지막 수정 시각** 순이고,
+    앞자리에 앉아 있는 예전 매물은 '다시 올라온' 것이라는 뜻입니다.
+    """
+    times = [field_time(fields, key) for fields in fields_list]
     inversions = 0
     previous = None
     for value in times:
@@ -273,6 +304,8 @@ async def scan(pages: int, fresh_hours: float) -> None:
         fresh_out, missed_out = count_missed(outside, seen_ids, fresh_after)
         dwell = window_dwell(filtered, now)
         inversions = order_inversions(filtered)
+        inversions_updated = order_inversions(filtered, "updated")
+        oldest = oldest_in_window(filtered, now)
         beyond_newer = newer_beyond_window(filtered)
         ages = missed_ages(filtered, seen_ids, fresh_after, now)
 
@@ -314,6 +347,8 @@ async def scan(pages: int, fresh_hours: float) -> None:
                 "filter_missed": filter_missed,
                 "dwell": dwell,
                 "inversions": inversions,
+                "inversions_updated": inversions_updated,
+                "oldest_in_window": oldest,
                 "beyond_newer": beyond_newer,
                 "peak_1m": peak_arrivals(filtered, 60),
                 "peak_5m": peak_arrivals(filtered, 5 * 60),
@@ -338,7 +373,9 @@ async def scan(pages: int, fresh_hours: float) -> None:
             "   └ 창에 머무는 시간: "
             + " / ".join(f"{size}건={format_span(minutes)}" for size, minutes in dwell)
             + f" | 가장 몰렸을 때 1분 {rows[-1]['peak_1m']}건·5분 {rows[-1]['peak_5m']}건"
-            + (f" | 등록순 역전 {inversions}건(창 밖이 창 안보다 최근인 것 {beyond_newer}건)"
+            + (f" | 등록 시각 역전 {inversions}건 · 수정 시각 역전 {inversions_updated}건"
+               f"(창 밖이 창 안보다 최근인 것 {beyond_newer}건,"
+               f" 창 안 가장 오래된 매물 {format_span(oldest)})"
                if inversions else "")
             + (f" | 못 본 것 나이 {max(ages[0], 0):.0f}~{max(ages[-1], 0):.0f}분" if ages else "")
         )

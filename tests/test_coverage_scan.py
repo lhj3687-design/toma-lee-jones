@@ -170,10 +170,33 @@ class WindowDepthTests(unittest.TestCase):
         self.assertIsNone(profile[1][1])
         self.assertEqual(coverage_scan.format_span(None), "창이 남음")
 
+    def test_the_oldest_item_in_the_window_gates_the_extra_page_fetch(self):
+        """봇의 '다음 페이지도 본다'는 페이지 전체가 신규일 때만 발동합니다.
+
+        창 안에 예전 매물이 하나라도 섞여 있으면 발동할 수 없으므로, 그 조건이
+        실제로 만족될 수 있는지는 이 값으로만 말할 수 있습니다.
+        """
+        now = datetime.now().timestamp()
+        fields = self.items([1, 2, 60 * 24 * 30, 4])
+        self.assertAlmostEqual(coverage_scan.oldest_in_window(fields, now, window=4),
+                               60 * 24 * 30, delta=1)
+        self.assertAlmostEqual(coverage_scan.oldest_in_window(fields, now, window=2),
+                               2, delta=1)
+
     def test_inversions_catch_a_list_that_is_not_really_newest_first(self):
         fields = self.items([0, 30, 10, 60])  # 세 번째가 두 번째보다 최근입니다
         self.assertEqual(coverage_scan.order_inversions(fields), 1)
         self.assertEqual(coverage_scan.order_inversions(self.items([0, 10, 20])), 0)
+
+    def test_inversions_can_be_counted_on_the_update_time_too(self):
+        """'새로운 순'의 기준이 등록 시각이 아니라 수정 시각인지 가리는 계산입니다."""
+        now = datetime.now().timestamp()
+        fields = [
+            {"id_": "a", "created": now - 600, "updated": now - 60},
+            {"id_": "b", "created": now - 60, "updated": now - 120},
+        ]
+        self.assertEqual(coverage_scan.order_inversions(fields), 1)          # 등록 시각으로는 역전
+        self.assertEqual(coverage_scan.order_inversions(fields, "updated"), 0)  # 수정 시각으로는 정렬됨
 
     def test_items_outside_the_window_can_be_newer_than_the_window_tail(self):
         fields = self.items([0, 90, 5, 120])  # 창 2건: 뒤쪽 5분짜리가 창 밖입니다
