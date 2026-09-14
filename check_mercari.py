@@ -45,15 +45,23 @@ UNKNOWN_SELLER_IDS = {"", "0", "none", "null"}
 SEEN_FILE = Path("seen_items.json")
 MAX_ITEMS_PER_KEYWORD = 120  # 메루카리 검색 한 페이지 크기(키워드당 정렬 방식마다 확인할 매물 개수)
 MAX_SEARCH_PAGES = 3  # 새 매물이 한 페이지를 가득 채웠을 때만 추가로 볼 최대 페이지 수
-MAX_SEEN_ITEMS = 15000
-# 재출품 지문. seen과 거의 같은 속도로 쌓이는데(실측 둘 다 시간당 130~140건) 상한만
-# seen의 40%였습니다. 올라와 있는 매물의 지문은 매 조회마다 갱신돼 살아남으므로,
-# 밀려나는 건 사라진 매물의 지문 — 재출품 판정이 필요한 바로 그 항목입니다.
-# 그래서 6000에서는 재출품 기억이 약 하루, seen은 약 나흘로 벌어집니다.
-# 올리는 비용은 측정해 보니 거의 없습니다: 커밋당 델타는 파일 크기가 아니라 매 실행
-# 재정렬되는 항목 수가 결정하고, 늘어난 꼬리는 다시 조회되지 않아 델타에 기여하지
-# 않습니다(같은 조건 실측: 11.1 -> 9.9KB/커밋, 압축 기준 일회성 +0.35MB).
-MAX_RELIST_FINGERPRINTS = 15000
+# 상한은 '용량을 아끼는 장치'가 아닙니다. 재 보면 정반대입니다 — 운영 이력 2,416판을
+# 상한만 바꿔 다시 팩하면 자르지 않은 쪽이 가장 쌉니다(README "용량 상한" 참고).
+#
+#   안 자름 6.67MB | 13,000 +0.04% | 10,000 +9.7% | 8,000 +29.7% | 6,000 +148.9%
+#
+# 상한이 '아직 다시 관측되는 구간'까지 파고들면, 경계에 걸친 항목들이 매 실행 들락날락하며
+# 파일 앞쪽이 통째로 다시 쓰이기 때문입니다. 반대로 다시 볼 일 없는 꼬리를 들고 있는 비용은
+# 일회성이고 작습니다(꼬리는 매 실행 그대로라 git 델타가 건너뜁니다).
+#
+# 그래서 상한은 '살아 있는 구간'보다 충분히 깊어야 합니다. 실측으로 지문이 실제로 다시
+# 쓰인 가장 깊은 자리는 뒤에서 7,738번째였고(141건 중 99%가 7,490 안쪽), 비용이 튀기
+# 시작하는 자리도 8,000 언저리로 같은 곳을 가리킵니다. 다만 그 관측은 봇이 돌아간 기간
+# 만큼만 볼 수 있고(그때 지문 dict가 8,112개였습니다), 매물 유입이 몰리는 시간대에는
+# 같은 하루가 더 깊은 위치로 밀립니다(실측 시간당 140건 -> 버스트 때 500~650건).
+# 그래서 관측된 경계의 약 4배로 잡습니다. 상태 파일은 이 상한에서 약 7.7MB가 됩니다.
+MAX_SEEN_ITEMS = 30000
+MAX_RELIST_FINGERPRINTS = 30000
 # 재출품 판정을 미뤄 둔 기록. '예전 매물이 정말 사라졌는지'를 시간으로 확인하는 동안만
 # 남아 있습니다(아래 confirm_disappearance 참고). 동시에 몇 건 이상 쌓일 일이 없지만,
 # 판정 도중 매물이 팔려서 다시 조회되지 않으면 그 기록은 스스로 사라지지 않으므로
@@ -1699,6 +1707,59 @@ def keyword_health_alerts(searched: list, previous_checked_at: dict, now: float)
     return alerts
 
 
+def state_capacity_alerts(seen: dict, relist_fingerprints: dict) -> list:
+    """상태 상한에 닿아 오래된 기록이 잘려 나가기 시작하면 알립니다.
+
+    상한에 닿는 순간부터 `save_state`는 매 실행 '가장 오래 관측되지 않은' 기록부터
+    말없이 버립니다. 버려지면 두 가지를 잃습니다.
+
+      - `seen`: 그 매물에 이미 알린 '역대 최저가'가 있었다면 사라집니다. 다시 검색에
+        잡히면 그때 가격이 새 기준가가 되므로, 사용자가 들은 적 없는 가격이 '이전 가격'
+        으로 나갑니다 — PR #23이 고친 결함과 같은 모양입니다.
+      - `relist_fingerprints`: 재출품을 알아볼 근거가 사라져, 같은 매물이 새 ID로 다시
+        올라올 때 신규 알림이 또 나갑니다.
+
+    둘 다 조용히 일어나고 로그를 열어 보기 전에는 알 수 없습니다. 그래서 닿는 순간을
+    알립니다. 매 실행 보내면 알림 폭탄이 되므로 alert_id에 상한 값을 넣어, 상한 하나당
+    한 번만 나가게 합니다(`sent_alerts`가 걸러 냅니다). 상한을 올리면 id가 달라져
+    다음에 닿을 때 다시 알립니다.
+    """
+    alerts = []
+    for name, label, store, cap in (
+        ("seen", "seen", seen, MAX_SEEN_ITEMS),
+        ("fingerprints", "재출품 지문", relist_fingerprints, MAX_RELIST_FINGERPRINTS),
+    ):
+        # 상한과 같을 때는 아직 버리지 않았습니다. 실제로 잘려 나가는 순간부터 알립니다.
+        if len(store) <= cap:
+            continue
+        alerts.append(
+            {
+                "alert_id": f"health:state-cap:{name}:{cap}",
+                "caption": (
+                    f"⚠️ 메루카리 알림봇 상태 상한 도달\n"
+                    f"{label} {len(store):,}/{cap:,} — 가장 오래 관측되지 않은 기록부터 "
+                    f"잘려 나가기 시작했습니다.\n"
+                    f"예전 최저가 기억과 재출품 판별 근거가 그만큼 짧아집니다."
+                ),
+                "photo": None,
+            }
+        )
+    return alerts
+
+
+def report_state_usage(seen: dict, relist_fingerprints: dict, sent_alerts: list) -> None:
+    """상태가 상한에 얼마나 가까운지 실행마다 한 줄로 남깁니다.
+
+    상한은 한 번 닿으면 그때부터 계속 닿아 있습니다. 알림은 처음 한 번만 나가므로,
+    나중에 로그만 열어 봐도 지금 어디쯤인지 보이도록 매 실행 적어 둡니다.
+    """
+    print(
+        f"[점검] 상태 seen {len(seen):,}/{MAX_SEEN_ITEMS:,} · "
+        f"재출품 지문 {len(relist_fingerprints):,}/{MAX_RELIST_FINGERPRINTS:,} · "
+        f"전송 기록 {len(sent_alerts):,}/{MAX_SENT_ALERTS:,}"
+    )
+
+
 def report_feed_health(searched: list) -> None:
     """메루카리 응답이 기대대로 오는지 실행마다 한 줄로 요약합니다.
 
@@ -1871,6 +1932,10 @@ async def collect_updates() -> None:
     warnings += keyword_health_alerts(searched, previous_checked_at, now)
     warnings += created_coverage_alerts(searched, keyword_checked_at, now, sent_alerts)
     warnings += empty_feed_alerts(searched, keyword_checked_at, now, sent_alerts)
+    # 이 가족만 검색 결과가 아니라 '지금 들고 있는 상태'를 봅니다. 상한에 닿아 기록이
+    # 잘려 나가기 시작하는 순간은 검색이 아무리 정상이어도 알아차릴 수 없기 때문입니다.
+    warnings += state_capacity_alerts(seen, relist_fingerprints)
+    report_state_usage(seen, relist_fingerprints, sent_alerts)
     for entry in warnings:
         print(entry["caption"].splitlines()[0], file=sys.stderr)
 

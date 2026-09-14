@@ -1950,6 +1950,71 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("[경고]", captured.getvalue())
 
 
+    def test_state_capacity_alert_fires_only_once_the_cap_actually_drops_records(self):
+        """상한에 닿으면 오래된 기록이 말없이 잘려 나갑니다.
+
+        검색도 전송도 전부 정상이라 다른 어떤 감지도 이걸 보지 못합니다.
+        """
+        cap = mercari.MAX_SEEN_ITEMS
+        self.assertEqual(mercari.state_capacity_alerts({"a": 1}, {}), [])
+        self.assertEqual(
+            mercari.state_capacity_alerts({str(i): 1 for i in range(cap)}, {}), []
+        )  # 상한과 같을 때는 아직 버리지 않습니다
+
+        alerts = mercari.state_capacity_alerts({str(i): 1 for i in range(cap + 1)}, {})
+        self.assertEqual([a["alert_id"] for a in alerts], [f"health:state-cap:seen:{cap}"])
+        self.assertIn("상태 상한 도달", alerts[0]["caption"])
+
+        # 지문 상한도 같은 방식으로 따로 봅니다.
+        fingerprints = {str(i): 1 for i in range(mercari.MAX_RELIST_FINGERPRINTS + 1)}
+        both = mercari.state_capacity_alerts({str(i): 1 for i in range(cap + 1)}, fingerprints)
+        self.assertEqual(
+            [a["alert_id"] for a in both],
+            [f"health:state-cap:seen:{cap}",
+             f"health:state-cap:fingerprints:{mercari.MAX_RELIST_FINGERPRINTS}"],
+        )
+
+    async def test_state_capacity_alert_reaches_the_queue(self):
+        # 실제 실행 경로에서도 대기열에 들어가야 합니다(검색은 전부 정상인 상황입니다).
+        mercari.SEARCHES = [{"query": "test", "categories": []}]
+        mercari.save_state({"a": 1, "b": 1}, [], [], {}, {"test"}, {"test": 1000.0})
+        api = FakeMercapi({"test": [FakeItem("m1", "정상", 1000)]})
+
+        with patch.object(mercari, "MAX_SEEN_ITEMS", 2), patch.object(
+            mercari, "Mercapi", return_value=api
+        ):
+            await mercari.collect_updates()
+
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        self.assertIn("health:state-cap:seen:2", [e["alert_id"] for e in state["pending"]])
+
+    def test_state_capacity_alert_is_sent_once_per_cap_value(self):
+        """상한은 한 번 닿으면 계속 닿아 있습니다. 매 실행 보내면 알림 폭탄입니다.
+
+        alert_id에 상한 값이 들어 있어 sent_alerts가 두 번째부터 걸러 내고,
+        상한을 올리면 id가 달라져 다음에 닿을 때 다시 나갑니다.
+        """
+        cap = mercari.MAX_SEEN_ITEMS
+        alert = mercari.state_capacity_alerts({str(i): 1 for i in range(cap + 1)}, {})[0]
+        self.assertEqual(mercari.deduplicate_pending([alert], [alert["alert_id"]]), [])
+        self.assertEqual(
+            [e["alert_id"] for e in mercari.deduplicate_pending([alert], ["health:state-cap:seen:1"])],
+            [alert["alert_id"]],
+        )
+
+    async def test_state_usage_is_logged_every_run(self):
+        # 알림은 처음 한 번만 나가므로, 나중에 로그만 봐도 지금 어디쯤인지 보여야 합니다.
+        mercari.SEARCHES = [{"query": "test", "categories": []}]
+        mercari.save_state({"x": 1}, [], [], {}, {"test"}, {"test": 1000.0})
+        api = FakeMercapi({"test": [FakeItem("m1", "정상", 1000)]})
+
+        with patch.object(mercari, "Mercapi", return_value=api), patch(
+            "sys.stdout", new=io.StringIO()
+        ) as captured:
+            await mercari.collect_updates()
+
+        self.assertIn(f"/{mercari.MAX_SEEN_ITEMS:,}", captured.getvalue())
+
     async def test_quick_scan_only_runs_the_new_item_search(self):
         # 1분처럼 짧은 주기에서는 등록순만 봅니다(실행 시간과 API 호출량 절반).
         mercari.SEARCHES = [{"query": "test", "categories": []}]
