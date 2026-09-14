@@ -23,6 +23,66 @@ class MergeSeenTests(unittest.TestCase):
         self.assertEqual(list(merged), ["a", "c", "b", "d"])
         self.assertEqual(merged["b"], 20)  # 최신 값 우선
 
+    def test_the_baseline_price_never_goes_up_through_a_merge(self):
+        """운영에서 실제로 되돌아간 자리입니다.
+
+        `last_alert_price`는 '실제로 알림을 보낸 역대 최저가'라 내려가기만 해야 합니다.
+        그런데 병합이 양쪽에 있는 키를 mine 으로 덮는데, 내 실행이 **먼저 시작했으면**
+        그 값은 상대가 이미 내려놓은 기준을 모르는 옛날 값입니다.
+
+        m47315804624: 인하 알림 `30000 -> 28888`이 나간 뒤, 기준가가 28888에서 30000으로
+        되돌아갔습니다(2026-09-13 17:44, 17:46 두 번). 실측 구간에서 이렇게 올라간 자리가
+        245건이고 그중 210건이 '알림으로 내려간 값에서 그 직전 값으로 정확히 되돌아감'
+        이었습니다.
+        """
+        theirs = {"m47315804624": {"last_alert_price": 28888, "last_seen_price": 28888}}
+        mine = {"m47315804624": {"last_alert_price": 30000, "last_seen_price": 30000}}
+        merged = merge.merge_ordered(theirs, mine, limit=10,
+                                     merge_values=merge.merge_price_record)
+        self.assertEqual(merged["m47315804624"]["last_alert_price"], 28888)
+        # 참고용 값과 순서는 그대로 mine 을 따릅니다.
+        self.assertEqual(merged["m47315804624"]["last_seen_price"], 30000)
+
+    def test_a_lower_baseline_from_my_side_still_wins(self):
+        """내 쪽이 더 낮으면 내 쪽이 맞습니다 — 방향이 하나뿐인 규칙입니다."""
+        theirs = {"x": {"last_alert_price": 30000, "last_seen_price": 30000}}
+        mine = {"x": {"last_alert_price": 28888, "last_seen_price": 28888}}
+        merged = merge.merge_ordered(theirs, mine, limit=10,
+                                     merge_values=merge.merge_price_record)
+        self.assertEqual(merged["x"]["last_alert_price"], 28888)
+
+    def test_a_baseline_that_only_one_side_has_is_kept(self):
+        """한쪽만 기준가를 세웠으면 그것을 씁니다. 기준이 없는 쪽이 이기면 안 됩니다."""
+        theirs = {"x": {"last_alert_price": 5000, "last_seen_price": 5000}}
+        mine = {"x": {"last_alert_price": None, "last_seen_price": None}}
+        merged = merge.merge_ordered(theirs, mine, limit=10,
+                                     merge_values=merge.merge_price_record)
+        self.assertEqual(merged["x"]["last_alert_price"], 5000)
+
+    def test_legacy_plain_price_entries_still_merge(self):
+        """예전 상태 파일은 매물마다 dict 가 아니라 가격 하나만 들고 있었습니다."""
+        merged = merge.merge_ordered({"x": 28888}, {"x": 30000}, limit=10,
+                                     merge_values=merge.merge_price_record)
+        self.assertEqual(merged["x"], 28888)
+
+    def test_fingerprints_carry_the_same_rule(self):
+        """지문이 들고 있는 기준가는 재출품이 그대로 물려받습니다.
+
+        여기서 올라가면 그 값이 새 ID로 옮겨 가 '역대 최저가'를 비싸게 만듭니다.
+        """
+        theirs = {"seller:A:t": {"item_id": "m1", "last_alert_price": 9000,
+                                 "last_seen_price": 9000}}
+        mine = {"seller:A:t": {"item_id": "m1", "last_alert_price": 12000,
+                               "last_seen_price": 12000}}
+        merged = merge.merge_ordered(theirs, mine, limit=10,
+                                     merge_values=merge.merge_price_record)
+        self.assertEqual(merged["seller:A:t"]["last_alert_price"], 9000)
+        self.assertEqual(merged["seller:A:t"]["item_id"], "m1")
+
+    def test_merge_without_a_value_rule_keeps_the_old_behaviour(self):
+        merged = merge.merge_ordered({"a": 1}, {"a": 2}, limit=10)
+        self.assertEqual(merged["a"], 2)
+
     def test_merge_ordered_drops_the_oldest_when_over_the_limit(self):
         merged = merge.merge_ordered({"a": 1, "b": 2}, {"c": 3}, limit=2)
         self.assertEqual(list(merged), ["b", "c"])
