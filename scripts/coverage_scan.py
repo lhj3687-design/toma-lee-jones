@@ -913,6 +913,7 @@ def report_combined(all_rows: dict, all_unique: dict, seen_ids: set) -> None:
             f"   창 안에 있던 것 {len(tracked_visible):,}건 ({share:.0f}%)."
             " 나머지는 아직 올라와 있는데 창 밖입니다."
         )
+    report_pass_overlap(all_unique)
     for sort, rows in all_rows.items():
         # 분모는 '최근 매물이 하나라도 있어서 실제로 확인이 된 키워드'입니다.
         # 전체 키워드로 나누면, 최근 매물이 없어 확인조차 못 한 키워드가 '가정이
@@ -926,6 +927,52 @@ def report_combined(all_rows: dict, all_unique: dict, seen_ids: set) -> None:
             + (f" · 최근 1시간 매물이 꽂힌 가장 뒷자리 {worst + 1}등"
                if worst is not None else "")
             + (f"\n      {', '.join(broken)}" if broken else "")
+        )
+
+
+def report_pass_overlap(all_unique: dict) -> None:
+    """두 패스의 창이 얼마나 겹치는가 — **추천순을 빼도 되는가**에 답하는 값입니다.
+
+    합집합만 찍으면 알 수 없는 것이 있습니다. 두 패스가 같은 120건을 보고 있다면
+    추천순은 호출만 두 배로 쓰고 아무것도 더 보지 않는 것이고, 거의 안 겹친다면
+    빼는 순간 그만큼이 눈에서 사라집니다. 겹침을 세야 갈립니다.
+
+    **추적 중(seen) 매물로 따로 세는 이유**는 추천순 패스의 일이 새 매물 탐지가 아니라
+    '오래 올라와 있는 매물의 가격 인하 추적'이기 때문입니다(`build_search_options`).
+    새 매물은 등록순이 책임집니다. 그러니 추천순의 값어치는 '추천순 창에만 있는
+    추적 매물이 몇 건인가'로 재야 합니다 — 그게 이 패스를 빼면 인하 알림을 못 받게
+    되는 매물의 수입니다.
+    """
+    created = all_unique.get("created")
+    score = all_unique.get("score")
+    if not created or not score:
+        return
+    print()
+    print("=" * 78)
+    print("■ 두 패스가 겹치는가 — 추천순을 빼면 무엇이 안 보이게 되는가")
+    print("=" * 78)
+    for label, key in (("창 안 매물 전체", "window_ids"),
+                       ("그중 추적 중(seen)", "tracked_in_window")):
+        left = {i for i in created[key] if i}
+        right = {i for i in score[key] if i}
+        both = left & right
+        total = len(left | right)
+        print(
+            f"   {label}: 합쳐서 {total:,}건"
+            f" · 등록순에만 {len(left - right):,}건"
+            f" / 두 패스 모두 {len(both):,}건"
+            f" / **추천순에만 {len(right - left):,}건**"
+        )
+    only_score = {i for i in score["tracked_in_window"] if i} - {
+        i for i in created["tracked_in_window"] if i}
+    tracked_total = len({i for i in created["tracked_in_window"] if i}
+                        | {i for i in score["tracked_in_window"] if i})
+    if tracked_total:
+        print(
+            f"\n   → 추천순 패스를 빼면 이 실행에서 눈에서 사라지는 추적 매물"
+            f" **{len(only_score):,}건** (창 안 추적 매물의 {len(only_score) / tracked_total * 100:.0f}%)."
+            f"\n     이 매물들의 가격 인하는 아무도 안 보게 됩니다 — 새 매물 탐지는"
+            f" 등록순이 책임지므로 그쪽은 영향이 없습니다."
         )
 
 

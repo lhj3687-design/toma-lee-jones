@@ -674,3 +674,46 @@ class DwellGrowthTests(unittest.TestCase):
     def test_a_window_with_room_left_is_not_judged(self):
         self.assertIsNone(coverage_scan.dwell_grows_with_the_window(
             [(30, 500.0), (60, None), (120, None)]))
+
+
+class PassOverlapTests(unittest.TestCase):
+    """두 패스의 창이 얼마나 겹치는가 — '추천순을 빼도 되는가'에 답하는 값.
+
+    합집합만 찍으면 갈리지 않습니다. 두 패스가 같은 것을 보고 있다면 추천순은 호출만
+    두 배로 쓰는 것이고, 거의 안 겹친다면 빼는 순간 그만큼이 눈에서 사라집니다.
+    """
+
+    def _unique(self, window, tracked):
+        return {"window_ids": set(window), "tracked_in_window": set(tracked)}
+
+    def _run(self, all_unique):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            coverage_scan.report_pass_overlap(all_unique)
+        return buffer.getvalue()
+
+    def test_items_only_the_score_pass_sees_are_counted(self):
+        output = self._run({
+            "created": self._unique(["a", "b", "c"], ["a", "b"]),
+            "score": self._unique(["b", "c", "d", "e"], ["b", "d"]),
+        })
+        # 창 안 전체: 합쳐서 5 / 등록순에만 a / 둘 다 b,c / 추천순에만 d,e
+        self.assertIn("합쳐서 5건 · 등록순에만 1건 / 두 패스 모두 2건 / **추천순에만 2건**",
+                      output)
+        # 추적 중: 합쳐서 3 / 등록순에만 a / 둘 다 b / 추천순에만 d
+        self.assertIn("합쳐서 3건 · 등록순에만 1건 / 두 패스 모두 1건 / **추천순에만 1건**",
+                      output)
+        self.assertIn("추적 매물 **1건**", output)
+
+    def test_two_passes_that_see_the_same_thing_report_nothing_lost(self):
+        """같은 것만 본다면 추천순은 호출만 두 배로 쓰는 것입니다."""
+        same = ["a", "b", "c"]
+        output = self._run({
+            "created": self._unique(same, same),
+            "score": self._unique(same, same),
+        })
+        self.assertIn("**추천순에만 0건**", output)
+        self.assertIn("추적 매물 **0건**", output)
+
+    def test_a_single_pass_run_reports_nothing(self):
+        self.assertEqual(self._run({"created": self._unique(["a"], ["a"])}), "")
