@@ -1375,6 +1375,88 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         # 눈금 한 건 + 예전 매물 한 건. 키워드가 셋이어도 예전 매물은 한 번만 묻습니다.
         self.assertEqual(api.lookups, ["m-new", "m-old"])
 
+    def _page(self, fresh: int, stale: int, unknown: int = 0) -> tuple:
+        """신규 fresh건 + 예전 stale건 + 등록 시각 모름 unknown건으로 한 페이지를 만듭니다."""
+        now = datetime.now()
+        cutoff = (now - timedelta(minutes=1)).timestamp()
+        items = []
+        for i in range(fresh):
+            items.append(vars(FakeItem(f"new{i}", "t", 1000, created=now)))
+        for i in range(stale):
+            items.append(vars(FakeItem(f"old{i}", "t", 1000, created=now - timedelta(days=187))))
+        for i in range(unknown):
+            items.append(vars(FakeItem(f"unk{i}", "t", 1000, created=None)))
+        return items, cutoff
+
+    def test_a_page_packed_with_new_listings_asks_for_the_next_one(self):
+        """예전 조건이 원리상 발동할 수 없었던 자리입니다.
+
+        메루카리의 '새로운 순'은 등록 시각이 아니라 마지막 수정 시각에 가까워서 예전
+        매물이 앞자리에 섞여 들어옵니다(실측: Margiela 597건 중 역전 254건). 예전 조건은
+        '페이지 안 **가장 오래된** 매물도 기준선 이후인가'였는데, 187일 전 매물 하나가
+        섞이는 순간 최솟값이 통째로 널뛰어 조건이 영영 거짓이 됐습니다.
+
+        개수로 세면 그 몇 건에 흔들리지 않습니다.
+        """
+        items, cutoff = self._page(fresh=118, stale=2)
+        results = FakeResults(items, pages=[[FakeItem("next", "t", 1000)]])
+        self.assertTrue(mercari.wants_another_page("created", results, items, cutoff))
+        # 예전 계산(가장 오래된 매물의 나이)은 여기서 거짓이 납니다 — 그게 결함이었습니다.
+        oldest = min(mercari.listing_created_at(item) for item in items)
+        self.assertFalse(mercari.is_fresh_listing(oldest, cutoff))
+
+    def test_a_normal_page_does_not_ask_for_another(self):
+        """평소에는 한 번도 발동하면 안 됩니다.
+
+        운영 이력 실측(2026-09-10 ~ 09-14, 키워드별·실행별 신규 건수 3,665조합):
+        중앙값 1건 / 상위 1% 16건 / **최대 72건**. 그 최대치에서도 조용해야 합니다.
+        """
+        for fresh in (1, 16, 72):
+            items, cutoff = self._page(fresh=fresh, stale=120 - fresh)
+            results = FakeResults(items, pages=[[FakeItem("next", "t", 1000)]])
+            self.assertFalse(
+                mercari.wants_another_page("created", results, items, cutoff),
+                f"신규 {fresh}건에서 다음 페이지를 불렀습니다",
+            )
+
+    def test_the_real_outage_recovery_still_fits_in_one_page(self):
+        """2026-09-12 19:20 ~ 09-13 02:41 UTC(7.34시간) 정지 뒤 복구의 실측값입니다.
+
+        그 복구에서 한 키워드가 창 안에서 본 신규 매물은 가장 많은 것이 56건이었고,
+        복구가 내보낸 신규 알림 173건은 다른 4일 같은 시계 구간의 중앙값 156건보다
+        오히려 많았습니다. 즉 **그 장애에서는 창이 잘리지 않았습니다.** 새 조건이
+        여기서 페이지를 더 부르면 아무것도 못 고치면서 조회량만 늘리는 것입니다.
+        """
+        items, cutoff = self._page(fresh=56, stale=64)
+        results = FakeResults(items, pages=[[FakeItem("next", "t", 1000)]])
+        self.assertFalse(mercari.wants_another_page("created", results, items, cutoff))
+
+    def test_missing_created_times_never_trigger_extra_pages(self):
+        """등록 시각을 모르면 신규 개수를 셀 수 없습니다.
+
+        `is_fresh_listing()`은 모르는 값을 True로 돌려줍니다(알림을 놓치는 쪽보다 한 번
+        더 보내는 쪽이 안전). 그대로 세면 피드가 등록 시각을 못 주는 순간 **모든 키워드가
+        매 실행 3페이지씩** 부릅니다. 봇은 그 상태로도 멈추지 않고 계속 돌기 때문에
+        (README "동작 점검") 조용히 조회량만 세 배가 됩니다.
+        """
+        items, cutoff = self._page(fresh=110, stale=0, unknown=10)
+        results = FakeResults(items, pages=[[FakeItem("next", "t", 1000)]])
+        self.assertFalse(mercari.wants_another_page("created", results, items, cutoff))
+
+    def test_the_score_pass_never_asks_for_another_page(self):
+        """추천순은 '흐름'이 아니라 '명단'이라 다음 페이지에 새 매물이 있다는 보장이
+
+        없습니다(README "추천순(score) 창은 …"). 신규가 가득해도 발동하면 안 됩니다.
+        """
+        items, cutoff = self._page(fresh=120, stale=0)
+        results = FakeResults(items, pages=[[FakeItem("next", "t", 1000)]])
+        self.assertFalse(mercari.wants_another_page("score", results, items, cutoff))
+
+    def test_a_page_with_no_next_token_is_the_end(self):
+        items, cutoff = self._page(fresh=120, stale=0)
+        self.assertFalse(
+            mercari.wants_another_page("created", FakeResults(items), items, cutoff))
+
     def test_pending_relists_do_not_pile_up(self):
         """판정 보류 기록은 그 매물이 다시 조회될 때만 갱신됩니다.
 
