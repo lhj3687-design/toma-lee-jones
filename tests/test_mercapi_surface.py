@@ -16,6 +16,12 @@ Dependabot이 mercapi를 올린 PR도 그대로 초록불이 됩니다 — 심�
   2. Mercapi.search()가 받는 인자 이름
   3. 검색 결과 항목의 필드 이름 (item_fields가 읽는 것)
   4. 한 페이지 크기 (MAX_ITEMS_PER_KEYWORD가 이 값과 같아야 합니다)
+  5. 단건 조회의 요청 조립기와 HTTP 클라이언트 (listing_response가 쓰는 것)
+
+5번은 mercapi의 **내부 이름**(`_item` / `_product` / `_client`)입니다. 봇이 굳이 거기까지
+내려가는 이유는 `item()` / `product()`가 404에서만 None을 돌려주기 때문입니다 — 없어진
+일반 매물은 403으로 오므로 그 함수들은 KeyError를 내고, '없음'과 '못 물어봄'이 한
+덩어리가 됩니다(README "재출품 감지" 참고). 내부 이름이라 더더욱 여기서 지켜야 합니다.
 
 1번이 특히 중요합니다. `build_search_options()`는 import에 실패하면 **조용히 기본
 검색으로 물러납니다.** 이름이 바뀌어도 봇은 죽지 않고 정렬 없이 돌기 때문에(stderr 로그만
@@ -80,6 +86,25 @@ if page_size != MAX_ITEMS_PER_KEYWORD:
     missing.append(
         f"한 페이지 크기가 {page_size}인데 MAX_ITEMS_PER_KEYWORD는 {MAX_ITEMS_PER_KEYWORD}입니다"
     )
+
+# 5) listing_response()가 쓰는 단건 조회 표면. mercapi의 내부 이름이라 조용히 바뀔 수
+#    있습니다. 요청을 실제로 조립해 보고(서명까지) URL에 매물 ID가 들어가는지 봅니다.
+api = Mercapi()
+for name in ("_item", "_product", "_client"):
+    if not hasattr(api, name):
+        missing.append(f"Mercapi.{name}")
+if not missing:
+    for builder, sample in ((api._item, "m12345678901"),
+                            (api._product, "2JJ4Hj8xGFg7txonvrwDp5")):
+        try:
+            request = builder(sample)
+        except Exception as exc:
+            missing.append(f"Mercapi.{builder.__name__}({sample!r}) -> {type(exc).__name__}")
+            continue
+        if sample not in str(request.url):
+            missing.append(f"Mercapi.{builder.__name__} 요청 URL에 매물 ID가 없습니다: {request.url}")
+    if not hasattr(api._client, "send"):
+        missing.append("Mercapi._client.send")
 
 if missing:
     print("\n".join(missing))

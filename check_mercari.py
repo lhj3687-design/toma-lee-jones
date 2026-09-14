@@ -88,6 +88,10 @@ MAX_RELIST_LOOKUPS_PER_RUN = 12
 MAX_RELIST_LOOKUP_SECONDS_PER_RUN = 20
 # 조회 사이 간격. 검색이 페이지 사이에 두는 간격과 같게 둡니다.
 RELIST_LOOKUP_PAUSE_SECONDS = 1.0
+# '그 매물은 없다'로 읽는 상태 코드입니다. 둘인 이유는 엔드포인트마다 다르기 때문입니다
+# (2026-09-14 실측: 숍스는 404, 없어진 일반 매물은 **403**). 그 밖의 코드는 전부
+# '못 물어봄'으로 둡니다 — 400은 ID 형식이 틀린 것이고, 429·5xx는 메루카리 사정입니다.
+LISTING_MISSING_STATUS_CODES = (403, 404)
 PRICE_DROP_ALERT_THRESHOLD = 1000  # 마지막 알림 가격보다 이 금액(엔) 이상 떨어졌을 때만 알립니다.
 MAX_PENDING_ALERTS = 500
 # 이미 보낸 알림 목록. 같은 알림이 두 번 나가는 걸 막는 마지막 방어선입니다.
@@ -1076,7 +1080,7 @@ async def check_keyword(
         return False
     listed_ids = listed_item_ids(items)
     survival = await lookup_survival(
-        m, relist_lookup_targets(items, seen, relist_fingerprints or {}, listed_ids)
+        m, relist_lookup_targets(items, seen, relist_fingerprints or {}, listed_ids), listed_ids
     )
     process_items(
         keyword,
@@ -1236,21 +1240,86 @@ def relist_lookup_targets(
     return targets
 
 
-async def fetch_listing(m: Mercapi, item_id: str):
-    """매물 하나를 **알맞은 엔드포인트로** 가져옵니다. 없으면(404) None입니다.
+async def listing_response(m: Mercapi, item_id: str):
+    """매물 하나를 **알맞은 엔드포인트로** 조회해 HTTP 응답을 그대로 돌려줍니다.
 
     엔드포인트를 가르는 자리를 한 곳에만 둡니다. 예전에 `coverage_scan`이 이 갈림을
     따로 들고 있다가 숍스 ID로 `item()`을 불러 확인 12건이 전부 KeyError로 죽었고,
     그런데도 요약은 "판매중 0/12건"으로 찍혔습니다.
+
+    왜 `Mercapi.item()` / `Mercapi.product()`를 그대로 쓰지 않는가: 그 함수들은
+    **404일 때만** None을 돌려주고 그 밖에는 `body["data"]`를 바로 꺼냅니다. 그런데
+    메루카리는 없는 일반 매물에 404를 주지 않습니다(2026-09-14 실측, 아래).
+
+        일반 m12123461134   HTTP 403  {errors, meta, result}   <- 없어진 매물
+        일반 m000000000000  HTTP 400  {errors, meta, result}   <- ID 형식이 틀림
+        일반 m24841492644   HTTP 200  판매중
+        숍스 zzzz…(없는 ID)  HTTP 404  {code, details, message, requestId}
+        숍스 2JJ4Hj8…       HTTP 200  살아 있음
+
+    그래서 `item()`으로 물으면 없어진 매물이 전부 KeyError로 오고, '없음'과
+    '못 물어봄'이 한 덩어리가 됩니다. 실제로 그렇게 나왔습니다 — 예전 매물 61건을
+    물었더니 없어진 일반 매물 17건이 **한 건도 None으로 오지 않았습니다.**
+    상태 코드는 우리가 직접 읽어야 합니다.
+
+    `_item` / `_product` / `_client`는 mercapi의 내부 이름입니다.
+    `tests/test_mercapi_surface.py`가 이 셋이 그대로 있는지 지킵니다.
     """
-    if is_shop_product_id(item_id):
-        return await m.product(item_id)
-    return await m.item(item_id)
+    request = m._product(item_id) if is_shop_product_id(item_id) else m._item(item_id)
+    return await m._client.send(request)
+
+
+def listing_presence(status_code: int) -> bool | None:
+    """조회 응답의 상태 코드를 '있음 / 없음 / 모름'으로 읽습니다.
+
+    모르는 코드(400, 429, 5xx …)는 **None**입니다. 없어졌다고 읽으면 안 됩니다 —
+    못 잰 것을 0으로 읽는 것이 이 저장소가 두 번 당한 자리입니다.
+    """
+    if status_code == 200:
+        return True
+    if status_code in LISTING_MISSING_STATUS_CODES:
+        return False
+    return None
+
+
+async def ask_presence(m: Mercapi, item_id: str) -> bool | None:
+    """매물 하나에게 '아직 있느냐'고 묻고 있음/없음/모름으로 돌려받습니다."""
+    try:
+        response = await listing_response(m, item_id)
+    except Exception as exc:
+        print(f"[재출품] {item_id} 확인 실패({type(exc).__name__})", file=sys.stderr)
+        return None
+    answer = listing_presence(response.status_code)
+    if answer is None:
+        print(f"[재출품] {item_id} 확인 실패(HTTP {response.status_code})", file=sys.stderr)
+    return answer
+
+
+def canary_ids(targets: set[str], live_ids: set[str]) -> dict:
+    """물어볼 엔드포인트마다 **지금 살아 있는 것이 확실한 매물**을 하나씩 고릅니다.
+
+    왜 필요한가: 없어진 일반 매물의 신호가 **403**입니다. 그런데 403은 메루카리가
+    우리를 막을 때도 나옵니다. 가르지 않으면, 막히는 순간 모든 판정이 '사라졌다'로
+    떨어지면서 별개 매물의 신규 알림이 **조용히** 삼켜집니다 — 이 라운드에서 고치고
+    있는 바로 그 고장이 더 나쁜 모양으로 돌아옵니다.
+
+    그래서 아는 답에 먼저 대 봅니다. 이번 검색에 실제로 걸린 매물은 지금 올라와 있는
+    것이 확실하므로, 그것이 '있음'으로 안 나오면 그 엔드포인트의 답은 전부 믿지
+    않습니다. 엔드포인트가 둘이라 쓰는 쪽마다 하나씩 봅니다(추가 조회 최대 2건).
+    """
+    needed = {is_shop_product_id(item_id) for item_id in targets}
+    chosen: dict = {}
+    for item_id in sorted(live_ids):
+        shop = is_shop_product_id(item_id)
+        if shop in needed and shop not in chosen:
+            chosen[shop] = item_id
+    return chosen
 
 
 async def lookup_survival(
     m: Mercapi,
     item_ids: set[str],
+    live_ids: set[str] | None = None,
     limit: int = MAX_RELIST_LOOKUPS_PER_RUN,
 ) -> dict:
     """예전 매물이 지금도 상품 페이지를 가지고 있는지 하나씩 직접 묻습니다.
@@ -1265,15 +1334,32 @@ async def lookup_survival(
     재출품이 아니라 별개의 매물입니다(팔린 매물의 기준가를 물려받으면 안 됩니다).
 
     **이 물음이라서 숍스 상품도 답이 나옵니다.** 숍스 응답에는 판매 상태 필드가 없어
-    '팔렸는가'는 못 가리지만, 없는 상품은 404라 `Mercapi.product()`가 None을 돌려줍니다.
-    오판이 몰리는 쪽이 하필 숍스(판매자 119903670)라, 여기서 답이 안 나오면 이 설계는
-    절반만 듣습니다.
+    '팔렸는가'는 못 가리지만, 없는 상품은 404가 그대로 옵니다. 오판이 몰리는 쪽이
+    하필 숍스(판매자 119903670)라, 여기서 답이 안 나오면 이 설계는 절반만 듣습니다.
+    실제로 재 보니 답이 안 나오는 쪽은 숍스가 아니라 **일반 매물**이었습니다 —
+    `listing_response()` 주석 참고.
     """
     survival: dict = {}
     if not item_ids:
         return survival
     asked = sorted(item_ids)[:limit]
     started = current_time()
+
+    # 아는 답부터 맞춰 봅니다(위 canary_ids 참고). 여기서 어긋나면 그 엔드포인트의
+    # 답은 전부 버립니다 — 물어본 적 없는 것으로 둬서 다음 실행이 다시 묻습니다.
+    canaries = canary_ids(set(asked), live_ids or set())
+    untrusted = set()
+    for shop, canary in canaries.items():
+        if await ask_presence(m, canary) is not True:
+            untrusted.add(shop)
+            print(
+                f"[재출품] ⛔ 지금 올라와 있는 것이 확실한 매물 {canary}이(가) '있음'으로"
+                f" 안 나옵니다. {'숍스' if shop else '일반'} 매물의 확인을 이번 실행에서는"
+                " 믿지 않고 전부 미룹니다.",
+                file=sys.stderr,
+            )
+        await asyncio.sleep(RELIST_LOOKUP_PAUSE_SECONDS)
+
     for index, item_id in enumerate(asked):
         if index:
             if current_time() - started >= MAX_RELIST_LOOKUP_SECONDS_PER_RUN:
@@ -1282,14 +1368,12 @@ async def lookup_survival(
                 asked = asked[:index]
                 break
             await asyncio.sleep(RELIST_LOOKUP_PAUSE_SECONDS)
-        try:
-            found = await fetch_listing(m, item_id)
-        except Exception as exc:
-            # 답을 못 얻은 것은 '없다'가 아닙니다. None으로 남겨 다음 실행이 다시 묻습니다.
-            survival[item_id] = None
-            print(f"[재출품] {item_id} 확인 실패({type(exc).__name__}) -> 판정 보류", file=sys.stderr)
+        shop = is_shop_product_id(item_id)
+        if shop in untrusted or shop not in canaries:
+            # 눈금을 못 맞춘 엔드포인트입니다. 물어봐도 그 답을 읽을 수 없으므로
+            # 아예 묻지 않습니다(조회도 아낍니다).
             continue
-        survival[item_id] = found is not None
+        survival[item_id] = await ask_presence(m, item_id)
     if len(item_ids) > len(asked):
         print(
             f"[재출품] 직접 확인할 매물 {len(item_ids)}건 중 {len(asked)}건만 물어봤습니다"
@@ -2049,7 +2133,7 @@ async def collect_updates() -> None:
     for _keyword, items, checked, _coverage, _cutoff in searched:
         if checked:
             lookup_targets |= relist_lookup_targets(items, seen, relist_fingerprints, listed_ids)
-    survival = await lookup_survival(mercari, lookup_targets)
+    survival = await lookup_survival(mercari, lookup_targets, listed_ids)
     if survival:
         alive = sum(1 for value in survival.values() if value is True)
         gone = sum(1 for value in survival.values() if value is False)

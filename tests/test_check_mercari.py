@@ -200,17 +200,46 @@ class FakeResults:
         return FakeResults(self.pages[0], self.pages[1:])
 
 
+class FakeResponse:
+    """단건 조회의 HTTP 응답을 흉내 냅니다."""
+
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+
+class FakeHttpClient:
+    def __init__(self, owner):
+        self.owner = owner
+
+    async def send(self, request):
+        kind, item_id = request
+        self.owner.lookups.append(item_id)
+        if item_id in self.owner.fail_lookup_ids:
+            raise RuntimeError("단건 조회 실패 시뮬레이션")
+        if item_id in self.owner.lookup_status:
+            return FakeResponse(self.owner.lookup_status[item_id])
+        if item_id in self.owner.alive_ids:
+            return FakeResponse(200, {"data": {"status": "on_sale"}})
+        # 없는 매물이 돌려주는 것은 엔드포인트마다 다릅니다(2026-09-14 실측):
+        # 일반 매물은 403, 숍스 상품은 404입니다. 404가 아니라서 mercapi의
+        # item()은 None 대신 KeyError를 냅니다 — 그래서 봇은 상태 코드를 직접 읽습니다.
+        return FakeResponse(403 if kind == "item" else 404)
+
+
 class FakeMercapi:
     """검색 호출을 흉내 냅니다.
 
     실제 코드는 키워드마다 '등록순'과 '추천순'으로 두 번 조회한 뒤 결과를 합치므로,
     호출 횟수를 세어 두 번 불렸는지도 검증할 수 있게 합니다.
 
-    재출품 판정이 쓰는 **매물 단건 조회**(`item()`/`product()`)도 흉내 냅니다.
-    `live_ids`에 없는 매물은 실제 API와 같이 None을 돌려줍니다(404). 기본값은
-    "아무것도 안 남아 있다"라서, 따로 지정하지 않은 테스트에서는 예전 매물이 사라진
-    것으로 나옵니다. 엔드포인트도 실제와 같이 갈립니다 — 숍스 ID로 `item()`을 부르면
-    터집니다(운영에서 그것 때문에 확인 12건이 전부 실패했습니다).
+    재출품 판정이 쓰는 **매물 단건 조회**도 흉내 냅니다. 검색에 걸린 매물은 지금
+    올라와 있는 것이므로 기본값으로 '있음'이고, 그 밖의 매물은 '없음'입니다.
+    엔드포인트도 실제와 같이 갈립니다 — 숍스 ID를 일반 매물 쪽으로 보내면 터집니다
+    (운영에서 그것 때문에 확인 12건이 전부 실패했습니다).
     """
 
     def __init__(
@@ -222,6 +251,7 @@ class FakeMercapi:
         fail_next_page_keywords=(),
         live_ids=(),
         fail_lookup_ids=(),
+        lookup_status=None,
     ):
         self.items_by_keyword = items_by_keyword
         self.fail_keywords = set(fail_keywords)
@@ -230,27 +260,25 @@ class FakeMercapi:
         self.fail_next_page_keywords = set(fail_next_page_keywords)
         # 키워드별로 "몇 번째 조회를 실패시킬지" (0=등록순, 1=추천순)
         self.fail_call_indexes = fail_call_indexes or {}
-        # 단건 조회에서 "아직 상품 페이지가 있다"고 답할 매물들
-        self.live_ids = set(live_ids)
         self.fail_lookup_ids = set(fail_lookup_ids)
+        self.lookup_status = dict(lookup_status or {})
+        searchable = {
+            str(getattr(item, "id_", None))
+            for items in items_by_keyword.values() for item in items
+        }
+        self.alive_ids = searchable | set(live_ids)
         self.call_counts = {}
         self.calls = []
         self.lookups = []
+        self._client = FakeHttpClient(self)
 
-    async def item(self, item_id):
-        if mercari.is_shop_product_id(item_id):
-            # 숍스 ID로 items/get을 부르면 응답에 "data" 키가 없어 터집니다.
-            raise KeyError("data")
-        return self._lookup(item_id)
+    def _item(self, item_id):
+        assert not mercari.is_shop_product_id(item_id), (
+            f"숍스 ID {item_id}를 일반 매물 엔드포인트로 보냈습니다")
+        return ("item", item_id)
 
-    async def product(self, product_id):
-        return self._lookup(product_id)
-
-    def _lookup(self, item_id):
-        self.lookups.append(item_id)
-        if item_id in self.fail_lookup_ids:
-            raise RuntimeError("단건 조회 실패 시뮬레이션")
-        return object() if item_id in self.live_ids else None
+    def _product(self, product_id):
+        return ("product", product_id)
 
     async def search(self, keyword, categories=(), **options):
         index = self.call_counts.get(keyword, 0)
@@ -971,9 +999,9 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(new_items, [])
         self.assertIn("shop-3", seen)
-        # 숍스 ID는 product()로 물어봐야 합니다. item()으로 물으면 KeyError로 터져서
-        # 확인이 한 건도 답을 못 냅니다(2026-09-14 운영 실측: 12건 전부 그랬습니다).
-        self.assertEqual(api3.lookups, ["shop-2"])
+        # 물어본 순서: 먼저 눈금(지금 검색에 걸린 shop-3 — 살아 있는 것이 확실),
+        # 그다음 예전 매물. 눈금이 '있음'으로 안 나오면 그 엔드포인트의 답은 버립니다.
+        self.assertEqual(api3.lookups, ["shop-3", "shop-2"])
 
     async def test_a_missing_old_listing_is_not_judged_gone_on_the_first_run(self):
         """'이번 결과에 없다'는 사라졌다는 뜻이 아닙니다.
@@ -1286,8 +1314,8 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         요약이 "판매중 0/12건"으로 찍혔고, 재출품 판정이 '못 본 것'을 '없어진 것'으로
         읽고 있었습니다.
         """
-        api = FakeMercapi({}, fail_lookup_ids={"m-old"})
-        survival = await mercari.lookup_survival(api, {"m-old"})
+        api = FakeMercapi({}, live_ids={"m-live"}, fail_lookup_ids={"m-old"})
+        survival = await mercari.lookup_survival(api, {"m-old"}, {"m-live"})
         self.assertEqual(survival, {"m-old": None})   # False 가 아니어야 합니다
         self.assertIsNot(survival["m-old"], False)
 
@@ -1298,10 +1326,10 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         장치라(concurrency 때문에 한 실행이 길어지면 봇 전체가 멈춥니다), 넘친 것은
         버리지 않고 다음 실행에서 다시 봅니다.
         """
-        api = FakeMercapi({})
+        api = FakeMercapi({}, live_ids={"m-live"})
         targets = {f"m-old{index:02d}" for index in range(20)}
         with patch.object(mercari, "RELIST_LOOKUP_PAUSE_SECONDS", 0):
-            survival = await mercari.lookup_survival(api, targets, limit=5)
+            survival = await mercari.lookup_survival(api, targets, {"m-live"}, limit=5)
         self.assertEqual(len(survival), 5)
         self.assertEqual(set(survival) - targets, set())
 
@@ -1344,7 +1372,8 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         ):
             await mercari.collect_updates()
 
-        self.assertEqual(api.lookups, ["m-old"])
+        # 눈금 한 건 + 예전 매물 한 건. 키워드가 셋이어도 예전 매물은 한 번만 묻습니다.
+        self.assertEqual(api.lookups, ["m-new", "m-old"])
 
     def test_pending_relists_do_not_pile_up(self):
         """판정 보류 기록은 그 매물이 다시 조회될 때만 갱신됩니다.

@@ -57,10 +57,12 @@ from check_mercari import (  # noqa: E402  (경로를 먼저 잡아야 합니다
     SEEN_FILE,
     extract_item_id,
     extract_seller_id,
-    fetch_listing,
+    ask_presence,
+    is_shop_product_id,
     item_fields,
     listing_created_at,
-    lookup_survival,
+    listing_presence,
+    listing_response,
 )
 
 PAGE_PAUSE_SECONDS = 1.0  # 봇이 페이지 사이에 두는 간격과 같게 둡니다.
@@ -788,7 +790,11 @@ async def scan(
 
 # 있을 수 없는 매물 ID들입니다. 봇의 재출품 판정이 '없음'을 말할 수 있는지 재는 대조군으로,
 # 일반 매물 자리와 숍스 상품 자리를 하나씩 둡니다(엔드포인트가 다릅니다).
-SURVIVAL_CONTROL_IDS = ("m000000000000", "zzzzzzzzzzzzzzzzzzzzzz")
+#
+# 일반 쪽은 **형식이 맞는** ID여야 합니다. 처음에 `m000000000000`(13자리)을 썼더니
+# HTTP 400('ID 형식이 틀림')이 왔는데, 그건 '없는 매물'과 다른 답입니다. 실제 ID는
+# m + 11자리입니다.
+SURVIVAL_CONTROL_IDS = ("m99999999999", "zzzzzzzzzzzzzzzzzzzzzz")
 
 
 async def probe_lookup_endpoint(api, item_ids: tuple) -> None:
@@ -836,8 +842,12 @@ async def survival_controls(api) -> tuple[dict, bool]:
     그래서 아는 답(있을 수 없는 ID)에 먼저 대 봅니다. 여기서 False가 안 나오면
     나머지 숫자는 읽지 않습니다. **봇이 실제로 부르는 함수**를 그대로 씁니다.
     """
-    answers = await lookup_survival(api, set(SURVIVAL_CONTROL_IDS),
-                                   limit=len(SURVIVAL_CONTROL_IDS))
+    # 봇이 실제로 부르는 함수를 그대로 씁니다. 다만 봇은 '지금 살아 있는 것이 확실한
+    # 매물'을 눈금으로 함께 묻는데(canary), 대조군은 그 눈금 자체를 재는 자리라
+    # 있을 수 없는 ID를 살아 있는 것으로 넘겨 눈금을 통과시킵니다. 여기서 보고 싶은
+    # 것은 "없는 매물에게 물으면 없다고 답하는가" 하나뿐입니다.
+    answers = {item_id: await ask_presence(api, item_id)
+               for item_id in SURVIVAL_CONTROL_IDS}
     trustworthy = all(answers.get(item_id) is False for item_id in SURVIVAL_CONTROL_IDS)
     return answers, trustworthy
 
@@ -864,42 +874,50 @@ def report_survival_controls(answers: dict, trustworthy: bool) -> None:
 
 
 async def still_on_sale(api, item_ids: set) -> dict:
-    """쫓는 매물이 **지금도 팔리지 않고 올라와 있는지** 하나씩 물어봅니다.
+    """쫓는 매물이 **지금도 올라와 있는지** 하나씩 물어봅니다.
 
     왜 필요한가: 검색으로 '훑은 범위에 없음'이 나와도 두 가지가 갈리지 않습니다 —
-    이미 팔려서 없는 것과, 아직 올라와 있는데 순위가 한참 뒤라 못 본 것입니다.
+    이미 없어져서 안 보이는 것과, 아직 올라와 있는데 순위가 한참 뒤라 못 본 것입니다.
     재출품 오판을 설명하려면 **뒤쪽**이어야 합니다. 앞쪽이면 '사라졌다'가 맞는
     판정이었다는 뜻이니까요.
 
-    `Mercapi.item()`은 봇이 쓰지 않는 표면이라 `tests/test_mercapi_surface.py`가
-    지키지 않습니다. 그래서 실패를 삼키고 '확인 실패'로 돌려줍니다 — 이 조회 하나
-    때문에 스캔 전체가 죽으면 안 됩니다.
+    봇과 **같은 함수로 같은 상태 코드를 읽습니다**(`listing_response` /
+    `listing_presence`). 여기서 따로 읽었다가, 없어진 일반 매물이 403으로 오는 것을
+    모르고 `item()`의 KeyError로 받아 '확인 실패'로 뭉뚱그린 적이 있습니다.
+    실패를 삼키고 돌려주는 것은 그대로입니다 — 이 조회 하나 때문에 스캔이 죽으면
+    안 됩니다.
     """
     states: dict = {}
     for item_id in sorted(item_ids):
-        # 엔드포인트를 가르는 자리는 봇과 **같은 함수**를 씁니다(`fetch_listing`).
-        # 여기서 따로 갈랐다가 숍스 ID로 `item()`을 불러 확인 12건이 전부 KeyError로
-        # 죽은 적이 있습니다(2026-09-14 실측).
-        shop_item = not MERCARI_ITEM_ID_PATTERN.match(str(item_id))
         try:
-            found = await fetch_listing(api, item_id)
+            response = await listing_response(api, item_id)
         except Exception as exc:
             states[item_id] = f"확인 실패({type(exc).__name__})"
             await asyncio.sleep(PAGE_PAUSE_SECONDS)
             continue
-        if found is None:
-            states[item_id] = "없음(삭제)"
-        elif shop_item:
+        presence = listing_presence(response.status_code)
+        if presence is False:
+            states[item_id] = f"없음(HTTP {response.status_code})"
+        elif presence is None:
+            states[item_id] = f"확인 실패(HTTP {response.status_code})"
+        elif is_shop_product_id(item_id):
             # 숍스 상품 응답에는 판매 상태 필드가 없습니다. 페이지가 아직 있다는
             # 것까지만 말할 수 있으니, 그 이상으로 적지 않습니다.
             states[item_id] = "상품 페이지 있음"
         else:
-            status = str(getattr(found, "status", "") or "")
+            try:
+                status = str((response.json().get("data") or {}).get("status") or "")
+            except Exception:
+                status = ""
             states[item_id] = {
                 "ITEM_STATUS_ON_SALE": "판매중",
                 "ITEM_STATUS_SOLD_OUT": "판매완료",
                 "ITEM_STATUS_STOP": "중지",
                 "ITEM_STATUS_TRADING": "거래중",
+                "on_sale": "판매중",
+                "sold_out": "판매완료",
+                "stop": "중지",
+                "trading": "거래중",
             }.get(status, status or "상태 모름")
         await asyncio.sleep(PAGE_PAUSE_SECONDS)
     return states
@@ -950,7 +968,7 @@ def report_tracked(track: set, all_found: dict, seen_ids: set, sorts: tuple,
                   " 이 항목들에 대해서는 판매 여부를 **말할 수 없습니다.**")
             return
         alive = [i for i, state in on_sale.items()
-                 if state in ("판매중", "상품 페이지 있음")]
+                 if not state.startswith(("없음", "확인 실패"))]
         hidden = [i for i in alive
                   if not any((all_found.get(sort) or {}).get(i) for sort in sorts)]
         print(
