@@ -201,7 +201,7 @@ def collect(versions: list, progress=None) -> tuple[list, dict, dict]:
     return events, owner_became, alerts
 
 
-def audit(since: float, until: float, calibrate: bool) -> int:
+def audit(since: float, until: float, calibrate: bool, list_ids: bool = False) -> int:
     versions = state_versions(since, until)
     print(f"구간 안 first-parent 상태 파일 {len(versions):,}판", file=sys.stderr)
     if not versions:
@@ -223,27 +223,40 @@ def audit(since: float, until: float, calibrate: bool) -> int:
     print(f"그중 가격 이력을 물려받은 판정      {len(inherited)}건"
           f" (값 {len(inherited) - by_drop} / 첫 관측 인하 알림 {by_drop})")
 
+    if list_ids:
+        # 판정이 '사라졌다'로 읽은 예전 매물들입니다. 그 매물이 지금도 올라와 있는지는
+        # 상태 파일로는 알 수 없고 메루카리에 직접 물어봐야 합니다. 이 목록을
+        # Coverage Scan(Actions 탭)의 `track` 입력에 그대로 넣으세요 — 대조군까지
+        # 함께 돌면서 '없는 매물에게 물으면 없다고 답하는가'부터 확인해 줍니다.
+        print(",".join(sorted({event["old_id"] for event in inherited})))
+        return 0
+
     verdicts = []
     for event in inherited:
         back = first_return(event["old_id"], event["ts"], owner_became)
         verdicts.append({**event, "returned_at": back,
                          "gap": (back - event["ts"]) if back else None})
     misjudged = [v for v in verdicts if v["gap"] is not None]
-    still_wrong = [v for v in misjudged if v["gap"] > RELIST_ABSENCE_SECONDS]
-    caught = len(misjudged) - len(still_wrong)
+    beyond_window = [v for v in misjudged if v["gap"] > RELIST_ABSENCE_SECONDS]
 
     print(f"  그중 예전 매물이 뒤에 다시 관측됨 = 오판   {len(misjudged)}건  (하한입니다)")
-    print(f"    {RELIST_ABSENCE_SECONDS // 60}분 안에 돌아옴 = 판정 보류가 잡아냄  {caught}건")
-    print(f"    그보다 오래 안 보임 = 보류로도 못 잡음     {len(still_wrong)}건")
+    print(f"    그중 공백이 {RELIST_ABSENCE_SECONDS // 60}분을 넘은 것            "
+          f"{len(beyond_window)}건")
+    print()
+    print("  ※ 이 공백은 **예전 판정**이 어디서 걸렸는지를 보여 주는 값입니다.")
+    print("    지금 판정은 시간을 기다리지 않고 예전 매물에게 직접 물어보므로, 그 매물이")
+    print("    아직 올라와 있기만 하면 공백이 얼마든 전부 '별개의 매물'로 갈립니다.")
+    print("    실제로 그러는지는 상태 파일로 알 수 없습니다 — 아래 --list-ids 로 예전 매물")
+    print("    목록을 뽑아 Coverage Scan의 track 에 넣고 직접 물어보세요.")
 
-    if still_wrong:
-        print("\n보류로도 못 잡는 것들 (공백이 긴 순):")
-        for verdict in sorted(still_wrong, key=lambda v: -v["gap"]):
+    if beyond_window:
+        print("\n공백이 창보다 길었던 것들 (긴 순):")
+        for verdict in sorted(beyond_window, key=lambda v: -v["gap"]):
             when = datetime.fromtimestamp(verdict["ts"], timezone.utc).strftime("%m-%d %H:%M")
             print(f"   {when}  공백 {verdict['gap'] / 60:7.0f}분"
                   f"  예전={verdict['old_id']:<24} 새={verdict['new_id']:<24}"
                   f"  {verdict['fp'][:44]}")
-        sellers = collections.Counter(v["fp"].split(":")[1] for v in still_wrong
+        sellers = collections.Counter(v["fp"].split(":")[1] for v in beyond_window
                                       if v["fp"].startswith("seller:"))
         print(f"   판매자별: {dict(sellers)}")
 
@@ -267,6 +280,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--until", default=CALIBRATION["until"], help="UTC, 예: 2026-09-13T12:48")
     parser.add_argument("--calibrate", action="store_true",
                         help="PR #25의 눈금과 맞는지 확인하고 어긋나면 1로 끝납니다")
+    parser.add_argument("--list-ids", action="store_true",
+                        help="판정이 '사라졌다'로 읽은 예전 매물 ID만 쉼표로 출력합니다"
+                             " (Coverage Scan의 track 입력에 그대로 넣으세요)")
     return parser.parse_args()
 
 
@@ -276,4 +292,5 @@ def to_epoch(text: str) -> float:
 
 if __name__ == "__main__":
     args = parse_args()
-    raise SystemExit(audit(to_epoch(args.since), to_epoch(args.until), args.calibrate))
+    raise SystemExit(audit(to_epoch(args.since), to_epoch(args.until),
+                           args.calibrate, args.list_ids))

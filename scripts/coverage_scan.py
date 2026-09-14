@@ -774,6 +774,11 @@ async def scan(
         # 아는 답에 먼저 대 보고, 거기서 눈금이 안 맞으면 아래 표는 읽지 않습니다.
         control_answers, trustworthy = await survival_controls(api)
         report_survival_controls(control_answers, trustworthy)
+        if not trustworthy:
+            # 왜 안 맞는지는 날것을 봐야 압니다. 아는 답(있을 수 없는 ID) 두 개와,
+            # 쫓는 목록에서 하나를 같이 찍어 비교합니다.
+            await probe_lookup_endpoint(
+                api, SURVIVAL_CONTROL_IDS + tuple(sorted(track))[:2])
         report_tracked(track, all_found, seen_ids, sorts,
                        await still_on_sale(api, track), trustworthy)
     if len(sorts) > 1:
@@ -784,6 +789,38 @@ async def scan(
 # 있을 수 없는 매물 ID들입니다. 봇의 재출품 판정이 '없음'을 말할 수 있는지 재는 대조군으로,
 # 일반 매물 자리와 숍스 상품 자리를 하나씩 둡니다(엔드포인트가 다릅니다).
 SURVIVAL_CONTROL_IDS = ("m000000000000", "zzzzzzzzzzzzzzzzzzzzzz")
+
+
+async def probe_lookup_endpoint(api, item_ids: tuple) -> None:
+    """단건 조회가 **날것으로 무엇을 돌려주는지** 그대로 찍습니다.
+
+    `Mercapi.item()`은 404일 때만 None을 돌려주고, 그 밖에는 `body["data"]`를 바로
+    꺼냅니다. 2026-09-14 실측에서 없어진 매물 17건이 전부 None이 아니라 KeyError로
+    왔습니다 — 즉 메루카리는 없는 매물에 404를 주지 않습니다. 그러면 '없음'과
+    '못 물어봄'이 한 덩어리가 되고, 재출품 판정은 영영 사라짐을 확인하지 못합니다.
+
+    그래서 상태 코드와 응답의 최상위 키를 직접 봅니다. 여기서 나온 것으로
+    `check_mercari.lookup_survival()`이 무엇을 '없음'으로 읽을지 정합니다.
+    """
+    print()
+    print("=" * 78)
+    print("■ 단건 조회가 날것으로 무엇을 돌려주는가 (상태 코드 / 최상위 키)")
+    print("=" * 78)
+    for item_id in item_ids:
+        shop_item = not MERCARI_ITEM_ID_PATTERN.match(str(item_id))
+        kind = "숍스" if shop_item else "일반"
+        try:
+            request = api._product(item_id) if shop_item else api._item(item_id)
+            response = await api._client.send(request)
+            try:
+                body = response.json()
+                keys = ",".join(sorted(body)[:6]) if isinstance(body, dict) else type(body).__name__
+            except Exception as exc:
+                keys = f"(본문 파싱 실패: {type(exc).__name__})"
+            print(f"   {kind} {item_id:<26} HTTP {response.status_code}  키: {keys}")
+        except Exception as exc:
+            print(f"   {kind} {item_id:<26} 요청 자체가 실패: {type(exc).__name__}: {exc}")
+        await asyncio.sleep(PAGE_PAUSE_SECONDS)
 
 
 async def survival_controls(api) -> tuple[dict, bool]:
