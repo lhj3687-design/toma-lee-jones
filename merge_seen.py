@@ -11,8 +11,10 @@
 import json
 import sys
 
-MAX_SEEN_ITEMS = 15000
-MAX_RELIST_FINGERPRINTS = 15000
+# 상한은 check_mercari.py와 반드시 같아야 합니다(테스트가 확인합니다).
+# 어긋나면 충돌 병합 때마다 상태가 조용히 깎입니다. 값의 근거는 그쪽 주석 참고.
+MAX_SEEN_ITEMS = 30000
+MAX_RELIST_FINGERPRINTS = 30000
 MAX_SENT_ALERTS = 20000
 MAX_PENDING_ALERTS = 500
 MAX_PENDING_RELISTS = 500
