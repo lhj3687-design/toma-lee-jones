@@ -1119,7 +1119,13 @@ def confirm_disappearance(
     if can_confirm_absence and entry.get("checked_at") != now:
         # 한 실행에서 여러 키워드가 같은 매물을 물고 올 수 있어, 실행당 한 번만 셉니다.
         entry["checks"] = int(entry.get("checks") or 0) + 1
-        entry["checked_at"] = now
+    # 빠른 조회에서도 '이 매물을 언제 마지막으로 봤는지'는 적어 둡니다. 확인 횟수는
+    # 전체 조회에서만 늘지만, 이 값이 없으면 상태 파일만 보고는 **확인이 진행 중인
+    # 보류인지, 매물이 검색에서 사라져 수명만 기다리는 보류인지 구분할 수 없습니다.**
+    # 실측(2026-09-14 배포 직후 65분): 보류 26건이 생기는 동안 결론이 난 건 1건이고
+    # 나머지는 매물이 다시 조회되지 않아 그대로 남았는데, 그 사실을 확인하려고
+    # Actions 실행 로그까지 뒤져야 했습니다.
+    entry["checked_at"] = now
 
     since = entry.get("since")
     since = float(since) if isinstance(since, (int, float)) else now
