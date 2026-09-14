@@ -45,6 +45,19 @@ UNKNOWN_SELLER_IDS = {"", "0", "none", "null"}
 SEEN_FILE = Path("seen_items.json")
 MAX_ITEMS_PER_KEYWORD = 120  # 메루카리 검색 한 페이지 크기(키워드당 정렬 방식마다 확인할 매물 개수)
 MAX_SEARCH_PAGES = 3  # 새 매물이 한 페이지를 가득 채웠을 때만 추가로 볼 최대 페이지 수
+# '이 페이지가 신규로 가득 찼는가'를 판단할 때 봐 주는 예전 매물 수입니다.
+#
+# 예전에는 '페이지 안 **가장 오래된** 매물도 기준선 이후인가'로 물었습니다. 그런데
+# 메루카리의 '새로운 순'은 등록 시각이 아니라 마지막 수정 시각에 가까워서 예전 매물이
+# 앞자리에 섞여 들어오고(실측: Margiela 597건 중 역전 254건), 그 탓에 창 안 가장 오래된
+# 매물이 어느 키워드든 최소 187일 전이었습니다. 최솟값 하나가 통째로 널뛰니 조건이
+# **영영 참이 될 수 없었습니다.**
+#
+# 그래서 최솟값 대신 개수를 셉니다. 섞여 들어온 예전 매물 몇 건에 흔들리지 않습니다.
+# 값은 실측으로 잡았습니다(2026-09-10 ~ 09-14, 키워드별·실행별 신규 건수 3,665조합):
+# 중앙값 1건 / 상위 1% 16건 / **최대 72건**. 80건 이상은 한 번도 없었습니다. 즉 100건
+# (=120-20)이면 평소에는 한 번도 발동하지 않습니다.
+STALE_MIXIN_TOLERANCE = 20
 # 상한은 '용량을 아끼는 장치'가 아닙니다. 재 보면 정반대입니다 — 운영 이력 2,416판을
 # 상한만 바꿔 다시 팩하면 자르지 않은 쪽이 가장 쌉니다(README "용량 상한" 참고).
 #
@@ -970,22 +983,33 @@ async def flush_pending(
 
 
 def wants_another_page(pass_name: str, results, items: list, created_cutoff: float | None) -> bool:
-    """등록순 조회에서 한 페이지가 통째로 '신규 구간'에 들어갈 때만 다음 페이지를 봅니다.
+    """등록순 조회에서 한 페이지가 신규 매물로 가득 찼을 때만 다음 페이지를 봅니다.
 
-    한 페이지(120개)가 전부 기준선 이후에 등록된 매물이라면, 그 뒤에 아직 못 본 새 매물이
-    더 있을 수 있다는 뜻입니다. 인기 키워드에서 짧은 시간에 매물이 쏟아질 때 놓치지 않으려는
-    장치이며, 평소(5분에 120개 미만)에는 한 페이지만 보고 끝납니다.
+    한 페이지(120개)가 거의 전부 기준선 이후에 등록된 매물이라면, 그 뒤에 아직 못 본 새
+    매물이 더 있을 수 있다는 뜻입니다. 인기 키워드에서 짧은 시간에 매물이 쏟아질 때
+    놓치지 않으려는 장치이며, 평소에는 한 페이지만 보고 끝납니다.
+
+    **세는 법이 한 번 틀렸습니다.** 예전에는 '페이지 안 가장 오래된 매물도 기준선
+    이후인가'로 물었는데, 등록순 결과에 예전 매물이 섞여 들어와서 그 최솟값이 어느
+    키워드든 수백~수천 일 전이었습니다. 조건이 원리상 참이 될 수 없었고, 그래서 이
+    장치는 배포된 뒤 한 번도 발동한 적이 없습니다. 최솟값 대신 **개수**를 셉니다
+    (`STALE_MIXIN_TOLERANCE` 주석 참고).
+
+    등록 시각을 하나라도 모르면 발동하지 않습니다. `is_fresh_listing()`은 모르는 값을
+    True로 돌려주므로(알림을 놓치는 쪽보다 한 번 더 보내는 쪽이 안전), 그대로 세면
+    피드가 등록 시각을 못 주는 순간 **모든 키워드가 매 실행 3페이지씩** 부릅니다.
     """
-    if pass_name != "created" or created_cutoff is None:
+    if pass_name != NEW_ITEM_SORT_PASS or created_cutoff is None:
         return False
     if len(items) < MAX_ITEMS_PER_KEYWORD:
         return False
     if not getattr(getattr(results, "meta", None), "next_page_token", ""):
         return False
-    created_times = [t for t in (listing_created_at(item) for item in items) if t is not None]
-    if not created_times:
+    created_times = [listing_created_at(item) for item in items]
+    if any(t is None for t in created_times):
         return False
-    return is_fresh_listing(min(created_times), created_cutoff)
+    fresh = sum(1 for t in created_times if is_fresh_listing(t, created_cutoff))
+    return fresh >= MAX_ITEMS_PER_KEYWORD - STALE_MIXIN_TOLERANCE
 
 
 async def search_items(
@@ -1050,7 +1074,14 @@ async def search_items(
             if not wants_another_page(pass_name, results, page, created_cutoff):
                 pass_completed = True
                 break
-            print(f"[{keyword}] 신규 매물이 한 페이지를 가득 채워 다음 페이지도 확인합니다")
+            fresh_on_page = sum(
+                1 for fields in page
+                if is_fresh_listing(listing_created_at(fields), created_cutoff)
+            )
+            # 건수를 같이 찍습니다. 이 장치가 발동한 적이 한 번도 없어서(예전 조건이
+            # 원리상 참이 될 수 없었습니다) 임계값이 맞는지 볼 실전 기록이 없습니다.
+            print(f"[{keyword}] 신규 매물이 한 페이지를 가득 채워 다음 페이지도 확인합니다"
+                  f" (신규 {fresh_on_page}/{len(page)}건)")
             await asyncio.sleep(1)
         else:
             # 페이지 상한까지 다 쓴 경우입니다. 더 볼 수 있는 페이지가 남았을 수는 있지만,
