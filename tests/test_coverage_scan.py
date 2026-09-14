@@ -592,16 +592,85 @@ class OnSaleCheckTests(unittest.TestCase):
         coverage_scan.PAGE_PAUSE_SECONDS = 0
         try:
             api = self._api({
-                "살아있음": types.SimpleNamespace(status="ITEM_STATUS_ON_SALE"),
-                "팔림": types.SimpleNamespace(status="ITEM_STATUS_SOLD_OUT"),
-                "지워짐": None,
-                "터짐": RuntimeError("boom"),
+                "m1": types.SimpleNamespace(status="ITEM_STATUS_ON_SALE"),
+                "m2": types.SimpleNamespace(status="ITEM_STATUS_SOLD_OUT"),
+                "m3": None,
+                "m4": RuntimeError("boom"),
             })
-            states = asyncio.run(coverage_scan.still_on_sale(
-                api, {"살아있음", "팔림", "지워짐", "터짐"}))
-            self.assertEqual(states["살아있음"], "판매중")
-            self.assertEqual(states["팔림"], "판매완료")
-            self.assertEqual(states["지워짐"], "없음(삭제)")
-            self.assertTrue(states["터짐"].startswith("확인 실패"))
+            states = asyncio.run(coverage_scan.still_on_sale(api, {"m1", "m2", "m3", "m4"}))
+            self.assertEqual(states["m1"], "판매중")
+            self.assertEqual(states["m2"], "판매완료")
+            self.assertEqual(states["m3"], "없음(삭제)")
+            self.assertTrue(states["m4"].startswith("확인 실패"))
         finally:
             coverage_scan.PAGE_PAUSE_SECONDS = saved
+
+    def test_shop_products_go_to_the_product_endpoint_not_the_item_one(self):
+        """숍스 ID로 item()을 부르면 mercapi가 KeyError로 터집니다.
+
+        2026-09-14 실측에서 쫓던 12건이 **전부** '확인 실패(KeyError)'였습니다.
+        전부 숍스 상품(m+숫자가 아닌 ID)이었기 때문입니다. 엔드포인트를 가르지 않으면
+        이 확인은 한 건도 답을 내지 못합니다.
+        """
+        saved = coverage_scan.PAGE_PAUSE_SECONDS
+        coverage_scan.PAGE_PAUSE_SECONDS = 0
+
+        class Api:
+            def __init__(self):
+                self.item_calls, self.product_calls = [], []
+
+            async def item(self, item_id):
+                self.item_calls.append(item_id)
+                raise KeyError("data")     # 숍스 응답에는 "data" 키가 없습니다
+
+            async def product(self, product_id):
+                self.product_calls.append(product_id)
+                return types.SimpleNamespace(name="숍스 상품")
+
+        try:
+            api = Api()
+            states = asyncio.run(coverage_scan.still_on_sale(
+                api, {"m12345", "2JSVsYv7PXtWWgyKzRoqP7"}))
+            self.assertEqual(api.product_calls, ["2JSVsYv7PXtWWgyKzRoqP7"])
+            self.assertEqual(api.item_calls, ["m12345"])
+            self.assertEqual(states["2JSVsYv7PXtWWgyKzRoqP7"], "상품 페이지 있음")
+        finally:
+            coverage_scan.PAGE_PAUSE_SECONDS = saved
+
+    def test_all_checks_failing_is_not_reported_as_nothing_on_sale(self):
+        """못 잰 것을 '다 팔렸다'로 읽게 두면 안 됩니다."""
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            coverage_scan.report_tracked(
+                {"가", "나"}, {"created": {}}, set(), ("created",),
+                {"가": "확인 실패(KeyError)", "나": "확인 실패(KeyError)"},
+            )
+        output = buffer.getvalue()
+        self.assertIn("말할 수 없습니다", output)
+        self.assertNotIn("안 나오는 것", output)
+
+
+class DwellGrowthTests(unittest.TestCase):
+    """창을 넓혔는데 깊이가 그대로면 그 값은 깊이가 아닙니다.
+
+    PR #30에서는 **비단조인 표**가 방법이 틀렸다는 신호였습니다(창을 넓혔는데
+    얕아짐). 추천순에서는 **평평한 표**가 같은 신호입니다 — 2026-09-14 실측에서
+    거의 모든 키워드가 30건=60건=120건으로 나왔습니다.
+    """
+
+    def test_a_conveyor_gets_deeper_as_the_window_widens(self):
+        self.assertTrue(coverage_scan.dwell_grows_with_the_window(
+            [(30, 37.0), (60, 68.0), (120, 120.0)]))
+
+    def test_a_flat_table_is_flagged(self):
+        self.assertFalse(coverage_scan.dwell_grows_with_the_window(
+            [(30, 7.0), (60, 7.0), (120, 7.0)]))
+
+    def test_a_table_that_gets_shallower_is_flagged(self):
+        """PR #30이 실제로 마주쳤던 모양입니다 (Hermes 30건=2.1시간 / 60건=16.7일 / 120건=15.5시간)."""
+        self.assertFalse(coverage_scan.dwell_grows_with_the_window(
+            [(30, 126.0), (60, 24048.0), (120, 930.0)]))
+
+    def test_a_window_with_room_left_is_not_judged(self):
+        self.assertIsNone(coverage_scan.dwell_grows_with_the_window(
+            [(30, 500.0), (60, None), (120, None)]))

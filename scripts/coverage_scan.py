@@ -49,6 +49,7 @@ sys.path.insert(0, str(ROOT))
 
 from check_mercari import (  # noqa: E402  (경로를 먼저 잡아야 합니다)
     FULL_SCAN_INTERVAL_SECONDS,
+    MERCARI_ITEM_ID_PATTERN,
     MAX_ITEMS_PER_KEYWORD,
     MAX_LOOKBACK_SECONDS,
     SEARCHES,
@@ -330,6 +331,27 @@ def conveyor_holds(ranks: list, window: int = 0) -> bool:
     """
     window = window or MAX_ITEMS_PER_KEYWORD
     return bool(ranks) and max(ranks) < window
+
+
+def dwell_grows_with_the_window(dwell: list) -> bool | None:
+    """창을 넓혔는데 깊이가 그대로면 그 값은 깊이가 아닙니다.
+
+    컨베이어에서는 창 크기와 체류 시간이 **비례**합니다 — 창이 30건에서 120건으로
+    넓어지면 매물이 밖으로 밀려나기까지 4배 오래 걸립니다. 그래서 30 < 60 < 120은
+    반드시 성립합니다.
+
+    2026-09-14 추천순 실측에서는 거의 모든 키워드가 `30건=60건=120건`으로 **똑같이**
+    나왔습니다(마르지엘라 2분 / 크롬하츠 7분 / 더로우 54분). 컨베이어라면 나올 수 없는
+    모양이고, 같은 표의 등록순 쪽은 37분 → 68분 → 2.0시간으로 제대로 자랍니다.
+    PR #30에서 '비단조인 표'가 방법이 틀렸다는 신호였던 것과 같은 자리입니다 —
+    이번에는 **평평한 표**가 그 신호입니다.
+
+    창이 남는 키워드(값이 None)는 판단하지 않고 None을 돌려줍니다.
+    """
+    values = [minutes for _, minutes in dwell]
+    if any(value is None for value in values) or len(values) < 2:
+        return None
+    return all(earlier < later for earlier, later in zip(values, values[1:]))
 
 
 def predicted_survival(dwell_minutes: float | None, lag_minutes: float) -> float | None:
@@ -766,16 +788,24 @@ async def still_on_sale(api, item_ids: set) -> dict:
     """
     states: dict = {}
     for item_id in sorted(item_ids):
+        # 일반 매물(m+숫자)과 숍스 상품은 **다른 엔드포인트**입니다. 숍스 ID로
+        # `item()`을 부르면 응답 모양이 달라 mercapi가 KeyError로 터집니다
+        # (2026-09-14 실측: 쫓던 12건 전부 '확인 실패(KeyError)'였습니다).
+        shop_item = not MERCARI_ITEM_ID_PATTERN.match(str(item_id))
         try:
-            item = await api.item(item_id)
+            found = await (api.product(item_id) if shop_item else api.item(item_id))
         except Exception as exc:
             states[item_id] = f"확인 실패({type(exc).__name__})"
             await asyncio.sleep(PAGE_PAUSE_SECONDS)
             continue
-        if item is None:
+        if found is None:
             states[item_id] = "없음(삭제)"
+        elif shop_item:
+            # 숍스 상품 응답에는 판매 상태 필드가 없습니다. 페이지가 아직 있다는
+            # 것까지만 말할 수 있으니, 그 이상으로 적지 않습니다.
+            states[item_id] = "상품 페이지 있음"
         else:
-            status = str(getattr(item, "status", "") or "")
+            status = str(getattr(found, "status", "") or "")
             states[item_id] = {
                 "ITEM_STATUS_ON_SALE": "판매중",
                 "ITEM_STATUS_SOLD_OUT": "판매완료",
@@ -819,15 +849,24 @@ def report_tracked(track: set, all_found: dict, seen_ids: set, sorts: tuple,
             "추적 중" if item_id in seen_ids else "상태 파일에 없음")
         print(f"   {item_id:<26} {state:<14} | " + " | ".join(marks))
     if on_sale:
-        alive = [i for i, state in on_sale.items() if state == "판매중"]
+        failed = [i for i, state in on_sale.items() if state.startswith("확인 실패")]
+        if len(failed) == len(on_sale):
+            # 전부 실패했는데 '판매중 0건'이라고 찍으면, 확인이 안 된 것을 '다 팔렸다'로
+            # 읽게 됩니다. 못 잰 것은 못 쟀다고 말해야 합니다.
+            print(f"\n   ⛔ 상태 확인이 {len(failed)}건 전부 실패했습니다."
+                  " 이 항목들에 대해서는 판매 여부를 **말할 수 없습니다.**")
+            return
+        alive = [i for i, state in on_sale.items()
+                 if state in ("판매중", "상품 페이지 있음")]
         hidden = [i for i in alive
                   if not any((all_found.get(sort) or {}).get(i) for sort in sorts)]
         print(
-            f"\n   지금도 판매중인 것 {len(alive)}/{len(track)}건,"
-            f" 그중 훑은 범위(두 패스 모두)에 **안 나오는 것 {len(hidden)}건**."
+            f"\n   아직 남아 있는 것 {len(alive)}/{len(track)}건"
+            + (f" (확인 실패 {len(failed)}건)" if failed else "")
+            + f", 그중 훑은 범위(두 패스 모두)에 **안 나오는 것 {len(hidden)}건**."
         )
         print(
-            "   판매중인데 안 나온다면 '사라졌다'가 아니라 '순위가 너무 뒤'입니다 —\n"
+            "   남아 있는데 검색에 안 나온다면 '사라졌다'가 아니라 '순위가 너무 뒤'입니다 —\n"
             "   재출품 판정이 읽은 그 '없음'의 정체가 이것입니다."
         )
 
@@ -899,6 +938,9 @@ def report_window_sizes(rows: list, sort: str = "created") -> None:
     sizes = [size for size, _ in (rows[0]["dwell"] if rows else [])]
     measured = [row for row in rows if row["young_ranks"]]
     broken = [row for row in measured if not row["conveyor"]]
+    growth = [(row["keyword"], dwell_grows_with_the_window(row["dwell"])) for row in rows]
+    flat = [keyword for keyword, grows in growth if grows is False]
+    judged = [keyword for keyword, grows in growth if grows is not None]
     print(f"\n[{sort_label(sort)}] 창에 머무는 시간"
           " (건수가 아니라 '머무는 시간'으로 봅니다):")
     if broken:
@@ -910,6 +952,15 @@ def report_window_sizes(rows: list, sort: str = "created") -> None:
             f"      '새 매물은 맨 앞으로 들어와 뒤로만 밀린다'는 컨베이어 가정 위에 서\n"
             f"      있는데, 그게 깨지면 '밖으로 밀려난 것 중 가장 어린 것의 나이'는\n"
             f"      '창을 통과하는 시간'이 아닙니다. --snapshots로 종단 측정하세요."
+        )
+    if flat:
+        # 두 번째 신호입니다. 앞의 것과 원인은 같지만 서로를 대체하지 못합니다 —
+        # 이쪽은 최근 매물이 하나도 없는 키워드에서도 잡힙니다.
+        print(
+            f"   ⛔ 창을 넓혔는데 깊이가 **그대로인** 키워드가 {len(flat)}/{len(judged)}개입니다"
+            f" ({', '.join(flat[:6])}).\n"
+            f"      컨베이어라면 30건 < 60건 < 120건이 반드시 성립합니다. 평평하다는 것은\n"
+            f"      이 값이 '창을 통과하는 시간'이 아니라는 뜻입니다."
         )
     print("\n창을 줄여도 되는가 (건수가 아니라 '머무는 시간'으로 봅니다):")
     print(
