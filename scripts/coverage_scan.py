@@ -425,9 +425,18 @@ def missed_ages(
 
 
 def format_span(minutes: float | None) -> str:
-    """분을 읽기 쉬운 단위로. 창 깊이는 분·시간·일이 뒤섞여 나옵니다."""
+    """분을 읽기 쉬운 단위로. 창 깊이는 분·시간·일이 뒤섞여 나옵니다.
+
+    음수는 **잰 방법이 틀렸다는 뜻**이라 그렇게 찍습니다. 매물이 조회보다 나중에
+    올라올 수는 없으므로, 나이가 음수라면 기준 시각이 조회보다 앞선 것입니다.
+    실제로 2026-09-14에 그 일이 났습니다 — 스캔 시작 시각 하나로 모든 패스의 나이를
+    쟀는데, 추천순 패스는 그보다 몇 분 뒤에 돌기 때문에 '-3분치' 같은 값이 나왔습니다.
+    그대로 뒀으면 '추천순 창은 3분치'라는 그럴듯한 오답이 표에 실렸을 것입니다.
+    """
     if minutes is None:
         return "창이 남음"
+    if minutes < 0:
+        return "⛔잰 방법 틀림"
     if minutes < 90:
         return f"{minutes:.0f}분치"
     if minutes < 60 * 48:
@@ -468,8 +477,7 @@ async def census(
     api,
     sort: str,
     pages: int,
-    fresh_after: float,
-    now: float,
+    fresh_hours: float,
     seen_ids: set,
     keyword_checked_at: dict,
     check_filter: bool,
@@ -491,10 +499,15 @@ async def census(
     sellers = sellers or set()
     found_at: dict = {}      # 쫓는 매물 -> [(키워드, 순위, 훑은 건수)]
     unique = {"window_missed": set(), "filter_missed": set(), "fresh": set(),
-              "window_ids": set(), "tracked_in_window": set()}
+              "window_ids": set(), "tracked_in_window": set(),
+              "tracked_scanned": set()}
     for search in SEARCHES:
         keyword, categories = search["query"], search["categories"]
         filtered, found = await walk(api, keyword, categories, pages, sort)
+        # 나이는 **이 키워드를 조회하고 난 시각**으로 잽니다. 스캔 시작 시각 하나로
+        # 전부 재면, 뒤에 도는 패스일수록 기준이 과거라 나이가 음수로 나옵니다.
+        scanned_at = datetime.now().timestamp()
+        fresh_after = scanned_at - fresh_hours * 3600
         await asyncio.sleep(PAGE_PAUSE_SECONDS)
 
         inside, outside = split_by_window(filtered)
@@ -502,11 +515,11 @@ async def census(
         checked_at = float(checked_at) if isinstance(checked_at, (int, float)) else None
         fresh_in, missed_in, after_in = count_missed(inside, seen_ids, fresh_after, checked_at)
         fresh_out, missed_out, after_out = count_missed(outside, seen_ids, fresh_after, checked_at)
-        dwell = window_dwell(filtered, now)
+        dwell = window_dwell(filtered, scanned_at)
         inversions = order_inversions(filtered)
         inversions_updated = order_inversions(filtered, "updated")
-        young_ranks = young_item_ranks(filtered, now)
-        ages = missed_ages(filtered, seen_ids, fresh_after, now, checked_at)
+        young_ranks = young_item_ranks(filtered, scanned_at)
+        ages = missed_ages(filtered, seen_ids, fresh_after, scanned_at, checked_at)
 
         # 추적 중인 매물이 이 창 안에 있는가. 재출품 판정이 기대는 것이 바로 이것입니다.
         tracked_in = sum(1 for f in inside if extract_item_id(f) in seen_ids)
@@ -561,6 +574,9 @@ async def census(
         unique["tracked_in_window"].update(
             extract_item_id(f) for f in inside if extract_item_id(f) in seen_ids
         )
+        unique["tracked_scanned"].update(
+            extract_item_id(f) for f in filtered if extract_item_id(f) in seen_ids
+        )
         rows.append(
             {
                 "sort": sort,
@@ -578,7 +594,7 @@ async def census(
                 "dwell": dwell,
                 "inversions": inversions,
                 "inversions_updated": inversions_updated,
-                "oldest_in_window": oldest_in_window(filtered, now),
+                "oldest_in_window": oldest_in_window(filtered, scanned_at),
                 "beyond_newer": newer_beyond_window(filtered),
                 "peak_1m": peak_arrivals(filtered, 60),
                 "peak_5m": peak_arrivals(filtered, 5 * 60),
@@ -664,7 +680,6 @@ async def scan(
     api = Mercapi()
     seen_ids, keyword_checked_at = load_state()
     now = datetime.now().timestamp()
-    fresh_after = now - fresh_hours * 3600
     stamps = [v for v in keyword_checked_at.values() if isinstance(v, (int, float))]
     lag = (now - max(stamps)) / 60 if stamps else None
     print(
@@ -690,7 +705,7 @@ async def scan(
                       " 오래 올라와 있는 매물을 봅니다."))
         print("=" * 78)
         rows, unique, excluded, found_at = await census(
-            api, sort, pages, fresh_after, now, seen_ids, keyword_checked_at,
+            api, sort, pages, fresh_hours, seen_ids, keyword_checked_at,
             check_filter and sort == "created", track, sellers,
         )
         all_rows[sort], all_unique[sort] = rows, unique
@@ -730,13 +745,49 @@ async def scan(
             "   없다'가 사라짐의 증거가 아니라 **평소 상태**입니다."
         )
     if track:
-        report_tracked(track, all_found, seen_ids, sorts)
+        report_tracked(track, all_found, seen_ids, sorts,
+                       await still_on_sale(api, track))
     if len(sorts) > 1:
         report_combined(all_rows, all_unique, seen_ids)
     print("완료")
 
 
-def report_tracked(track: set, all_found: dict, seen_ids: set, sorts: tuple) -> None:
+async def still_on_sale(api, item_ids: set) -> dict:
+    """쫓는 매물이 **지금도 팔리지 않고 올라와 있는지** 하나씩 물어봅니다.
+
+    왜 필요한가: 검색으로 '훑은 범위에 없음'이 나와도 두 가지가 갈리지 않습니다 —
+    이미 팔려서 없는 것과, 아직 올라와 있는데 순위가 한참 뒤라 못 본 것입니다.
+    재출품 오판을 설명하려면 **뒤쪽**이어야 합니다. 앞쪽이면 '사라졌다'가 맞는
+    판정이었다는 뜻이니까요.
+
+    `Mercapi.item()`은 봇이 쓰지 않는 표면이라 `tests/test_mercapi_surface.py`가
+    지키지 않습니다. 그래서 실패를 삼키고 '확인 실패'로 돌려줍니다 — 이 조회 하나
+    때문에 스캔 전체가 죽으면 안 됩니다.
+    """
+    states: dict = {}
+    for item_id in sorted(item_ids):
+        try:
+            item = await api.item(item_id)
+        except Exception as exc:
+            states[item_id] = f"확인 실패({type(exc).__name__})"
+            await asyncio.sleep(PAGE_PAUSE_SECONDS)
+            continue
+        if item is None:
+            states[item_id] = "없음(삭제)"
+        else:
+            status = str(getattr(item, "status", "") or "")
+            states[item_id] = {
+                "ITEM_STATUS_ON_SALE": "판매중",
+                "ITEM_STATUS_SOLD_OUT": "판매완료",
+                "ITEM_STATUS_STOP": "중지",
+                "ITEM_STATUS_TRADING": "거래중",
+            }.get(status, status or "상태 모름")
+        await asyncio.sleep(PAGE_PAUSE_SECONDS)
+    return states
+
+
+def report_tracked(track: set, all_found: dict, seen_ids: set, sorts: tuple,
+                   on_sale: dict | None = None) -> None:
     """이름을 대고 쫓는 매물이 **지금** 어느 창의 몇 등에 있는지.
 
     재출품 오판에서 '사라졌다'로 읽힌 예전 매물들을 여기에 넣습니다. 그 판정은
@@ -764,8 +815,21 @@ def report_tracked(track: set, all_found: dict, seen_ids: set, sorts: tuple) -> 
                 f"{sort_label(sort)}: [{best[0]}] {best[1] + 1}등({where})"
                 f" · 걸린 키워드 {len(hits)}개"
             )
-        state = "추적 중" if item_id in seen_ids else "상태 파일에 없음"
-        print(f"   {item_id:<26} {state:<12} | " + " | ".join(marks))
+        state = (on_sale or {}).get(item_id) or (
+            "추적 중" if item_id in seen_ids else "상태 파일에 없음")
+        print(f"   {item_id:<26} {state:<14} | " + " | ".join(marks))
+    if on_sale:
+        alive = [i for i, state in on_sale.items() if state == "판매중"]
+        hidden = [i for i in alive
+                  if not any((all_found.get(sort) or {}).get(i) for sort in sorts)]
+        print(
+            f"\n   지금도 판매중인 것 {len(alive)}/{len(track)}건,"
+            f" 그중 훑은 범위(두 패스 모두)에 **안 나오는 것 {len(hidden)}건**."
+        )
+        print(
+            "   판매중인데 안 나온다면 '사라졌다'가 아니라 '순위가 너무 뒤'입니다 —\n"
+            "   재출품 판정이 읽은 그 '없음'의 정체가 이것입니다."
+        )
 
 
 def report_combined(all_rows: dict, all_unique: dict, seen_ids: set) -> None:
@@ -775,13 +839,13 @@ def report_combined(all_rows: dict, all_unique: dict, seen_ids: set) -> None:
     그래서 이 숫자가 판정의 바닥입니다 — 추적 중인 매물 중 한 번의 전체 조회에서
     실제로 눈에 들어오는 비율이 낮으면, '결과에 없다'는 사라짐의 증거가 될 수 없습니다.
     """
-    visible = set()
-    tracked_visible = set()
+    visible, tracked_visible, tracked_scanned = set(), set(), set()
     for sort, unique in all_unique.items():
         visible |= unique["window_ids"]
         tracked_visible |= unique["tracked_in_window"]
-    visible.discard(None)
-    tracked_visible.discard(None)
+        tracked_scanned |= unique["tracked_scanned"]
+    for group in (visible, tracked_visible, tracked_scanned):
+        group.discard(None)
     print()
     print("=" * 78)
     print("■ 두 패스를 합치면 — 한 번의 전체 조회에서 봇이 실제로 보는 것")
@@ -796,12 +860,31 @@ def report_combined(all_rows: dict, all_unique: dict, seen_ids: set) -> None:
         "\n   이 비율이 낮으면 '이번 결과에 없다'는 **사라짐의 증거가 아닙니다.**\n"
         "   재출품 판정(confirm_disappearance)이 기대는 것이 바로 그 증거입니다."
     )
+    # 위 비율에는 **이미 팔린 매물**이 섞여 있습니다. 상태 파일은 팔린 매물을 지우지
+    # 않으므로, '안 보이는 것'에 '팔려서 안 보이는 것'이 함께 들어갑니다. 아래 값은
+    # 그 혼입이 없습니다 — **이번 조회에 실제로 걸린**(= 아직 올라와 있는) 매물만
+    # 놓고, 그중 몇 %가 창 안이었는지 봅니다.
+    if tracked_scanned:
+        share = len(tracked_visible) / len(tracked_scanned) * 100
+        print(
+            f"\n   팔린 매물을 걸러낸 값: 이번 조회에 걸린 추적 중 매물"
+            f" {len(tracked_scanned):,}건 가운데\n"
+            f"   창 안에 있던 것 {len(tracked_visible):,}건 ({share:.0f}%)."
+            " 나머지는 아직 올라와 있는데 창 밖입니다."
+        )
     for sort, rows in all_rows.items():
-        broken = [r["keyword"] for r in rows if r["young_ranks"] and not r["conveyor"]]
+        # 분모는 '최근 매물이 하나라도 있어서 실제로 확인이 된 키워드'입니다.
+        # 전체 키워드로 나누면, 최근 매물이 없어 확인조차 못 한 키워드가 '가정이
+        # 성립한 쪽'으로 세어져 깨진 비율이 묽어집니다.
+        measured = [row for row in rows if row["young_ranks"]]
+        broken = [row["keyword"] for row in measured if not row["conveyor"]]
+        worst = max((max(row["young_ranks"]) for row in measured), default=None)
         print(
             f"\n   [{sort_label(sort)}] 컨베이어 가정(새 매물은 창 안 앞자리로 들어온다)이"
-            f" 깨진 키워드 {len(broken)}/{len(rows)}개"
-            + (f"\n      {', '.join(broken[:6])}" if broken else "")
+            f" 깨진 키워드 {len(broken)}/{len(measured)}개"
+            + (f" · 최근 1시간 매물이 꽂힌 가장 뒷자리 {worst + 1}등"
+               if worst is not None else "")
+            + (f"\n      {', '.join(broken)}" if broken else "")
         )
 
 

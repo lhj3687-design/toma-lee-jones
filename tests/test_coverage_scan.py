@@ -516,8 +516,92 @@ class SellerVisibilityTests(unittest.TestCase):
         api = Api({"filtered": [], "all": []}, {"filtered": 0, "all": 0})
         rows, _, _, _ = asyncio.run(
             coverage_scan.census(
-                api, "score", 1, 0.0, datetime.now().timestamp(), set(), {},
+                api, "score", 1, 24.0, set(), {},
                 check_filter=False, sellers={"119903670"},
             )
         )
         self.assertEqual((rows[0]["seller_in"], rows[0]["seller_out"]), (1, 2))
+
+
+class AgeMeasurementTests(unittest.TestCase):
+    """나이를 재는 기준 시각이 조회보다 앞서면 안 됩니다.
+
+    2026-09-14 실측에서 실제로 났던 일입니다 — 스캔 시작 시각 하나로 모든 패스의
+    나이를 쟀는데, 추천순 패스는 그보다 몇 분 뒤에 돌기 때문에 창 깊이가
+    '-3분치'로 찍혔습니다. 매물이 조회보다 나중에 올라올 수는 없으니 음수는
+    **잰 방법이 틀렸다는 뜻**인데, 작은 음수는 그럴듯해 보여서 그냥 지나갈 수
+    있습니다. 그래서 두 군데를 막습니다.
+    """
+
+    def test_a_negative_span_is_reported_as_a_broken_measurement(self):
+        self.assertEqual(coverage_scan.format_span(-3.0), "⛔잰 방법 틀림")
+        self.assertEqual(coverage_scan.format_span(-0.2), "⛔잰 방법 틀림")
+        self.assertEqual(coverage_scan.format_span(None), "창이 남음")
+        self.assertEqual(coverage_scan.format_span(30.0), "30분치")
+
+    def test_each_keyword_is_aged_against_its_own_scan_time(self):
+        """뒤에 도는 패스도 나이가 음수로 나오면 안 됩니다."""
+        saved = (coverage_scan.SEARCHES, coverage_scan.PAGE_PAUSE_SECONDS,
+                 coverage_scan.SEEN_FILE)
+        coverage_scan.PAGE_PAUSE_SECONDS = 0
+        coverage_scan.SEARCHES = [{"query": "kw", "categories": []}]
+        state = Path(tempfile.mkdtemp()) / "seen_items.json"
+        state.write_text(json.dumps({"seen": {}, "keyword_checked_at": {}}))
+        coverage_scan.SEEN_FILE = state
+        try:
+            window = coverage_scan.MAX_ITEMS_PER_KEYWORD
+            # 조회 직전에 올라온 매물이 창 밖 첫 자리에 있는 경우입니다.
+            items = [FakeItem(f"오래된-{i}", created=datetime.now() - timedelta(days=9))
+                     for i in range(window + 5)]
+            items[window] = FakeItem("갓 올라옴", created=datetime.now())
+
+            class Api(FakeApi):
+                async def search(self, keyword, categories=(), **options):
+                    return FakeResults([items], 0, len(items))
+
+            api = Api({"filtered": [], "all": []}, {"filtered": 0, "all": 0})
+            rows, _, _, _ = asyncio.run(
+                coverage_scan.census(api, "score", 1, 24.0, set(), {}, check_filter=False)
+            )
+            depths = [minutes for _, minutes in rows[0]["dwell"] if minutes is not None]
+            self.assertTrue(depths)
+            self.assertTrue(all(depth >= 0 for depth in depths), depths)
+        finally:
+            (coverage_scan.SEARCHES, coverage_scan.PAGE_PAUSE_SECONDS,
+             coverage_scan.SEEN_FILE) = saved
+
+
+class OnSaleCheckTests(unittest.TestCase):
+    """'훑은 범위에 없음'이 '팔렸다'인지 '순위가 뒤'인지 갈라 줍니다.
+
+    갈리지 않으면 재출품 오판을 설명할 수 없습니다 — 팔린 것이면 '사라졌다'가
+    맞는 판정이었다는 뜻이니까요.
+    """
+
+    def _api(self, results):
+        class Api:
+            async def item(self, item_id):
+                value = results[item_id]
+                if isinstance(value, Exception):
+                    raise value
+                return value
+        return Api()
+
+    def test_statuses_are_translated_and_failures_do_not_kill_the_scan(self):
+        saved = coverage_scan.PAGE_PAUSE_SECONDS
+        coverage_scan.PAGE_PAUSE_SECONDS = 0
+        try:
+            api = self._api({
+                "살아있음": types.SimpleNamespace(status="ITEM_STATUS_ON_SALE"),
+                "팔림": types.SimpleNamespace(status="ITEM_STATUS_SOLD_OUT"),
+                "지워짐": None,
+                "터짐": RuntimeError("boom"),
+            })
+            states = asyncio.run(coverage_scan.still_on_sale(
+                api, {"살아있음", "팔림", "지워짐", "터짐"}))
+            self.assertEqual(states["살아있음"], "판매중")
+            self.assertEqual(states["팔림"], "판매완료")
+            self.assertEqual(states["지워짐"], "없음(삭제)")
+            self.assertTrue(states["터짐"].startswith("확인 실패"))
+        finally:
+            coverage_scan.PAGE_PAUSE_SECONDS = saved
