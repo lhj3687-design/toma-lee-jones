@@ -62,22 +62,32 @@ MAX_SEARCH_PAGES = 3  # 새 매물이 한 페이지를 가득 채웠을 때만 �
 # 그래서 관측된 경계의 약 4배로 잡습니다. 상태 파일은 이 상한에서 약 7.7MB가 됩니다.
 MAX_SEEN_ITEMS = 30000
 MAX_RELIST_FINGERPRINTS = 30000
-# 재출품 판정을 미뤄 둔 기록. '예전 매물이 정말 사라졌는지'를 시간으로 확인하는 동안만
+# 재출품 판정을 미뤄 둔 기록. 예전 매물을 직접 물어봤는데 답을 못 얻는 동안만
 # 남아 있습니다(아래 confirm_disappearance 참고). 동시에 몇 건 이상 쌓일 일이 없지만,
 # 판정 도중 매물이 팔려서 다시 조회되지 않으면 그 기록은 스스로 사라지지 않으므로
 # 상한과 수명을 둡니다.
 MAX_PENDING_RELISTS = 500
 PENDING_RELIST_TTL_SECONDS = 24 * 60 * 60
-# '이번 조회 결과에 없다'는 사라졌다는 뜻이 아닙니다. 키워드당 상위 120건만 보기 때문에,
-# 버젓이 올라와 있는 매물도 순위가 밀리면 그대로 결과에서 빠집니다. 그래서 지문의 주인이
-# 이 시간 동안 한 번도 다시 나타나지 않아야 '사라졌다'로 인정합니다.
-# 실측(2026-09-13): 확실한 오판 36건 중 28건은 예전 매물이 2분 안에 다시 관측됐고,
-# 중앙값은 81초였습니다. 10분이면 전체 조회(5분 간격)를 최소 두 번 거칩니다.
+# 직접 조회가 계속 실패할 때 언제 포기할지. 답을 못 얻은 채로 이 시간이 지나고
+# MIN_RELIST_ABSENCE_CHECKS번 이상 헛물을 켰으면 '사라짐을 확인하지 못했다'로 끝냅니다.
+# (끝낸 결과는 '별개의 매물'입니다 — 아래 confirm_disappearance 참고.)
 RELIST_ABSENCE_SECONDS = 10 * 60
 # 시간만으로는 부족합니다. 봇이 몇 시간 멈춰 있다 깨어난 실행 하나가 '10분이 지났다'는
-# 이유로 판정을 내리면, 실제로 확인한 것은 한 번뿐입니다. 전체 조회로 실제 확인한
-# 횟수도 함께 셉니다.
+# 이유로 판정을 끝내면, 실제로 물어본 것은 한 번뿐입니다. 실제 시도 횟수도 함께 셉니다.
 MIN_RELIST_ABSENCE_CHECKS = 2
+# 한 실행에서 '예전 매물이 아직 있는지'를 직접 물어보는 조회의 상한입니다.
+# 실측(2026-09-14 03:14~13:34 UTC, 상태 파일 1,429판, 실행 약 619회): 물어볼 자리는
+# 106건으로 실행당 0.17회, 물어볼 것이 있는 실행 자체가 12.6%였고 한 실행 최대가
+# 4건이었습니다. 즉 평소에는 이 상한에 닿지 않습니다(관측 최대의 3배로 잡았습니다).
+#
+# 상한을 두는 이유는 조회량이 아니라 **시간**입니다. concurrency 때문에 한 실행이
+# 길어지는 동안 봇 전체가 멈추므로(README "한 실행이 오래 붙잡고 있지 않게 하는 장치"),
+# 지문이 한꺼번에 터지는 이상 상황에서 조회 단계가 통째로 늘어지면 안 됩니다.
+# 넘친 것은 버리지 않고 다음 실행에서 다시 봅니다.
+MAX_RELIST_LOOKUPS_PER_RUN = 12
+MAX_RELIST_LOOKUP_SECONDS_PER_RUN = 20
+# 조회 사이 간격. 검색이 페이지 사이에 두는 간격과 같게 둡니다.
+RELIST_LOOKUP_PAUSE_SECONDS = 1.0
 PRICE_DROP_ALERT_THRESHOLD = 1000  # 마지막 알림 가격보다 이 금액(엔) 이상 떨어졌을 때만 알립니다.
 MAX_PENDING_ALERTS = 500
 # 이미 보낸 알림 목록. 같은 알림이 두 번 나가는 걸 막는 마지막 방어선입니다.
@@ -664,6 +674,33 @@ def relist_fingerprint(seller_id, name, price) -> str | None:
     return None
 
 
+def listing_name(fields) -> str:
+    """알림과 지문에 쓰는 제목."""
+    return fields.get("name") or extract_field(fields, ["name", "title"], "(제목 없음)")
+
+
+def listing_price(fields) -> int | None:
+    """알림과 지문에 쓰는 가격. 모르면 None입니다.
+
+    가격 비공개(`is_no_price`) 매물은 price에 9999999가 들어옵니다. 그대로 두면
+    말도 안 되는 가격 인하 알림의 기준가가 되므로 '가격 모름'으로 취급합니다.
+    """
+    if fields.get("is_no_price"):
+        return None
+    price = fields.get("price")
+    return int(price) if isinstance(price, Decimal) else price
+
+
+def is_shop_product_id(item_id) -> bool:
+    """숍스 상품 ID인지. 일반 매물은 `m` + 숫자입니다.
+
+    **엔드포인트가 갈립니다.** 숍스 ID로 `Mercapi.item()`을 부르면 응답에 `"data"` 키가
+    없어 KeyError로 터집니다(2026-09-14 실측: 쫓던 12건 전부 그랬습니다). 가르지 않으면
+    재출품 오판이 몰리는 판매자의 매물이 전부 숍스라 확인이 한 건도 답을 못 냅니다.
+    """
+    return not MERCARI_ITEM_ID_PATTERN.match(str(item_id))
+
+
 def extract_field(item, candidates, default=None):
     """여러 후보 필드명 중 값이 있는 첫 번째를 돌려줍니다(매물 객체/dict 둘 다 허용)."""
     data = item_fields(item)
@@ -1037,6 +1074,10 @@ async def check_keyword(
     items, succeeded, _coverage = await search_items(m, keyword, categories, created_cutoff)
     if not succeeded:
         return False
+    listed_ids = listed_item_ids(items)
+    survival = await lookup_survival(
+        m, relist_lookup_targets(items, seen, relist_fingerprints or {}, listed_ids)
+    )
     process_items(
         keyword,
         items,
@@ -1044,6 +1085,8 @@ async def check_keyword(
         relist_fingerprints,
         new_items,
         created_cutoff,
+        listed_ids=listed_ids,
+        survival=survival,
         pending_relists=pending_relists,
     )
     return True
@@ -1080,24 +1123,35 @@ def confirm_disappearance(
     pending_relists: dict,
     now: float,
     fresh: bool,
-    can_confirm_absence: bool,
+    survival: dict | None = None,
 ) -> tuple[str, bool]:
     """처음 보는 ID가 기존 지문의 가격 이력을 물려받아도 되는지 판정합니다.
 
-    판정의 핵심은 '예전 매물이 정말 사라졌는가'인데, **이번 조회 결과에 없다는 것은
-    사라졌다는 뜻이 아닙니다.** 키워드당 상위 120건만 보기 때문에, 버젓이 올라와 있는
-    매물도 순위가 밀리면 결과에서 빠집니다. 실제로 그래서 서로 다른 두 매물이 하나로
-    묶였습니다(README "재출품 감지" 참고).
+    판정의 핵심은 '예전 매물이 정말 사라졌는가'입니다. 예전에는 그것을 **이번 조회
+    결과에 있는가**로 대신 읽었는데, 그 대리 지표는 거의 아무 정보도 담고 있지
+    않았습니다 — 조회에 걸린 추적 매물 가운데 봇의 창 안에 들어와 있는 것은 (이미 팔린
+    것을 걸러내고도) 34~36%뿐입니다. 나머지는 버젓이 올라와 있는데 순위가 뒤라 안 보이는
+    것뿐이고, 그래서 '사라졌다'고 판정된 12건을 이름 대고 쫓았더니 **12건 전부 상품
+    페이지가 아직 있었습니다**(README "추천순(score) 창은 …" 참고).
 
-    그래서 없다는 것 하나로는 판정하지 않고, **다시 나타나지 않는 것을 시간으로**
-    확인합니다.
+    그래서 지금은 판정 직전에 **그 매물 하나를 직접 물어봅니다**(`survival`).
 
       - 예전 매물이 이번 결과에 있음 -> 살아 있습니다. 즉시 '별개의 매물'("alive").
-        있다는 것은 빠른 조회(등록순만)에서도 확실한 증거이므로 바로 씁니다.
-      - 없음 -> 아직 모릅니다("wait"). 이번 실행은 이 매물의 상태를 건드리지 않고,
-        보류 기록만 남겨 다음 실행이 이어서 확인합니다.
-      - RELIST_ABSENCE_SECONDS 동안 전체 조회로 MIN_RELIST_ABSENCE_CHECKS번 이상
-        확인했는데도 한 번도 안 나타남 -> 사라진 것으로 봅니다("gone").
+        있다는 것은 어느 조회에서든 확실한 증거라, 조회를 아끼려고 먼저 봅니다.
+      - 직접 조회가 '있다'고 함 -> 곧바로 '별개의 매물'("alive").
+      - 직접 조회가 '없다'(404)고 함 -> 곧바로 '사라짐'("gone").
+      - 물어보지 못했거나 답이 안 옴 -> 아직 모릅니다("wait"). 보류 기록만 남기고
+        다음 실행이 이어서 물어봅니다.
+
+    **못 물어본 것을 '사라졌다'로 읽지 않습니다.** 이 저장소가 같은 함정에 두 번
+    빠졌습니다 — 판매 여부 확인이 12건 전부 실패했는데 요약이 "판매중 0/12건"으로
+    찍히고 있었고, 재출품 판정 자체가 '못 본 것'을 '없어진 것'으로 읽고 있었습니다.
+    그래서 답을 못 얻은 채 RELIST_ABSENCE_SECONDS가 지나고 MIN_RELIST_ABSENCE_CHECKS번
+    이상 헛물을 켜면 포기하는데, 포기한 결과는 **'별개의 매물'**입니다. 틀렸을 때
+    치르는 값이 한쪽으로 기울어 있기 때문입니다 — 재출품을 신규로 오인하면 알림이 한 건
+    더 가서 눈에 보이지만, 별개의 매물을 재출품으로 오인하면 그 매물의 신규 알림이
+    **조용히 삼켜집니다**(그게 이 라운드에서 고치는 오판입니다). 직접 조회가 통째로
+    망가지면 알림이 늘어 시끄러워질 뿐, 잃지는 않습니다.
 
     두 번째 값은 '처음 봤을 때 갓 올라온 매물이었는지'입니다. 판정을 미루는 동안
     키워드의 조회 기준선이 전진하므로, 나중에 '별개의 매물'로 결론이 나도 그때 다시
@@ -1116,15 +1170,23 @@ def confirm_disappearance(
         pending_relists.pop(item_id, None)
         return "alive", was_fresh
 
-    if can_confirm_absence and entry.get("checked_at") != now:
+    alive = (survival or {}).get(matched_id, "unasked")
+    if alive is True:
+        pending_relists.pop(item_id, None)
+        return "alive", was_fresh
+    if alive is False:
+        pending_relists.pop(item_id, None)
+        return "gone", was_fresh
+
+    if alive is None and entry.get("checked_at") != now:
+        # 물어봤는데 답이 안 온 경우만 헛물로 셉니다. 상한에 걸려 아예 못 물어본 것
+        # ("unasked")은 세지 않습니다 — 세면 묻지도 않고 포기하게 됩니다.
         # 한 실행에서 여러 키워드가 같은 매물을 물고 올 수 있어, 실행당 한 번만 셉니다.
         entry["checks"] = int(entry.get("checks") or 0) + 1
-    # 빠른 조회에서도 '이 매물을 언제 마지막으로 봤는지'는 적어 둡니다. 확인 횟수는
-    # 전체 조회에서만 늘지만, 이 값이 없으면 상태 파일만 보고는 **확인이 진행 중인
-    # 보류인지, 매물이 검색에서 사라져 수명만 기다리는 보류인지 구분할 수 없습니다.**
-    # 실측(2026-09-14 배포 직후 65분): 보류 26건이 생기는 동안 결론이 난 건 1건이고
-    # 나머지는 매물이 다시 조회되지 않아 그대로 남았는데, 그 사실을 확인하려고
-    # Actions 실행 로그까지 뒤져야 했습니다.
+    # '이 매물을 언제 마지막으로 봤는지'는 못 물어본 실행에서도 적어 둡니다. 이 값이
+    # 없으면 상태 파일만 보고는 **확인이 진행 중인 보류인지, 매물이 검색에서 사라져
+    # 수명만 기다리는 보류인지 구분할 수 없습니다.** 실측(2026-09-14 배포 직후 65분)에서
+    # 그 사실을 확인하려고 Actions 실행 로그까지 뒤져야 했습니다.
     entry["checked_at"] = now
 
     since = entry.get("since")
@@ -1133,9 +1195,109 @@ def confirm_disappearance(
         now - since >= RELIST_ABSENCE_SECONDS
         and int(entry.get("checks") or 0) >= MIN_RELIST_ABSENCE_CHECKS
     ):
+        # 확인을 포기합니다. 사라짐을 확인하지 못했으므로 사라진 것이 아닙니다.
         pending_relists.pop(item_id, None)
-        return "gone", was_fresh
+        return "unconfirmed", was_fresh
     return "wait", was_fresh
+
+
+def relist_lookup_targets(
+    items: list[dict],
+    seen: dict,
+    relist_fingerprints: dict,
+    listed_ids: set[str],
+) -> set[str]:
+    """이번 실행에서 직접 물어봐야 할 '예전 매물' ID들.
+
+    `process_items()`가 `confirm_disappearance()`를 부르게 되는 자리와 **같은 조건**으로
+    추립니다. 미리 추려 두는 이유는 둘입니다.
+
+      - 조회는 async인데 판정은 sync입니다. 판정 한복판에서 await할 수가 없습니다.
+      - 한 실행에서 여러 키워드가 같은 예전 매물을 물고 오므로, 한 번만 물어봅니다.
+        실측(2026-09-14, 10.32시간): 물어볼 자리 106건이 관측 단위로는 387번이었습니다.
+
+    조건이 `process_items()`와 갈라지면 조회해 놓고 안 쓰거나(낭비) 필요한데 못 물어보는
+    (판정이 영영 보류) 일이 생깁니다. `test_lookup_targets_match_what_the_judgment_asks`가
+    두 자리에 같은 입력을 넣어 집합이 정확히 같은지 지킵니다.
+    """
+    targets: set[str] = set()
+    for fields in items:
+        item_id = extract_item_id(fields)
+        if not item_id or item_id in seen:
+            continue
+        fingerprint = relist_fingerprint(
+            extract_seller_id(fields), listing_name(fields), listing_price(fields)
+        )
+        matched = relist_fingerprints.get(fingerprint) if fingerprint else None
+        matched_id = matched.get("item_id") if isinstance(matched, dict) else None
+        if not matched_id or matched_id == item_id or matched_id in listed_ids:
+            continue
+        targets.add(str(matched_id))
+    return targets
+
+
+async def fetch_listing(m: Mercapi, item_id: str):
+    """매물 하나를 **알맞은 엔드포인트로** 가져옵니다. 없으면(404) None입니다.
+
+    엔드포인트를 가르는 자리를 한 곳에만 둡니다. 예전에 `coverage_scan`이 이 갈림을
+    따로 들고 있다가 숍스 ID로 `item()`을 불러 확인 12건이 전부 KeyError로 죽었고,
+    그런데도 요약은 "판매중 0/12건"으로 찍혔습니다.
+    """
+    if is_shop_product_id(item_id):
+        return await m.product(item_id)
+    return await m.item(item_id)
+
+
+async def lookup_survival(
+    m: Mercapi,
+    item_ids: set[str],
+    limit: int = MAX_RELIST_LOOKUPS_PER_RUN,
+) -> dict:
+    """예전 매물이 지금도 상품 페이지를 가지고 있는지 하나씩 직접 묻습니다.
+
+    돌려주는 값은 ID -> True(있음) / False(없음) / None(물어봤지만 답을 못 얻음)입니다.
+    **세 번째를 False로 뭉치면 안 됩니다.** 못 잰 것을 '없다'로 읽는 것이 지금 고치고
+    있는 결함 그 자체입니다.
+
+    무엇을 묻는가: '팔렸는가'가 아니라 **'페이지가 아직 있는가'**입니다. 재출품은
+    판매자가 매물을 지우고 다시 올리는 것이라, 갈라야 하는 것은 삭제 여부입니다.
+    팔렸어도 페이지가 남아 있으면 그 매물은 지워지지 않은 것이고, 새 ID는 그것의
+    재출품이 아니라 별개의 매물입니다(팔린 매물의 기준가를 물려받으면 안 됩니다).
+
+    **이 물음이라서 숍스 상품도 답이 나옵니다.** 숍스 응답에는 판매 상태 필드가 없어
+    '팔렸는가'는 못 가리지만, 없는 상품은 404라 `Mercapi.product()`가 None을 돌려줍니다.
+    오판이 몰리는 쪽이 하필 숍스(판매자 119903670)라, 여기서 답이 안 나오면 이 설계는
+    절반만 듣습니다.
+    """
+    survival: dict = {}
+    if not item_ids:
+        return survival
+    asked = sorted(item_ids)[:limit]
+    started = current_time()
+    for index, item_id in enumerate(asked):
+        if index:
+            if current_time() - started >= MAX_RELIST_LOOKUP_SECONDS_PER_RUN:
+                # 시간 상한. 여기서 멈추는 것은 답을 못 얻은 것과 다릅니다 —
+                # 아예 묻지 않았으므로 헛물로도 세지 않게 아무 값도 남기지 않습니다.
+                asked = asked[:index]
+                break
+            await asyncio.sleep(RELIST_LOOKUP_PAUSE_SECONDS)
+        try:
+            found = await fetch_listing(m, item_id)
+        except Exception as exc:
+            # 답을 못 얻은 것은 '없다'가 아닙니다. None으로 남겨 다음 실행이 다시 묻습니다.
+            survival[item_id] = None
+            print(f"[재출품] {item_id} 확인 실패({type(exc).__name__}) -> 판정 보류", file=sys.stderr)
+            continue
+        survival[item_id] = found is not None
+    if len(item_ids) > len(asked):
+        print(
+            f"[재출품] 직접 확인할 매물 {len(item_ids)}건 중 {len(asked)}건만 물어봤습니다"
+            f" (실행당 상한 {limit}건 / {MAX_RELIST_LOOKUP_SECONDS_PER_RUN}초,"
+            " 나머지는 다음 실행에서 다시 봅니다)",
+            file=sys.stderr,
+        )
+    return survival
 
 
 def process_items(
@@ -1146,7 +1308,7 @@ def process_items(
     new_items: list,
     created_cutoff: float | None = None,
     listed_ids: set[str] | None = None,
-    can_resolve_relists: bool = True,
+    survival: dict | None = None,
     pending_relists: dict | None = None,
     now: float | None = None,
 ) -> None:
@@ -1155,12 +1317,11 @@ def process_items(
     listed_ids는 '이번 실행에서 살아 있는 것이 확인된 매물 ID' 집합입니다.
     한 키워드의 결과만으로 판단하면, 같은 판매자가 제목이 똑같은 상품을 여러 개 올렸는데
     카테고리 필터 때문에 한쪽만 검색에 잡히는 경우 별개의 매물을 재출품으로 오인합니다.
-    그래서 이번 실행의 모든 키워드 결과를 합쳐서 넘겨줍니다.
+    그래서 이번 실행의 모든 키워드 결과를 합쳐서 넘겨줍니다. 다만 여기 **없다는 것에는
+    아무 뜻이 없습니다** — 그래서 재출품 판정은 survival을 봅니다.
 
-    can_resolve_relists는 '이번 실행의 결과로 사라짐을 확인해도 되는지'입니다.
-    빠른 조회(등록순만)는 오래 올라와 있는 매물을 아예 훑지 않으므로 없다는 사실에
-    아무 뜻이 없습니다. 반대로 **있다는 사실은 어느 조회에서든 확실한 증거**라서,
-    빠른 조회에서도 '별개의 매물' 판정은 그대로 씁니다.
+    survival은 `lookup_survival()`이 예전 매물 하나하나에 직접 물어본 답입니다
+    (ID -> 있음/없음/못 물어봄). 없으면 판정은 전부 보류되고 다음 실행이 다시 묻습니다.
     """
     if listed_ids is None:
         listed_ids = listed_item_ids(items)
@@ -1174,6 +1335,7 @@ def process_items(
     relist_count = 0
     stale_count = 0
     deferred_count = 0
+    unconfirmed_count = 0
     # 상태 갱신은 실행과 무관한 순서로 합니다(state_update_order 주석 참고).
     # 알림 순서는 아래에서 최신 매물이 먼저 나가도록 되돌립니다.
     alerts_start = len(new_items)
@@ -1181,14 +1343,8 @@ def process_items(
         item_id = extract_item_id(fields)
         if not item_id:
             continue
-        name = fields.get("name") or extract_field(fields, ["name", "title"], "(제목 없음)")
-        price = fields.get("price")
-        if isinstance(price, Decimal):
-            price = int(price)
-        # 가격 비공개(is_no_price) 매물은 price에 9999999가 들어옵니다. 그대로 두면
-        # 말도 안 되는 가격 인하 알림의 기준가가 되므로 '가격 모름'으로 취급합니다.
-        if fields.get("is_no_price"):
-            price = None
+        name = listing_name(fields)
+        price = listing_price(fields)
         photo = extract_field(fields, ["thumbnails", "photos", "thumbnail", "image_url"])
         if isinstance(photo, (list, tuple)):
             photo = photo[0] if photo else None
@@ -1197,7 +1353,7 @@ def process_items(
 
         # item_type에 "SHOP"이 찍히거나, ID가 일반 매물 형식(m+숫자)이 아니면 숍스 상품으로 간주합니다.
         item_type = str(extract_field(fields, ["item_type"], "")).upper()
-        is_shop_item = "SHOP" in item_type or not MERCARI_ITEM_ID_PATTERN.match(str(item_id))
+        is_shop_item = "SHOP" in item_type or is_shop_product_id(item_id)
         item_url = (
             f"https://jp.mercari.com/shops/product/{item_id}"
             if is_shop_item
@@ -1225,9 +1381,9 @@ def process_items(
                 # 같은 ID의 지문이 남아 있음 = 예전에 확인했는데 seen에서만 밀려난 매물.
                 record = restored
             elif matched and matched_id is not None:
-                # 지문의 주인이 지금도 버젓이 올라와 있다면 재출품이 아니라 별개의 매물입니다.
-                # 없다고 해서 사라진 것은 아니므로(상위 120건 창 밖으로 밀리기만 해도
-                # 결과에서 빠집니다) 사라짐은 시간을 두고 확인합니다.
+                # 지문의 주인이 지금도 올라와 있다면 재출품이 아니라 별개의 매물입니다.
+                # 이번 검색 결과에 없다는 것으로는 사라짐을 알 수 없으므로(순위가 밀리기만
+                # 해도 결과에서 빠집니다) 그 매물 하나를 직접 물어본 답으로 판정합니다.
                 verdict, was_fresh = confirm_disappearance(
                     item_id,
                     matched_id,
@@ -1235,7 +1391,7 @@ def process_items(
                     pending_relists,
                     now,
                     fresh,
-                    can_resolve_relists,
+                    survival,
                 )
                 if verdict == "wait":
                     # 아직 모릅니다. 이번 실행은 이 매물의 상태를 건드리지 않고 넘어갑니다.
@@ -1247,8 +1403,12 @@ def process_items(
                     record = restored
                     relist_count += 1
                 else:
+                    # "alive"(살아 있는 것을 확인) 또는 "unconfirmed"(끝내 못 물어봄).
+                    # 둘 다 사라짐이 확인되지 않았으므로 별개의 매물로 다룹니다.
                     record = None
                     fresh = was_fresh
+                    if verdict == "unconfirmed":
+                        unconfirmed_count += 1
             else:
                 record = None
 
@@ -1322,6 +1482,7 @@ def process_items(
         f"(신규 {new_count}개, 재출품 {relist_count}개, 가격인하 {drop_count}개, "
         f"오래된 매물 {stale_count}개 조용히 기록"
         + (f", 판정 보류 {deferred_count}개" if deferred_count else "")
+        + (f", 사라짐 확인 못 함 {unconfirmed_count}개" if unconfirmed_count else "")
         + ")"
     )
 
@@ -1878,7 +2039,25 @@ async def collect_updates() -> None:
 
     report_feed_health(searched)
 
-    # 2단계: 모아 둔 결과로 알림을 판정합니다.
+    # 2단계: 재출품 판정에 걸릴 '예전 매물'들에게 아직 있는지 직접 물어봅니다.
+    # 검색 결과에 없다는 것으로는 사라짐을 알 수 없어서(추적 매물의 34~36%만 창 안에
+    # 들어옵니다) 판정이 기댈 곳이 여기뿐입니다. 키워드 루프 안이 아니라 여기서 한꺼번에
+    # 묻는 이유는 두 가지입니다 — 여러 키워드가 같은 예전 매물을 물고 오므로 한 번만
+    # 물으면 되고(실측 106건 대 387번), 위에서 합친 listed_ids로 이미 살아 있는 것이
+    # 확인된 매물은 물어볼 필요가 없기 때문입니다.
+    lookup_targets: set[str] = set()
+    for _keyword, items, checked, _coverage, _cutoff in searched:
+        if checked:
+            lookup_targets |= relist_lookup_targets(items, seen, relist_fingerprints, listed_ids)
+    survival = await lookup_survival(mercari, lookup_targets)
+    if survival:
+        alive = sum(1 for value in survival.values() if value is True)
+        gone = sum(1 for value in survival.values() if value is False)
+        unknown = len(survival) - alive - gone
+        print(f"[재출품] 예전 매물 {len(survival)}건 직접 확인 "
+              f"(아직 있음 {alive} / 없어짐 {gone} / 못 물어봄 {unknown})")
+
+    # 3단계: 모아 둔 결과로 알림을 판정합니다.
     for keyword, items, checked, coverage, cutoff in searched:
         keyword_is_new = keyword not in known_keywords
         # 조회 시각 기록이 아직 없는 키워드는 '신규' 판정의 기준선이 없는 상태입니다.
@@ -1895,7 +2074,7 @@ async def collect_updates() -> None:
                 keyword_items,
                 created_cutoff=cutoff,
                 listed_ids=listed_ids,
-                can_resolve_relists=full_scan,
+                survival=survival,
                 pending_relists=pending_relists,
                 now=now,
             )

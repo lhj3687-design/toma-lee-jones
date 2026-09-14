@@ -205,6 +205,12 @@ class FakeMercapi:
 
     실제 코드는 키워드마다 '등록순'과 '추천순'으로 두 번 조회한 뒤 결과를 합치므로,
     호출 횟수를 세어 두 번 불렸는지도 검증할 수 있게 합니다.
+
+    재출품 판정이 쓰는 **매물 단건 조회**(`item()`/`product()`)도 흉내 냅니다.
+    `live_ids`에 없는 매물은 실제 API와 같이 None을 돌려줍니다(404). 기본값은
+    "아무것도 안 남아 있다"라서, 따로 지정하지 않은 테스트에서는 예전 매물이 사라진
+    것으로 나옵니다. 엔드포인트도 실제와 같이 갈립니다 — 숍스 ID로 `item()`을 부르면
+    터집니다(운영에서 그것 때문에 확인 12건이 전부 실패했습니다).
     """
 
     def __init__(
@@ -214,6 +220,8 @@ class FakeMercapi:
         extra_pages_by_keyword=None,
         fail_call_indexes=None,
         fail_next_page_keywords=(),
+        live_ids=(),
+        fail_lookup_ids=(),
     ):
         self.items_by_keyword = items_by_keyword
         self.fail_keywords = set(fail_keywords)
@@ -222,8 +230,27 @@ class FakeMercapi:
         self.fail_next_page_keywords = set(fail_next_page_keywords)
         # 키워드별로 "몇 번째 조회를 실패시킬지" (0=등록순, 1=추천순)
         self.fail_call_indexes = fail_call_indexes or {}
+        # 단건 조회에서 "아직 상품 페이지가 있다"고 답할 매물들
+        self.live_ids = set(live_ids)
+        self.fail_lookup_ids = set(fail_lookup_ids)
         self.call_counts = {}
         self.calls = []
+        self.lookups = []
+
+    async def item(self, item_id):
+        if mercari.is_shop_product_id(item_id):
+            # 숍스 ID로 items/get을 부르면 응답에 "data" 키가 없어 터집니다.
+            raise KeyError("data")
+        return self._lookup(item_id)
+
+    async def product(self, product_id):
+        return self._lookup(product_id)
+
+    def _lookup(self, item_id):
+        self.lookups.append(item_id)
+        if item_id in self.fail_lookup_ids:
+            raise RuntimeError("단건 조회 실패 시뮬레이션")
+        return object() if item_id in self.live_ids else None
 
     async def search(self, keyword, categories=(), **options):
         index = self.call_counts.get(keyword, 0)
@@ -341,19 +368,19 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
     async def test_relist_with_same_seller_id_does_not_trigger_new_alert(self):
         # 같은 판매자가 삭제 후 새 ID로 재등록한 경우: '신규' 알림 없이
         # 예전 최저가 기록을 새 ID로 이어받아야 합니다.
-        # 다만 예전 매물이 정말 사라졌는지는 시간을 두고 확인하므로(아래 판정 보류
-        # 테스트들 참고), 확인 창이 지난 뒤에 판정이 납니다.
+        # 예전 매물이 정말 사라졌는지는 그 매물을 **직접 물어봐서** 확인하므로,
+        # 삭제된 것이 확인되면 그 자리에서 판정이 납니다(기다리지 않습니다).
         seen = {}
         relist_fingerprints = {}
         pending_relists: dict = {}
         new_items: list = []
         base = datetime.now().timestamp()
 
-        async def observe(item, at):
+        async def observe(item, at, live_ids=()):
             new_items.clear()
             with patch.object(mercari, "current_time", return_value=at):
                 await mercari.check_keyword(
-                    FakeMercapi({"test": [item]}),
+                    FakeMercapi({"test": [item]}, live_ids=live_ids),
                     "test",
                     [],
                     seen,
@@ -365,14 +392,10 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         await observe(FakeItem("m1000", "Margiela 초레어 카트소", 20000, seller_id="seller-A"), base)
         self.assertEqual([e["alert_id"] for e in new_items], ["new:m1000"])
 
-        # 판매자가 삭제 후 재등록: ID는 바뀌었지만 판매자+제목(공백/기호 차이만 있음)은 동일
+        # 판매자가 삭제 후 재등록: ID는 바뀌었지만 판매자+제목(공백/기호 차이만 있음)은 동일.
+        # 예전 매물 m1000은 이제 상품 페이지가 없습니다(live_ids에 없음).
         relisted = FakeItem("m2000", "  Margiela  초레어  카트소 ", 20000, seller_id="seller-A")
         await observe(relisted, base + 60)
-        self.assertEqual(new_items, [])          # 아직 판정하지 않습니다
-        self.assertNotIn("m2000", seen)          # 상태도 건드리지 않습니다
-
-        # 확인 창이 지나도록 예전 매물이 한 번도 다시 나타나지 않으면 재출품으로 판정합니다.
-        await observe(relisted, base + 60 + mercari.RELIST_ABSENCE_SECONDS)
         self.assertEqual(new_items, [])  # 재출품이므로 '신규' 알림 없음
         # 예전 ID는 굳이 지우지 않습니다. 지워 버리면 그 매물이 검색에 다시 잡혔을 때
         # 처음 보는 매물로 오인돼 알림이 가기 때문에, 용량 상한에 밀려 자연스럽게 사라지게 둡니다.
@@ -382,10 +405,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
 
         # 재등록하면서 1000엔 이상 더 싸게 올렸다면 가격인하 알림은 정상적으로 와야 함
         cheaper = FakeItem("m3000", "Margiela 초레어 카트소", 18000, seller_id="seller-A")
-        start = base + 60 + mercari.RELIST_ABSENCE_SECONDS
-        await observe(cheaper, start + 60)
-        self.assertEqual(new_items, [])
-        await observe(cheaper, start + 60 + mercari.RELIST_ABSENCE_SECONDS)
+        await observe(cheaper, base + 120)
         self.assertEqual([e["alert_id"] for e in new_items], ["drop:m3000:20000:18000"])
 
     async def test_relist_fallback_to_title_and_exact_price_without_seller_id(self):
@@ -412,12 +432,10 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         await observe(FakeItem("m1", "Chrome Hearts Tシャツ", 32000), base)
         self.assertEqual([e["alert_id"] for e in new_items], ["new:m1"])
 
-        # 같은 제목, 같은 가격, 다른 ID -> 예전 매물이 다시 나타나지 않는 것을 확인한 뒤
+        # 같은 제목, 같은 가격, 다른 ID -> 예전 매물이 정말 없어진 것을 확인한 뒤
         # 재출품으로 처리 (알림 없음)
         second = FakeItem("m2", "Chrome Hearts Tシャツ", 32000)
         await observe(second, base + 60)
-        self.assertEqual(new_items, [])
-        await observe(second, base + 60 + mercari.RELIST_ABSENCE_SECONDS)
         self.assertEqual(new_items, [])
         self.assertIn("m2", seen)
 
@@ -939,24 +957,23 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e["alert_id"] for e in new_items], ["new:shop-2"])
 
         # 반대로 예전 매물이 사라진 뒤 같은 제목+가격으로 다시 올라오면 재출품으로 처리합니다.
-        # (사라졌다는 것은 확인 창이 지나야 인정되므로 두 번 관찰합니다.)
+        # 여기서 갈리는 것은 **숍스 상품의 페이지가 아직 있는가**입니다. 숍스 응답에는
+        # 판매 상태 필드가 없지만, 없는 상품은 404라 product()가 None을 돌려줍니다.
         pending_relists: dict = {}
         base = datetime.now().timestamp()
         third = FakeItem("shop-3", "같은 제목 같은 가격", 5000, seller_id="0")
-        for at in (base, base + mercari.RELIST_ABSENCE_SECONDS):
-            new_items.clear()
-            with patch.object(mercari, "current_time", return_value=at):
-                await mercari.check_keyword(
-                    FakeMercapi({"test": [third]}),
-                    "test",
-                    [],
-                    seen,
-                    relist_fingerprints,
-                    new_items,
-                    pending_relists=pending_relists,
-                )
-            self.assertEqual(new_items, [])
+        new_items.clear()
+        api3 = FakeMercapi({"test": [third]})
+        with patch.object(mercari, "current_time", return_value=base):
+            await mercari.check_keyword(
+                api3, "test", [], seen, relist_fingerprints, new_items,
+                pending_relists=pending_relists,
+            )
+        self.assertEqual(new_items, [])
         self.assertIn("shop-3", seen)
+        # 숍스 ID는 product()로 물어봐야 합니다. item()으로 물으면 KeyError로 터져서
+        # 확인이 한 건도 답을 못 냅니다(2026-09-14 운영 실측: 12건 전부 그랬습니다).
+        self.assertEqual(api3.lookups, ["shop-2"])
 
     async def test_a_missing_old_listing_is_not_judged_gone_on_the_first_run(self):
         """'이번 결과에 없다'는 사라졌다는 뜻이 아닙니다.
@@ -1045,39 +1062,111 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(pending_relists, {})
 
-    async def test_absence_is_not_confirmed_by_a_single_check_however_long_it_took(self):
-        """시간만 보고 판정하면 몇 시간 멈췄다 깨어난 실행 하나가 판정을 끝내 버립니다.
+    async def test_an_old_listing_still_on_mercari_is_settled_without_waiting(self):
+        """같은 운영 사고를, 이번에는 검색 결과가 아니라 **직접 조회**로 잡습니다.
 
-        그 실행이 실제로 확인한 것은 한 번뿐인데, 한 번 안 보이는 것이야말로 이 결함이
-        만들어지는 바로 그 자리입니다(순위가 밀려 결과에서 빠진 매물).
-        시간과 실제 확인 횟수를 함께 봐야 합니다.
+        PR #31에서 '사라졌다'고 판정된 12건을 이름 대고 쫓았더니 12건 전부 상품 페이지가
+        아직 있었고, 12건 전부 두 패스 600건 깊이 어디에도 없었습니다. 즉 검색 결과는
+        이 물음에 답을 주지 못하고, 예전 매물에게 직접 물어야 답이 나옵니다.
+
+        예전 판정은 여기서 예전 가격(257100)을 물려받아
+        `drop:2JTt64sCqodGJdNRSX2tmw:257100:47500`을 실제로 보냈습니다.
+        """
+        seen: dict = {}
+        fingerprint = "seller:119903670:maisonmargielaブルゾンその他メンズ古着中古送料無料"
+        relist_fingerprints = {
+            fingerprint: {
+                "item_id": "2JJ4Hj8xGFg7txonvrwDp5",
+                "last_alert_price": 257100,
+                "last_seen_price": 257100,
+            }
+        }
+        pending_relists: dict = {}
+        new_items: list = []
+        title = "Maison Margiela ブルゾン（その他） メンズ 【古着】【中古】【送料無料】"
+        self.assertEqual(mercari.relist_fingerprint("119903670", title, 47500), fingerprint)
+        newcomer = vars(
+            FakeItem("2JTt64sCqodGJdNRSX2tmw", title, 47500, seller_id="119903670")
+        )
+
+        # 예전 매물은 이번 결과에 없습니다(순위가 뒤라 안 보일 뿐). 직접 물어보니 있습니다.
+        mercari.process_items(
+            "test", [newcomer], seen, relist_fingerprints, new_items,
+            listed_ids={"2JTt64sCqodGJdNRSX2tmw"},
+            survival={"2JJ4Hj8xGFg7txonvrwDp5": True},
+            pending_relists=pending_relists, now=1000.0,
+        )
+
+        # 기다리지 않고 그 자리에서 별개의 매물로 결론이 납니다.
+        self.assertEqual([e["alert_id"] for e in new_items], ["new:2JTt64sCqodGJdNRSX2tmw"])
+        self.assertEqual(
+            seen["2JTt64sCqodGJdNRSX2tmw"],
+            {"last_alert_price": 47500, "last_seen_price": 47500},  # 257100을 물려받지 않습니다
+        )
+        self.assertEqual(pending_relists, {})
+
+    async def test_absence_is_not_confirmed_by_a_single_failed_lookup_however_long_it_took(self):
+        """물어보지 못한 것을 시간만으로 '사라졌다'로 바꾸면 안 됩니다.
+
+        봇이 몇 시간 멈췄다 깨어난 실행 하나가 '10분이 지났다'는 이유로 판정을 끝내면
+        실제로 물어본 것은 한 번뿐입니다. 시간과 실제 시도 횟수를 함께 봐야 하고,
+        끝내 못 물어봤으면 결론은 '사라짐'이 아니라 '별개의 매물'입니다.
         """
         seen: dict = {}
         relist_fingerprints = {
             "seller:A:t": {"item_id": "m-old", "last_alert_price": 5000, "last_seen_price": 5000}
         }
         pending_relists: dict = {}
+        new_items: list = []
         item = vars(FakeItem("m-new", "t", 5000, seller_id="A"))
 
-        def run(now, full_scan=True):
+        def run(now, survival):
             mercari.process_items(
-                "test", [item], seen, relist_fingerprints, [],
+                "test", [item], seen, relist_fingerprints, new_items,
                 listed_ids={"m-new"}, pending_relists=pending_relists, now=now,
-                can_resolve_relists=full_scan,
+                survival=survival,
             )
 
-        run(1000.0, full_scan=False)              # 빠른 조회: 보류만 시작, 확인 0회
-        run(1000.0 + 7 * 60 * 60)                 # 7시간 뒤 깨어난 첫 실행: 확인 1회
-        self.assertEqual(seen, {})                # 시간은 넘쳤지만 확인이 한 번뿐입니다
+        run(1000.0, {"m-old": None})                 # 물어봤지만 답이 안 옴: 1회
+        run(1000.0 + 7 * 60 * 60, None)              # 7시간 뒤: 아예 못 물어봄 -> 안 셉니다
+        self.assertEqual(seen, {})                   # 시간은 넘쳤지만 시도가 한 번뿐입니다
         self.assertEqual(pending_relists["m-new"]["checks"], 1)
-        run(1000.0 + 7 * 60 * 60 + 60)            # 확인 2회째
-        self.assertIn("m-new", seen)
+        run(1000.0 + 7 * 60 * 60 + 60, {"m-old": None})   # 시도 2회째
+        # 끝내 확인하지 못했으므로 사라진 것이 아닙니다 -> 가격 이력을 물려받지 않습니다.
+        self.assertEqual(seen["m-new"], {"last_alert_price": 5000, "last_seen_price": 5000})
+        self.assertEqual(pending_relists, {})
 
-    async def test_fast_scans_do_not_count_as_absence_checks(self):
-        """빠른 조회(등록순만)는 오래 올라와 있는 매물을 아예 훑지 않습니다.
+    async def test_a_lookup_that_says_the_old_listing_is_alive_settles_it_at_once(self):
+        """직접 물어봐서 '아직 있다'는 답을 얻으면 그 자리에서 별개의 매물입니다.
 
-        거기서 '없다'는 것에는 아무 뜻이 없으므로 확인 횟수로 세면 안 됩니다.
-        반대로 '있다'는 것은 어떤 조회에서든 확실한 증거라 바로 씁니다.
+        예전에는 이 자리에서 '이번 검색 결과에 없다'를 근거로 삼았는데, 그 대리 지표는
+        추적 매물의 34~36%만 창 안에 들어오는 탓에 거의 아무 정보도 담고 있지 않았습니다.
+        """
+        relist_fingerprints = {
+            "seller:A:t": {"item_id": "m-old", "last_alert_price": 5000, "last_seen_price": 5000}
+        }
+        pending_relists: dict = {}
+        seen: dict = {}
+        new_items: list = []
+        item = vars(FakeItem("m-new", "t", 5000, seller_id="A"))
+
+        # 검색 결과에는 m-old가 없습니다(순위에 밀렸을 뿐). 예전 판정이라면 여기서
+        # 사라졌다고 봤을 자리입니다.
+        mercari.process_items(
+            "test", [item], seen, relist_fingerprints, new_items,
+            listed_ids={"m-new"}, pending_relists=pending_relists, now=1000.0,
+            survival={"m-old": True},
+        )
+        self.assertEqual([e["alert_id"] for e in new_items], ["new:m-new"])
+        self.assertEqual(seen["m-new"], {"last_alert_price": 5000, "last_seen_price": 5000})
+        self.assertEqual(pending_relists, {})  # 기다릴 것이 없습니다
+
+    async def test_a_pending_judgment_keeps_its_trail_while_it_cannot_ask(self):
+        """물어보지 못하는 동안에도 '마지막으로 본 실행'은 남아야 합니다.
+
+        이게 없으면 상태 파일만 보고는 확인이 진행 중인 보류와, 매물이 검색에서 사라져
+        수명만 기다리는 보류를 구분할 수 없습니다(실제로 그것 때문에 Actions 로그를
+        뒤졌습니다).
         """
         relist_fingerprints = {
             "seller:A:t": {"item_id": "m-old", "last_alert_price": 5000, "last_seen_price": 5000}
@@ -1090,21 +1179,18 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             mercari.process_items(
                 "test", [item], seen, relist_fingerprints, [],
                 listed_ids={"m-new"}, pending_relists=pending_relists,
-                now=1000.0 + step * 60, can_resolve_relists=False,
+                now=1000.0 + step * 60, survival=None,
             )
-        self.assertEqual(seen, {})  # 빠른 조회만으로는 영영 판정하지 않습니다
+        self.assertEqual(seen, {})  # 한 번도 못 물어봤으면 영영 판정하지 않습니다
         self.assertEqual(pending_relists["m-new"]["checks"], 0)
-        # 확인 횟수는 늘지 않아도 '마지막으로 본 실행'은 남아야 합니다. 이게 없으면
-        # 상태 파일만 보고는 확인이 진행 중인 보류와, 매물이 사라져 수명만 기다리는
-        # 보류를 구분할 수 없습니다(실제로 그것 때문에 Actions 로그를 뒤졌습니다).
         self.assertEqual(pending_relists["m-new"]["checked_at"], 1000.0 + 19 * 60)
 
-        # 같은 상황에서 예전 매물이 결과에 보이면 빠른 조회에서도 바로 판정합니다.
+        # 같은 상황에서 예전 매물이 검색 결과에 보이면 물어볼 것도 없이 바로 판정합니다.
         new_items: list = []
         mercari.process_items(
             "test", [item], seen, relist_fingerprints, new_items,
             listed_ids={"m-new", "m-old"}, pending_relists=pending_relists,
-            now=1000.0 + 20 * 60, can_resolve_relists=False,
+            now=1000.0 + 20 * 60,
         )
         self.assertEqual([e["alert_id"] for e in new_items], ["new:m-new"])
 
@@ -1141,6 +1227,124 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
             pending_relists=pending_relists, now=later,
         )
         self.assertEqual([e["alert_id"] for e in new_items], ["new:m-new"])
+
+    async def test_lookup_targets_match_what_the_judgment_asks(self):
+        """미리 추린 조회 대상이 판정이 실제로 묻는 것과 정확히 같아야 합니다.
+
+        조회는 async인데 판정은 sync라, 물어볼 매물을 `relist_lookup_targets()`가
+        미리 추립니다. 두 자리의 조건이 갈라지면 **조회해 놓고 안 쓰거나(낭비), 필요한데
+        못 물어봐서 판정이 영영 보류**됩니다. 같은 입력을 두 자리에 넣어 맞춰 봅니다.
+
+        일부러 까다로운 것만 모았습니다 — 이미 아는 매물, 지문이 없는 매물(제목이 빈
+        것), 같은 ID가 주인인 지문, 검색 결과에 살아 있는 예전 매물, 가격 비공개,
+        여러 키워드가 같은 예전 매물을 물고 오는 경우.
+        """
+        seen = {"m-known": {"last_alert_price": 1, "last_seen_price": 1}}
+        relist_fingerprints = {
+            "seller:A:a": {"item_id": "m-oldA", "last_alert_price": 5000, "last_seen_price": 5000},
+            "seller:B:b": {"item_id": "m-oldB", "last_alert_price": 6000, "last_seen_price": 6000},
+            "seller:C:c": {"item_id": "m-selfC", "last_alert_price": 7000, "last_seen_price": 7000},
+            "seller:D:d": {"item_id": "m-oldD", "last_alert_price": 8000, "last_seen_price": 8000},
+            "seller:E:e": {"item_id": "m-oldE", "last_alert_price": 9000, "last_seen_price": 9000},
+        }
+        items = [
+            vars(FakeItem("m-newA", "a", 5000, seller_id="A")),     # -> m-oldA 를 물어야 함
+            vars(FakeItem("m-newA2", "a", 5000, seller_id="A")),    # 같은 예전 매물(중복)
+            vars(FakeItem("m-known", "b", 6000, seller_id="B")),    # 이미 아는 매물 -> 안 물음
+            vars(FakeItem("m-selfC", "c", 7000, seller_id="C")),    # 같은 ID의 지문 -> 안 물음
+            vars(FakeItem("m-newD", "d", 8000, seller_id="D")),     # 예전 매물이 살아 있음
+            vars(FakeItem("m-newE", "e", 9000, seller_id="E", is_no_price=True)),  # 가격 모름
+            vars(FakeItem("m-newF", "", 1000, seller_id="F")),      # 지문 없음(제목이 빔)
+        ]
+        listed_ids = {mercari.extract_item_id(fields) for fields in items} | {"m-oldD"}
+
+        targets = mercari.relist_lookup_targets(items, seen, relist_fingerprints, listed_ids)
+
+        # 판정이 실제로 무엇을 물었는지는 survival 조회 기록으로 받아 봅니다.
+        asked: list = []
+
+        class Recorder(dict):
+            def get(self, key, default=None):
+                asked.append(key)
+                return default
+
+        # 비어 있지 않게 씨앗을 하나 넣습니다. 빈 dict는 falsy라 판정이 그냥 지나칩니다.
+        mercari.process_items(
+            "test", items, dict(seen), dict(relist_fingerprints), [],
+            listed_ids=listed_ids, survival=Recorder(_seed=None),
+            pending_relists={}, now=1000.0,
+        )
+        self.assertEqual(targets, set(asked))
+        # 가격 비공개(m-newE)도 물어야 합니다. 판매자를 알면 지문에 가격이 안 들어가서
+        # 가격을 몰라도 지문이 만들어지기 때문입니다.
+        self.assertEqual(targets, {"m-oldA", "m-oldE"})
+
+    async def test_a_lookup_failure_is_never_read_as_gone(self):
+        """확인 실패를 '없음'으로 읽으면 그게 바로 지금 고치는 오판입니다.
+
+        같은 함정에 이미 두 번 빠졌습니다 — 판매 여부 확인이 12건 전부 실패했는데
+        요약이 "판매중 0/12건"으로 찍혔고, 재출품 판정이 '못 본 것'을 '없어진 것'으로
+        읽고 있었습니다.
+        """
+        api = FakeMercapi({}, fail_lookup_ids={"m-old"})
+        survival = await mercari.lookup_survival(api, {"m-old"})
+        self.assertEqual(survival, {"m-old": None})   # False 가 아니어야 합니다
+        self.assertIsNot(survival["m-old"], False)
+
+    async def test_lookups_are_capped_per_run_and_the_rest_wait_for_the_next(self):
+        """조회 상한에 걸려 못 물어본 것은 헛물로 세지 않습니다.
+
+        세면 묻지도 않고 포기하게 됩니다. 상한은 조회량이 아니라 실행 시간을 지키는
+        장치라(concurrency 때문에 한 실행이 길어지면 봇 전체가 멈춥니다), 넘친 것은
+        버리지 않고 다음 실행에서 다시 봅니다.
+        """
+        api = FakeMercapi({})
+        targets = {f"m-old{index:02d}" for index in range(20)}
+        with patch.object(mercari, "RELIST_LOOKUP_PAUSE_SECONDS", 0):
+            survival = await mercari.lookup_survival(api, targets, limit=5)
+        self.assertEqual(len(survival), 5)
+        self.assertEqual(set(survival) - targets, set())
+
+        # 못 물어본 매물은 survival 에 아예 없고, 그 자리는 헛물로 세지 않습니다.
+        pending_relists: dict = {}
+        relist_fingerprints = {
+            "seller:A:t": {"item_id": "m-old19", "last_alert_price": 5000, "last_seen_price": 5000}
+        }
+        self.assertNotIn("m-old19", survival)
+        for step in range(3):
+            mercari.process_items(
+                "test", [vars(FakeItem("m-new", "t", 5000, seller_id="A"))],
+                {}, relist_fingerprints, [], listed_ids={"m-new"},
+                survival=survival, pending_relists=pending_relists,
+                now=1000.0 + step * mercari.RELIST_ABSENCE_SECONDS,
+            )
+        self.assertEqual(pending_relists["m-new"]["checks"], 0)
+
+    async def test_the_old_listing_is_asked_once_even_when_many_keywords_carry_it(self):
+        """같은 예전 매물을 여러 키워드가 물고 와도 한 실행에서 한 번만 묻습니다.
+
+        실측(2026-09-14, 10.32시간): 물어볼 자리 106건이 관측 단위로는 387번이었습니다.
+        관측마다 물으면 조회가 3.7배가 됩니다.
+        """
+        relist_fingerprints = {
+            "seller:A:t": {"item_id": "m-old", "last_alert_price": 5000, "last_seen_price": 5000}
+        }
+        newcomer = FakeItem("m-new", "t", 5000, seller_id="A")
+        api = FakeMercapi({"k1": [newcomer], "k2": [newcomer], "k3": [newcomer]})
+        mercari.SEARCHES = [{"query": name, "categories": []} for name in ("k1", "k2", "k3")]
+        checked_at = datetime.now().timestamp() - 300
+        mercari.save_state(
+            {"seed": {"last_alert_price": 1, "last_seen_price": 1}}, [], [],
+            relist_fingerprints, {"k1", "k2", "k3"},
+            {"k1": checked_at, "k2": checked_at, "k3": checked_at},
+        )
+
+        with patch.object(mercari, "Mercapi", return_value=api), patch.object(
+            mercari.asyncio, "sleep", new=AsyncMock()
+        ):
+            await mercari.collect_updates()
+
+        self.assertEqual(api.lookups, ["m-old"])
 
     def test_pending_relists_do_not_pile_up(self):
         """판정 보류 기록은 그 매물이 다시 조회될 때만 갱신됩니다.

@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 coverage_scan = importlib.import_module("coverage_scan")
+check_mercari = importlib.import_module("check_mercari")
 
 
 @dataclass
@@ -647,6 +648,59 @@ class OnSaleCheckTests(unittest.TestCase):
             )
         output = buffer.getvalue()
         self.assertIn("말할 수 없습니다", output)
+        self.assertNotIn("안 나오는 것", output)
+
+
+class SurvivalControlTests(unittest.TestCase):
+    """이 컬럼이 서 있는 전제는 '없는 매물은 404로 온다'입니다.
+
+    전제가 깨지면 표에는 "다 살아 있다"가 찍히는데, 그건 측정이 아니라 침묵입니다.
+    그래서 아는 답(있을 수 없는 ID)에 먼저 대 봅니다.
+    """
+
+    def _api(self, answers):
+        class Api:
+            async def item(self, item_id):
+                if item_id not in answers:
+                    raise KeyError("data")
+                return answers[item_id]
+
+            async def product(self, product_id):
+                return answers.get(product_id)
+        return Api()
+
+    def test_controls_pass_when_missing_listings_come_back_missing(self):
+        saved = check_mercari.RELIST_LOOKUP_PAUSE_SECONDS
+        check_mercari.RELIST_LOOKUP_PAUSE_SECONDS = 0
+        try:
+            api = self._api({item: None for item in coverage_scan.SURVIVAL_CONTROL_IDS})
+            answers, trustworthy = asyncio.run(coverage_scan.survival_controls(api))
+            self.assertTrue(trustworthy)
+            self.assertEqual(set(answers.values()), {False})
+        finally:
+            check_mercari.RELIST_LOOKUP_PAUSE_SECONDS = saved
+
+    def test_a_control_that_comes_back_alive_makes_the_column_unreadable(self):
+        """없는 매물에게 물었는데 '있다'가 나오면 그 뒤 숫자는 전부 의미가 없습니다."""
+        saved = check_mercari.RELIST_LOOKUP_PAUSE_SECONDS
+        check_mercari.RELIST_LOOKUP_PAUSE_SECONDS = 0
+        try:
+            answers = {item: None for item in coverage_scan.SURVIVAL_CONTROL_IDS}
+            answers[coverage_scan.SURVIVAL_CONTROL_IDS[1]] = types.SimpleNamespace(name="빈 껍데기")
+            _, trustworthy = asyncio.run(coverage_scan.survival_controls(self._api(answers)))
+            self.assertFalse(trustworthy)
+        finally:
+            check_mercari.RELIST_LOOKUP_PAUSE_SECONDS = saved
+
+    def test_a_broken_control_stops_the_survival_tally(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            coverage_scan.report_tracked(
+                {"가"}, {"created": {}}, set(), ("created",),
+                {"가": "상품 페이지 있음"}, trustworthy=False,
+            )
+        output = buffer.getvalue()
+        self.assertIn("집계하지 않습니다", output)
         self.assertNotIn("안 나오는 것", output)
 
 
