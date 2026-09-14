@@ -97,14 +97,59 @@ def merge_pending(theirs: list, mine: list, sent_alerts: list) -> list:
     return result[-MAX_PENDING_ALERTS:]
 
 
-def merge_ordered(theirs: dict, mine: dict, limit: int) -> dict:
-    """두 쪽을 합치되, 양쪽에 다 있는 키는 '최근에 본 쪽'(mine)의 순서·값을 따릅니다.
+def price_floor(record):
+    """그 매물의 '실제로 알림을 보낸 역대 최저가'. 없으면 None."""
+    if isinstance(record, dict):
+        value = record.get("last_alert_price")
+        return value if isinstance(value, int) else None
+    return record if isinstance(record, int) else None
+
+
+def merge_price_record(theirs, mine):
+    """같은 매물이 양쪽에 다 있을 때 가격 기록을 합칩니다.
+
+    `last_alert_price`는 '실제로 알림을 보낸 역대 최저가'라 **내려가기만 합니다.**
+    그런데 병합은 양쪽에 다 있는 키를 `mine`(내 실행)으로 덮어쓰는데, 내 실행이 상대보다
+    **먼저 시작했으면** 그 값은 상대가 이미 내려놓은 기준을 모르는 옛날 값입니다.
+    그대로 덮으면 기준가가 위로 올라갑니다.
+
+    실측(2026-09-13 17:12 ~ 09-14 17:51 UTC, PR #23 머지 뒤): 기준가가 올라간 자리가
+    **245건**이고 전부 `queue Mercari alerts` 커밋 — 즉 조회 단계 push의 병합입니다.
+    그중 **210건**이 '인하 알림을 보내 내려간 값에서 그 직전 값으로 **정확히** 되돌아간'
+    자리였습니다. 사용자에게 닿은 피해는 그중 일부입니다(이미 알린 최저가보다 비싼 값을
+    '역대 최저가'라고 주장한 인하 알림이 머지 뒤 2건).
+
+    나머지는 다음 실행이 스스로 되돌리고 `sent_alerts`가 중복을 막습니다. 그래도
+    기준이 위로 가는 것은 PR #23이 없앤 바로 그 결함이라, 남은 경로도 막습니다.
+    """
+    floors = [value for value in (price_floor(theirs), price_floor(mine))
+              if isinstance(value, int)]
+    if not floors:
+        return mine
+    lowest = min(floors)
+    if not isinstance(mine, dict):
+        return lowest
+    if mine.get("last_alert_price") == lowest:
+        return mine
+    # 나머지 필드와 순서는 그대로 mine 을 따릅니다. last_seen_price 는 참고용이라
+    # 판정에 쓰이지 않으므로 손대지 않습니다.
+    return {**mine, "last_alert_price": lowest}
+
+
+def merge_ordered(theirs: dict, mine: dict, limit: int, merge_values=None) -> dict:
+    """두 쪽을 합치되, 양쪽에 다 있는 키는 '최근에 본 쪽'(mine)의 순서를 따릅니다.
 
     상태 파일은 뒤에서부터 limit개만 남기므로, 최근 확인한 항목이 뒤로 가야
     오래 올라와 있는 매물이 먼저 잘려 나가 '신규'로 오인되는 일이 없습니다.
+
+    **값까지 mine 으로 덮으면 안 되는 것이 있습니다.** `merge_values`를 주면 양쪽에 다
+    있는 키에 대해 그 함수로 값을 합칩니다(`merge_price_record` 참고).
     """
     merged = {key: value for key, value in theirs.items() if key not in mine}
-    merged.update(mine)
+    for key, value in mine.items():
+        if merge_values is not None and key in theirs:
+            value = merge_values(theirs[key], value)
+        merged[key] = value
     return dict(list(merged.items())[-limit:])
 
 
@@ -178,13 +223,17 @@ def main() -> None:
     mine = read_json("/tmp/mine.json", required=True)
     theirs = read_json("/tmp/theirs.json")
 
-    merged_seen = merge_ordered(theirs.get("seen", {}), mine.get("seen", {}), MAX_SEEN_ITEMS)
+    merged_seen = merge_ordered(theirs.get("seen", {}), mine.get("seen", {}), MAX_SEEN_ITEMS,
+                                merge_values=merge_price_record)
     sent_alerts = unique_recent(theirs.get("sent_alerts", []) + mine.get("sent_alerts", []), MAX_SENT_ALERTS)
     merged_pending = merge_pending(theirs.get("pending", []), mine.get("pending", []), sent_alerts)
     merged_fingerprints = merge_ordered(
         prune_fingerprints(theirs.get("relist_fingerprints", {})),
         prune_fingerprints(mine.get("relist_fingerprints", {})),
         MAX_RELIST_FINGERPRINTS,
+        # 지문도 같은 기준가를 들고 다닙니다. 재출품이 물려받는 값이라 여기서 올라가면
+        # 그 값이 새 ID로 그대로 옮겨 갑니다.
+        merge_values=merge_price_record,
     )
     merged_known_keywords = sorted(set(theirs.get("known_keywords", [])) | set(mine.get("known_keywords", [])))
     merged_checked_at = merge_checked_at(
