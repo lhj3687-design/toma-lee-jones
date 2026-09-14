@@ -1425,6 +1425,36 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         self.assertIn("p2-0", {mercari.extract_item_id(f) for f in items})
 
+    async def test_a_smaller_item_cap_would_ask_for_more_pages_not_fewer(self):
+        """MAX_ITEMS_PER_KEYWORD를 낮추면 조회가 줄지 않고 늘어납니다.
+
+        한 페이지 크기(120)는 mercapi가 요청에 박아 보내는 값이라 봇이 고를 수 없습니다.
+        이 상한은 '몇 건을 받을지'가 아니라 '받아 온 페이지에서 몇 건을 쓸지'입니다.
+        그래서 낮추면 뒤쪽 오래된 매물이 잘려 나가고, 남은 앞부분만 보고 '한 페이지가
+        전부 신규'라고 판단해 다음 페이지를 부릅니다 — 아끼려다 더 부르는 셈입니다.
+        """
+        now = datetime.now()
+        cutoff = (now - timedelta(minutes=5)).timestamp()
+        page1 = [
+            FakeItem(f"p1-{i}", f"신규 {i}", 1000, created=now - timedelta(minutes=1))
+            for i in range(3)
+        ] + [
+            FakeItem(f"p1-old-{i}", f"예전 {i}", 1000, created=now - timedelta(days=1))
+            for i in range(2)
+        ]
+        page2 = [FakeItem("p2-0", "다음 페이지", 1000, created=now - timedelta(minutes=2))]
+
+        # 지금 설정(상한 120 = 한 페이지): 페이지를 다 채우지 못했으므로 한 페이지로 끝냅니다.
+        api = FakeMercapi({"test": page1}, extra_pages_by_keyword={"test": [page2]})
+        items, _, _ = await mercari.search_items(api, "test", [], created_cutoff=cutoff)
+        self.assertNotIn("p2-0", {mercari.extract_item_id(f) for f in items})
+
+        # 상한만 3으로 낮춘 경우: 잘라 낸 앞 3건이 전부 신규라 다음 페이지까지 부릅니다.
+        api = FakeMercapi({"test": page1}, extra_pages_by_keyword={"test": [page2]})
+        with patch.object(mercari, "MAX_ITEMS_PER_KEYWORD", 3):
+            items, _, _ = await mercari.search_items(api, "test", [], created_cutoff=cutoff)
+        self.assertIn("p2-0", {mercari.extract_item_id(f) for f in items})
+
     async def test_next_page_is_not_fetched_for_a_normal_page(self):
         # 평소에는(한 페이지를 다 채우지 못하거나 오래된 매물이 섞여 있으면) 한 페이지만 봅니다.
         now = datetime.now()
