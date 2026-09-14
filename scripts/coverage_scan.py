@@ -32,7 +32,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from check_mercari import (  # noqa: E402  (경로를 먼저 잡아야 합니다)
+    FULL_SCAN_INTERVAL_SECONDS,
     MAX_ITEMS_PER_KEYWORD,
+    MAX_LOOKBACK_SECONDS,
     SEARCHES,
     SEARCH_SORT_OPTIONS,
     SEEN_FILE,
@@ -139,12 +141,111 @@ def count_missed(fields_list: list, seen_ids: set, fresh_after: float) -> tuple[
     return len(fresh), len(missed)
 
 
+def age_minutes(fields: dict, now: float) -> float | None:
+    """이 매물이 올라온 지 몇 분 됐는지 (등록 시각을 모르면 None)."""
+    created = listing_created_at(fields)
+    return None if created is None else (now - created) / 60.0
+
+
+def window_depth(fields_list: list, now: float, sizes: tuple = ()) -> list:
+    """'창 N건'이 이 키워드에서 **몇 분치인지** 돌려줍니다.
+
+    창 크기를 건수로만 보면 120은 그냥 큰 숫자입니다. 하지만 봇에게 중요한 것은
+    시간 깊이입니다 — 직전 조회 이후에 올라온 매물이 전부 창 안에 들어와야 놓치지
+    않기 때문입니다. 같은 120건이 매물이 쏟아지는 키워드에서는 몇 시간치고,
+    한산한 키워드에서는 몇 달치입니다. 그래서 '120건이면 충분한가'는 키워드마다
+    답이 다르고, 줄여도 되는지도 이 값으로만 말할 수 있습니다.
+
+    돌려주는 값은 (창 크기, 분) 목록입니다. 매물 수가 그 크기에 못 미치면(창이 남으면)
+    분 대신 None입니다 — 그 키워드에서는 창이 제약이 아니라는 뜻입니다.
+    """
+    sizes = sizes or (30, 60, MAX_ITEMS_PER_KEYWORD)
+    profile = []
+    for size in sizes:
+        if len(fields_list) < size:
+            profile.append((size, None))
+            continue
+        profile.append((size, age_minutes(fields_list[size - 1], now)))
+    return profile
+
+
+def order_inversions(fields_list: list) -> int:
+    """등록순 결과가 정말 등록 시각 내림차순인지 셉니다(바로 앞보다 최근인 항목 수).
+
+    이 값이 0이 아니면 '앞 120건 = 가장 최근 120건'이라는 전제가 깨집니다. 창을
+    시간으로 환산하는 계산은 전부 그 전제 위에 서 있으므로, 먼저 이것부터 봐야 합니다.
+    """
+    times = [listing_created_at(fields) for fields in fields_list]
+    inversions = 0
+    previous = None
+    for value in times:
+        if value is None:
+            continue
+        if previous is not None and value > previous:
+            inversions += 1
+        previous = value
+    return inversions
+
+
+def newer_beyond_window(fields_list: list, window: int = 0) -> int:
+    """창 밖인데 창 안 맨 뒤보다 더 최근인 매물 수. 정렬이 지켜졌다면 0입니다."""
+    window = window or MAX_ITEMS_PER_KEYWORD
+    inside, outside = fields_list[:window], fields_list[window:]
+    tail = [t for t in (listing_created_at(f) for f in inside) if t is not None]
+    if not tail:
+        return 0
+    boundary = min(tail)
+    return sum(1 for f in outside if (listing_created_at(f) or 0) > boundary)
+
+
+def peak_arrivals(fields_list: list, seconds: float) -> int:
+    """등록 시각이 같은 구간(seconds)에 가장 많이 몰린 개수.
+
+    한 번의 실행이 받아내야 하는 양입니다. 평균으로 보면 넉넉해 보여도 몰릴 때
+    몰리므로, 창을 줄여도 되는지는 평균이 아니라 이 최대치로 판단해야 합니다.
+    """
+    times = sorted(t for t in (listing_created_at(f) for f in fields_list) if t is not None)
+    best = start = 0
+    for end in range(len(times)):
+        while times[end] - times[start] > seconds:
+            start += 1
+        best = max(best, end - start + 1)
+    return best
+
+
+def missed_ages(fields_list: list, seen_ids: set, fresh_after: float, now: float) -> list:
+    """상태 파일에 없는 최근 매물이 '올라온 지 몇 분 됐는지'를 오래된 순으로.
+
+    갓 올라온 매물이 아직 상태 파일에 없는 것은 결함이 아닙니다 — 다음 실행(1분 뒤)에
+    잡습니다. '못 본 것 1건'이 진짜 누락인지 조회 타이밍인지는 이 나이를 봐야 갈립니다.
+    """
+    ages = [
+        age_minutes(fields, now)
+        for fields in fields_list
+        if (listing_created_at(fields) or 0) >= fresh_after
+        and extract_item_id(fields) not in seen_ids
+    ]
+    return sorted((age for age in ages if age is not None), reverse=True)
+
+
+def format_span(minutes: float | None) -> str:
+    """분을 읽기 쉬운 단위로. 창 깊이는 분·시간·일이 뒤섞여 나옵니다."""
+    if minutes is None:
+        return "창이 남음"
+    if minutes < 90:
+        return f"{minutes:.0f}분치"
+    if minutes < 60 * 48:
+        return f"{minutes / 60:.1f}시간치"
+    return f"{minutes / 60 / 24:.1f}일치"
+
+
 async def scan(pages: int, fresh_hours: float) -> None:
     from mercapi import Mercapi
 
     api = Mercapi()
     seen_ids = load_seen_ids()
-    fresh_after = (datetime.now() - timedelta(hours=fresh_hours)).timestamp()
+    now = datetime.now().timestamp()
+    fresh_after = now - fresh_hours * 3600
     print(
         f"봇이 보는 창: 키워드·정렬당 상위 {MAX_ITEMS_PER_KEYWORD}건 / "
         f"이번 조회 깊이: {pages}페이지({pages * MAX_ITEMS_PER_KEYWORD}건) / "
@@ -165,6 +266,10 @@ async def scan(pages: int, fresh_hours: float) -> None:
         inside, outside = split_by_window(filtered)
         fresh_in, missed_in = count_missed(inside, seen_ids, fresh_after)
         fresh_out, missed_out = count_missed(outside, seen_ids, fresh_after)
+        depth = window_depth(filtered, now)
+        inversions = order_inversions(filtered)
+        beyond_newer = newer_beyond_window(filtered)
+        ages = missed_ages(filtered, seen_ids, fresh_after, now)
 
         # 카테고리 필터가 빼는 매물: 같은 깊이에서 필터를 뺀 결과에만 있는 것들입니다.
         # 필터는 매물을 걸러내기만 하므로, 필터 없는 목록의 앞쪽에 있으면서 필터 목록에
@@ -202,6 +307,12 @@ async def scan(pages: int, fresh_hours: float) -> None:
                 "beyond_missed": missed_out,
                 "filter_fresh": filter_fresh,
                 "filter_missed": filter_missed,
+                "depth": depth,
+                "inversions": inversions,
+                "beyond_newer": beyond_newer,
+                "peak_1m": peak_arrivals(filtered, 60),
+                "peak_5m": peak_arrivals(filtered, 5 * 60),
+                "missed_ages": ages,
             }
         )
         # API가 말하는 전체 건수(num_found)는 실제로 받은 개수와 어긋납니다. 2026-09-14
@@ -217,6 +328,14 @@ async def scan(pages: int, fresh_hours: float) -> None:
             f" | 창 안 최근 {fresh_in}건 중 못 본 것 {missed_in}건"
             f" | 창 밖 최근 {fresh_out}건 중 못 본 것 {missed_out}건"
             + (f" | 필터가 뺀 최근 {filter_fresh}건 중 못 본 것 {filter_missed}건" if categories else "")
+        )
+        print(
+            "   └ 창 깊이: "
+            + " / ".join(f"{size}건={format_span(minutes)}" for size, minutes in depth)
+            + f" | 가장 몰렸을 때 1분 {rows[-1]['peak_1m']}건·5분 {rows[-1]['peak_5m']}건"
+            + (f" | 등록순 역전 {inversions}건(창 밖이 창 안보다 최근인 것 {beyond_newer}건)"
+               if inversions else "")
+            + (f" | 못 본 것 나이 {max(ages[0], 0):.0f}~{max(ages[-1], 0):.0f}분" if ages else "")
         )
 
     print()
@@ -246,7 +365,48 @@ async def scan(pages: int, fresh_hours: float) -> None:
     print(f"   대상 {len(seen_sample):,}건")
     for category, count, names in category_breakdown(excluded_all, top=8):
         print(f"   카테고리 {str(category):<8} {count:>5}건   예: {' / '.join(names)}")
+
+    report_window_sizes(rows)
     print("완료")
+
+
+def report_window_sizes(rows: list) -> None:
+    """창을 줄여도 되는지 판단할 근거를 한자리에 모읍니다.
+
+    '1분마다 도는데 매번 120건까지 볼 필요가 있나'라는 질문의 답은 건수가 아니라
+    **시간 깊이**에 있습니다. 창을 줄이면 조회가 가벼워지는 것이 아니라(페이지 크기는
+    라이브러리가 120으로 고정), 거슬러 볼 수 있는 시간이 짧아집니다. 그 시간이 봇이
+    메꿔야 하는 구간(정상 1분, 긴 정지 뒤 최대 24시간)보다 짧아지면 그때 놓칩니다.
+    """
+    sizes = [size for size, _ in (rows[0]["depth"] if rows else [])]
+    print("\n창을 줄여도 되는가 (건수가 아니라 '시간 깊이'로 봅니다):")
+    print(
+        "   ※ 페이지 크기는 mercapi가 120으로 고정해 보냅니다. 상한을 낮춰도 120건을\n"
+        "      받아 온 뒤 잘라낼 뿐이라 호출 수도 트래픽도 줄지 않습니다. 달라지는 것은\n"
+        "      '얼마나 거슬러 볼 수 있는가' 하나뿐입니다."
+    )
+    header = "   " + f"{'키워드':<26}" + "".join(f"{str(size) + '건':>14}" for size in sizes)
+    print(header)
+    for row in sorted(rows, key=lambda r: depth_sort_key(r)):
+        cells = "".join(f"{format_span(minutes):>14}" for _, minutes in row["depth"])
+        print(f"   {row['keyword']:<26}{cells}")
+    print(
+        f"\n   봇이 메꿔야 하는 구간: 정상 실행 간격 1분"
+        f" / 전체 조회 {FULL_SCAN_INTERVAL_SECONDS // 60}분"
+        f" / 긴 정지 뒤 최대 {MAX_LOOKBACK_SECONDS // 3600}시간"
+    )
+    worst = min(rows, key=depth_sort_key, default=None)
+    if worst is not None:
+        shallow = ", ".join(
+            f"{size}건={format_span(minutes)}" for size, minutes in worst["depth"]
+        )
+        print(f"   가장 얕은 키워드: [{worst['keyword']}] {shallow}")
+
+
+def depth_sort_key(row: dict) -> float:
+    """창이 가장 얕은(=빨리 차는) 키워드부터 오도록. 창이 남는 키워드는 맨 뒤로."""
+    last = row["depth"][-1][1] if row.get("depth") else None
+    return float("inf") if last is None else last
 
 
 def parse_args() -> argparse.Namespace:

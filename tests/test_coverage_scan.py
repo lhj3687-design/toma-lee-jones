@@ -127,5 +127,62 @@ class CoverageScanTests(unittest.TestCase):
         self.assertEqual(found, 7)
 
 
+
+class WindowDepthTests(unittest.TestCase):
+    """창을 '건수'가 아니라 '시간 깊이'로 옮겨 보는 계산들.
+
+    이 숫자로 "창을 줄여도 되는가"를 답하게 되므로, 계산이 틀리면 결론이 통째로
+    틀립니다. 특히 등록순 역전은 '앞 120건 = 가장 최근 120건'이라는 전제가 깨지는
+    자리라, 그것부터 잡아내는지 확인합니다.
+    """
+
+    def items(self, minutes_ago: list) -> list:
+        now = datetime.now().timestamp()
+        return [{"id_": str(i), "created": now - m * 60} for i, m in enumerate(minutes_ago)]
+
+    def test_depth_is_the_age_of_the_last_item_the_window_reaches(self):
+        now = datetime.now().timestamp()
+        fields = self.items([0, 10, 20, 30, 40])
+        profile = coverage_scan.window_depth(fields, now, sizes=(1, 3, 5))
+        self.assertEqual([size for size, _ in profile], [1, 3, 5])
+        self.assertAlmostEqual(profile[0][1], 0, delta=1)
+        self.assertAlmostEqual(profile[1][1], 20, delta=1)
+        self.assertAlmostEqual(profile[2][1], 40, delta=1)
+
+    def test_a_window_bigger_than_the_result_is_not_a_limit(self):
+        """매물이 창보다 적으면 창이 제약이 아닙니다 — 0분으로 세면 정반대로 읽힙니다."""
+        now = datetime.now().timestamp()
+        profile = coverage_scan.window_depth(self.items([0, 5]), now, sizes=(2, 120))
+        self.assertIsNone(profile[1][1])
+        self.assertEqual(coverage_scan.format_span(None), "창이 남음")
+
+    def test_inversions_catch_a_list_that_is_not_really_newest_first(self):
+        fields = self.items([0, 30, 10, 60])  # 세 번째가 두 번째보다 최근입니다
+        self.assertEqual(coverage_scan.order_inversions(fields), 1)
+        self.assertEqual(coverage_scan.order_inversions(self.items([0, 10, 20])), 0)
+
+    def test_items_outside_the_window_can_be_newer_than_the_window_tail(self):
+        fields = self.items([0, 90, 5, 120])  # 창 2건: 뒤쪽 5분짜리가 창 밖입니다
+        self.assertEqual(coverage_scan.newer_beyond_window(fields, window=2), 1)
+
+    def test_peak_counts_the_busiest_stretch_not_the_average(self):
+        fields = self.items([0, 0.5, 0.9, 50, 100])  # 1분 안에 3건이 몰렸습니다
+        self.assertEqual(coverage_scan.peak_arrivals(fields, 60), 3)
+
+    def test_missed_ages_only_covers_recent_listings_the_bot_does_not_have(self):
+        now = datetime.now().timestamp()
+        fresh_after = now - 24 * 3600
+        fields = self.items([3, 20, 60 * 48])  # 마지막은 이틀 전이라 '최근'이 아닙니다
+        fields[1]["id_"] = "seen"
+        ages = coverage_scan.missed_ages(fields, {"seen"}, fresh_after, now)
+        self.assertEqual(len(ages), 1)
+        self.assertAlmostEqual(ages[0], 3, delta=1)
+
+    def test_span_is_readable_at_every_scale(self):
+        self.assertEqual(coverage_scan.format_span(45), "45분치")
+        self.assertEqual(coverage_scan.format_span(60 * 5), "5.0시간치")
+        self.assertEqual(coverage_scan.format_span(60 * 24 * 3), "3.0일치")
+
+
 if __name__ == "__main__":
     unittest.main()
