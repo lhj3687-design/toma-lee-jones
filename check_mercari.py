@@ -54,6 +54,22 @@ MAX_SEEN_ITEMS = 15000
 # 재정렬되는 항목 수가 결정하고, 늘어난 꼬리는 다시 조회되지 않아 델타에 기여하지
 # 않습니다(같은 조건 실측: 11.1 -> 9.9KB/커밋, 압축 기준 일회성 +0.35MB).
 MAX_RELIST_FINGERPRINTS = 15000
+# 재출품 판정을 미뤄 둔 기록. '예전 매물이 정말 사라졌는지'를 시간으로 확인하는 동안만
+# 남아 있습니다(아래 confirm_disappearance 참고). 동시에 몇 건 이상 쌓일 일이 없지만,
+# 판정 도중 매물이 팔려서 다시 조회되지 않으면 그 기록은 스스로 사라지지 않으므로
+# 상한과 수명을 둡니다.
+MAX_PENDING_RELISTS = 500
+PENDING_RELIST_TTL_SECONDS = 24 * 60 * 60
+# '이번 조회 결과에 없다'는 사라졌다는 뜻이 아닙니다. 키워드당 상위 120건만 보기 때문에,
+# 버젓이 올라와 있는 매물도 순위가 밀리면 그대로 결과에서 빠집니다. 그래서 지문의 주인이
+# 이 시간 동안 한 번도 다시 나타나지 않아야 '사라졌다'로 인정합니다.
+# 실측(2026-09-13): 확실한 오판 36건 중 28건은 예전 매물이 2분 안에 다시 관측됐고,
+# 중앙값은 81초였습니다. 10분이면 전체 조회(5분 간격)를 최소 두 번 거칩니다.
+RELIST_ABSENCE_SECONDS = 10 * 60
+# 시간만으로는 부족합니다. 봇이 몇 시간 멈춰 있다 깨어난 실행 하나가 '10분이 지났다'는
+# 이유로 판정을 내리면, 실제로 확인한 것은 한 번뿐입니다. 전체 조회로 실제 확인한
+# 횟수도 함께 셉니다.
+MIN_RELIST_ABSENCE_CHECKS = 2
 PRICE_DROP_ALERT_THRESHOLD = 1000  # 마지막 알림 가격보다 이 금액(엔) 이상 떨어졌을 때만 알립니다.
 MAX_PENDING_ALERTS = 500
 # 이미 보낸 알림 목록. 같은 알림이 두 번 나가는 걸 막는 마지막 방어선입니다.
@@ -239,8 +255,8 @@ NEW_ITEM_SORT_PASS = "created"
 FULL_SCAN_INTERVAL_SECONDS = 5 * 60
 
 
-def load_state() -> tuple[dict, list, list, dict, set, dict]:
-    empty = ({}, [], [], {}, set(LEGACY_KEYWORDS_SEEDED_AT_UPGRADE), {})
+def load_state() -> tuple[dict, list, list, dict, set, dict, dict]:
+    empty = ({}, [], [], {}, set(LEGACY_KEYWORDS_SEEDED_AT_UPGRADE), {}, {})
 
     if not SEEN_FILE.exists():
         return empty
@@ -275,6 +291,14 @@ def load_state() -> tuple[dict, list, list, dict, set, dict]:
     )
     raw_checked_at = data.get("keyword_checked_at")
     keyword_checked_at = dict(raw_checked_at) if isinstance(raw_checked_at, dict) else {}
+    # 판정을 미뤄 둔 재출품 후보. 이 필드가 없는 예전 상태 파일은 빈 값으로 시작합니다
+    # (그 실행부터 새로 확인이 시작될 뿐, 잃는 것은 없습니다).
+    raw_pending_relists = data.get("pending_relists")
+    pending_relists = (
+        {str(key): value for key, value in raw_pending_relists.items() if isinstance(value, dict)}
+        if isinstance(raw_pending_relists, dict)
+        else {}
+    )
     # 마지막 '전체 조회' 시각은 keyword_checked_at 안에 예약 키로 같이 보관합니다.
     # (상태 파일 형식과 병합 로직을 그대로 두면서 값 하나만 늘리기 위한 선택입니다.)
 
@@ -285,6 +309,7 @@ def load_state() -> tuple[dict, list, list, dict, set, dict]:
         prune_fingerprints(relist_fingerprints if isinstance(relist_fingerprints, dict) else {}),
         known_keywords,
         keyword_checked_at,
+        pending_relists,
     )
 
 
@@ -435,6 +460,7 @@ def save_state(
     relist_fingerprints: dict,
     known_keywords: set,
     keyword_checked_at: dict | None = None,
+    pending_relists: dict | None = None,
 ) -> None:
     sent_alerts = unique_recent(sent_alerts, MAX_SENT_ALERTS)
     pending = deduplicate_pending(pending, sent_alerts)
@@ -446,6 +472,9 @@ def save_state(
         "relist_fingerprints": dict(list(relist_fingerprints.items())[-MAX_RELIST_FINGERPRINTS:]),
         "known_keywords": sorted(known_keywords),
         "keyword_checked_at": keyword_checked_at or {},
+        # 판정 보류 기록은 맨 뒤에 둡니다. 앞에 끼우면 매 커밋 파일 전체의 바이트 배치가
+        # 밀려서, 몇 건 안 되는 값 때문에 git 델타가 통째로 커집니다.
+        "pending_relists": dict(list((pending_relists or {}).items())[-MAX_PENDING_RELISTS:]),
     }
     temporary_file = SEEN_FILE.with_suffix(".tmp")
     temporary_file.write_text(json.dumps(data, ensure_ascii=False))
@@ -459,6 +488,7 @@ def absorb_pushed_state(
     relist_fingerprints: dict,
     known_keywords: set,
     keyword_checked_at: dict | None = None,
+    pending_relists: dict | None = None,
 ) -> None:
     """push_state가 원격과 병합했다면 그 결과를 메모리로 되가져옵니다.
 
@@ -494,6 +524,7 @@ def absorb_pushed_state(
         (seen, "seen"),
         (relist_fingerprints, "relist_fingerprints"),
         (keyword_checked_at, "keyword_checked_at"),
+        (pending_relists, "pending_relists"),
     ):
         merged = data.get(key)
         if target is not None and isinstance(merged, dict):
@@ -745,6 +776,7 @@ async def flush_pending(
     relist_fingerprints: dict,
     known_keywords: set,
     keyword_checked_at: dict | None = None,
+    pending_relists: dict | None = None,
 ) -> tuple[list, list]:
     """대기열을 전송하고, 성공할 때마다 곧바로 원격 저장소에 기록합니다.
 
@@ -805,7 +837,10 @@ async def flush_pending(
             remaining.pop(0)
             sent += 1
             consecutive_failures = 0
-            save_state(seen, remaining, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at)
+            save_state(
+                seen, remaining, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at,
+                pending_relists,
+            )
             if not push_state("record Mercari alert delivery"):
                 print(
                     "[중단] 전송 기록 저장에 실패해 이번 실행은 여기서 멈춥니다 "
@@ -817,7 +852,8 @@ async def flush_pending(
             # 이걸 빼먹으면 다음 알림의 save_state가 병합 결과를 덮어써서, 상대편이
             # 이미 보낸 알림이 다시 나갑니다(absorb_pushed_state 주석 참고).
             absorb_pushed_state(
-                seen, remaining, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at
+                seen, remaining, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at,
+                pending_relists,
             )
             sent_keys = set(sent_alerts)
             await asyncio.sleep(SEND_INTERVAL_SECONDS)
@@ -988,11 +1024,20 @@ async def check_keyword(
     relist_fingerprints: dict,
     new_items: list,
     created_cutoff: float | None = None,
+    pending_relists: dict | None = None,
 ) -> bool:
     items, succeeded, _coverage = await search_items(m, keyword, categories, created_cutoff)
     if not succeeded:
         return False
-    process_items(keyword, items, seen, relist_fingerprints, new_items, created_cutoff)
+    process_items(
+        keyword,
+        items,
+        seen,
+        relist_fingerprints,
+        new_items,
+        created_cutoff,
+        pending_relists=pending_relists,
+    )
     return True
 
 
@@ -1000,6 +1045,83 @@ def listed_item_ids(items: list[dict]) -> set[str]:
     """지금 실제로 올라와 있는 매물 ID 집합. 재출품 판정에서
     '예전 매물이 정말 사라졌는지' 확인하는 데 씁니다."""
     return {item_id for item_id in (extract_item_id(fields) for fields in items) if item_id}
+
+
+def prune_pending_relists(pending_relists: dict, seen: dict, now: float) -> None:
+    """해결되지 않은 판정 보류 기록을 정리합니다.
+
+    보류 기록은 그 매물이 다시 조회될 때마다 갱신되고 판정이 끝나면 지워집니다.
+    그런데 판정 도중 매물이 팔리거나 검색 창 밖으로 밀려나면 다시 조회되지 않아
+    영영 남습니다. 그래서 두 가지를 걸러냅니다.
+
+      - 이미 seen에 들어간 매물(다른 실행이 먼저 판정을 끝냈음).
+      - 수명을 넘긴 기록.
+    """
+    for item_id in [key for key in pending_relists if key in seen]:
+        pending_relists.pop(item_id, None)
+    for item_id, entry in list(pending_relists.items()):
+        since = entry.get("since") if isinstance(entry, dict) else None
+        if not isinstance(since, (int, float)) or now - float(since) > PENDING_RELIST_TTL_SECONDS:
+            pending_relists.pop(item_id, None)
+
+
+def confirm_disappearance(
+    item_id: str,
+    matched_id: str,
+    listed_ids: set[str],
+    pending_relists: dict,
+    now: float,
+    fresh: bool,
+    can_confirm_absence: bool,
+) -> tuple[str, bool]:
+    """처음 보는 ID가 기존 지문의 가격 이력을 물려받아도 되는지 판정합니다.
+
+    판정의 핵심은 '예전 매물이 정말 사라졌는가'인데, **이번 조회 결과에 없다는 것은
+    사라졌다는 뜻이 아닙니다.** 키워드당 상위 120건만 보기 때문에, 버젓이 올라와 있는
+    매물도 순위가 밀리면 결과에서 빠집니다. 실제로 그래서 서로 다른 두 매물이 하나로
+    묶였습니다(README "재출품 감지" 참고).
+
+    그래서 없다는 것 하나로는 판정하지 않고, **다시 나타나지 않는 것을 시간으로**
+    확인합니다.
+
+      - 예전 매물이 이번 결과에 있음 -> 살아 있습니다. 즉시 '별개의 매물'("alive").
+        있다는 것은 빠른 조회(등록순만)에서도 확실한 증거이므로 바로 씁니다.
+      - 없음 -> 아직 모릅니다("wait"). 이번 실행은 이 매물의 상태를 건드리지 않고,
+        보류 기록만 남겨 다음 실행이 이어서 확인합니다.
+      - RELIST_ABSENCE_SECONDS 동안 전체 조회로 MIN_RELIST_ABSENCE_CHECKS번 이상
+        확인했는데도 한 번도 안 나타남 -> 사라진 것으로 봅니다("gone").
+
+    두 번째 값은 '처음 봤을 때 갓 올라온 매물이었는지'입니다. 판정을 미루는 동안
+    키워드의 조회 기준선이 전진하므로, 나중에 '별개의 매물'로 결론이 나도 그때 다시
+    재면 '오래된 매물'로 보여 신규 알림이 조용히 사라집니다. 처음 본 순간의 판단을
+    들고 갑니다.
+    """
+    entry = pending_relists.get(item_id)
+    if not isinstance(entry, dict) or entry.get("matched_id") != matched_id:
+        # 처음 보류하거나, 지문의 주인이 그새 바뀐 경우입니다. 다시 셉니다.
+        entry = {"matched_id": matched_id, "since": now, "checks": 0, "fresh": bool(fresh)}
+        pending_relists[item_id] = entry
+    was_fresh = bool(entry.get("fresh")) or bool(fresh)
+    entry["fresh"] = was_fresh
+
+    if matched_id in listed_ids:
+        pending_relists.pop(item_id, None)
+        return "alive", was_fresh
+
+    if can_confirm_absence and entry.get("checked_at") != now:
+        # 한 실행에서 여러 키워드가 같은 매물을 물고 올 수 있어, 실행당 한 번만 셉니다.
+        entry["checks"] = int(entry.get("checks") or 0) + 1
+        entry["checked_at"] = now
+
+    since = entry.get("since")
+    since = float(since) if isinstance(since, (int, float)) else now
+    if (
+        now - since >= RELIST_ABSENCE_SECONDS
+        and int(entry.get("checks") or 0) >= MIN_RELIST_ABSENCE_CHECKS
+    ):
+        pending_relists.pop(item_id, None)
+        return "gone", was_fresh
+    return "wait", was_fresh
 
 
 def process_items(
@@ -1011,6 +1133,8 @@ def process_items(
     created_cutoff: float | None = None,
     listed_ids: set[str] | None = None,
     can_resolve_relists: bool = True,
+    pending_relists: dict | None = None,
+    now: float | None = None,
 ) -> None:
     """검색 결과를 보고 신규/가격인하 알림을 만들고 상태를 갱신합니다.
 
@@ -1018,9 +1142,18 @@ def process_items(
     한 키워드의 결과만으로 판단하면, 같은 판매자가 제목이 똑같은 상품을 여러 개 올렸는데
     카테고리 필터 때문에 한쪽만 검색에 잡히는 경우 별개의 매물을 재출품으로 오인합니다.
     그래서 이번 실행의 모든 키워드 결과를 합쳐서 넘겨줍니다.
+
+    can_resolve_relists는 '이번 실행의 결과로 사라짐을 확인해도 되는지'입니다.
+    빠른 조회(등록순만)는 오래 올라와 있는 매물을 아예 훑지 않으므로 없다는 사실에
+    아무 뜻이 없습니다. 반대로 **있다는 사실은 어느 조회에서든 확실한 증거**라서,
+    빠른 조회에서도 '별개의 매물' 판정은 그대로 씁니다.
     """
     if listed_ids is None:
         listed_ids = listed_item_ids(items)
+    if pending_relists is None:
+        pending_relists = {}
+    if now is None:
+        now = current_time()
 
     new_count = 0
     drop_count = 0
@@ -1058,6 +1191,8 @@ def process_items(
         )
         price_txt = f"¥{price:,}" if isinstance(price, int) else "가격 확인 필요"
 
+        fresh = is_fresh_listing(listing_created_at(fields), created_cutoff)
+
         if item_id in seen:
             record = price_record(seen, item_id)
         else:
@@ -1076,27 +1211,36 @@ def process_items(
                 # 같은 ID의 지문이 남아 있음 = 예전에 확인했는데 seen에서만 밀려난 매물.
                 record = restored
             elif matched and matched_id is not None:
-                if not can_resolve_relists:
-                    # 등록순만 훑은 '빠른 조회'에서는 이 매물이 재출품인지, 제목이 우연히
-                    # 같은 별개의 매물인지 가릴 근거(전체 매물 목록)가 없습니다.
-                    # 잘못 판단하면 알림이 새거나 삼켜지므로, 이번 실행에서는 상태를
-                    # 건드리지 않고 다음 전체 조회(최대 5분 뒤)에 맡깁니다.
+                # 지문의 주인이 지금도 버젓이 올라와 있다면 재출품이 아니라 별개의 매물입니다.
+                # 없다고 해서 사라진 것은 아니므로(상위 120건 창 밖으로 밀리기만 해도
+                # 결과에서 빠집니다) 사라짐은 시간을 두고 확인합니다.
+                verdict, was_fresh = confirm_disappearance(
+                    item_id,
+                    matched_id,
+                    listed_ids,
+                    pending_relists,
+                    now,
+                    fresh,
+                    can_resolve_relists,
+                )
+                if verdict == "wait":
+                    # 아직 모릅니다. 이번 실행은 이 매물의 상태를 건드리지 않고 넘어갑니다.
+                    # (여기서 신규로 처리하면 진짜 재출품에 중복 알림이 나가고, 재출품으로
+                    #  처리하면 별개 매물의 신규 알림이 삼켜집니다.)
                     deferred_count += 1
                     continue
-                # 지문의 주인이 지금도 버젓이 올라와 있다면 재출품이 아니라 별개의 매물입니다.
-                # 특히 판매자 ID를 알 수 없는 숍스 상품에서 이 혼동이 잦은데,
-                # 그대로 두면 진짜 새 매물 알림이 조용히 삼켜집니다.
-                if matched_id in listed_ids:
-                    record = None
-                else:
+                if verdict == "gone":
                     record = restored
                     relist_count += 1
+                else:
+                    record = None
+                    fresh = was_fresh
             else:
                 record = None
 
         if record is None:
             remember(seen, item_id, {"last_alert_price": price, "last_seen_price": price})
-            if is_fresh_listing(listing_created_at(fields), created_cutoff):
+            if fresh:
                 caption = f"[{keyword}] {name}\n💴 {price_txt}\n🔗 {item_url}"
                 new_items.append({"alert_id": f"new:{item_id}", "caption": caption, "photo": photo})
                 new_count += 1
@@ -1616,11 +1760,20 @@ def forget_removed_keywords(known_keywords: set, keyword_checked_at: dict) -> No
 
 async def collect_updates() -> None:
     mercari = Mercapi()
-    seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at = load_state()
+    (
+        seen,
+        pending,
+        sent_alerts,
+        relist_fingerprints,
+        known_keywords,
+        keyword_checked_at,
+        pending_relists,
+    ) = load_state()
     forget_removed_keywords(known_keywords, keyword_checked_at)
     is_first_run = len(seen) == 0
     new_items: list = []
     now = current_time()
+    prune_pending_relists(pending_relists, seen, now)
     # 키워드별 조회 시각은 아래 루프에서 갱신되므로, 판정에 쓸 '갱신 전' 값을 미리 떠 둡니다.
     previous_checked_at = dict(keyword_checked_at)
 
@@ -1676,6 +1829,8 @@ async def collect_updates() -> None:
                 created_cutoff=cutoff,
                 listed_ids=listed_ids,
                 can_resolve_relists=full_scan,
+                pending_relists=pending_relists,
+                now=now,
             )
 
         if baseline_only:
@@ -1726,28 +1881,49 @@ async def collect_updates() -> None:
         pending = deduplicate_pending(pending + new_items + warnings, sent_alerts)
         print(f"새 알림 {len(new_items)}건 발견 (저장될 대기열 {len(pending)}건)")
 
-    save_state(seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at)
+    save_state(
+        seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at,
+        pending_relists,
+    )
 
 
 async def send_pending() -> None:
-    seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at = load_state()
+    # 전송 단계도 상태 파일을 통째로 다시 씁니다. 판정 보류 기록을 같이 들고 다니지 않으면
+    # 알림 한 건 보낼 때마다 그 기록이 지워져, 확인 중이던 재출품 판정이 매번 처음부터
+    # 다시 시작됩니다(sent_alerts가 같은 이유로 absorb_pushed_state를 쓰는 것과 같습니다).
+    (
+        seen,
+        pending,
+        sent_alerts,
+        relist_fingerprints,
+        known_keywords,
+        keyword_checked_at,
+        pending_relists,
+    ) = load_state()
     pending = deduplicate_pending(pending, sent_alerts)
 
     if not pending:
         print("전송할 대기 알림이 없습니다")
-        save_state(seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at)
+        save_state(
+            seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at,
+            pending_relists,
+        )
         return
 
     try:
         pending, sent_alerts = await flush_pending(
-            seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at
+            seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at,
+            pending_relists,
         )
     finally:
         # flush_pending이 SendBlocked로 끝난 경우에도 이 저장은 정확합니다.
         # sent_alerts는 제자리에서 갱신되므로 이미 보낸 건이 반영되고, pending은 호출 전
         # 값이라 이번 실행에서 건드린 순서 변경이 남지 않습니다. 그리고 save_state가
         # sent_alerts에 있는 항목을 대기열에서 걸러 내므로 재전송도 생기지 않습니다.
-        save_state(seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at)
+        save_state(
+            seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at,
+            pending_relists,
+        )
 
     if pending:
         print(f"[대기열에 {len(pending)}건 남음 -> 다음 실행에 재시도]", file=sys.stderr)

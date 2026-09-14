@@ -341,58 +341,88 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
     async def test_relist_with_same_seller_id_does_not_trigger_new_alert(self):
         # 같은 판매자가 삭제 후 새 ID로 재등록한 경우: '신규' 알림 없이
         # 예전 최저가 기록을 새 ID로 이어받아야 합니다.
+        # 다만 예전 매물이 정말 사라졌는지는 시간을 두고 확인하므로(아래 판정 보류
+        # 테스트들 참고), 확인 창이 지난 뒤에 판정이 납니다.
         seen = {}
         relist_fingerprints = {}
+        pending_relists: dict = {}
         new_items: list = []
+        base = datetime.now().timestamp()
 
-        api1 = FakeMercapi(
-            {"test": [FakeItem("m1000", "Margiela 초레어 카트소", 20000, seller_id="seller-A")]}
-        )
-        await mercari.check_keyword(api1, "test", [], seen, relist_fingerprints, new_items)
+        async def observe(item, at):
+            new_items.clear()
+            with patch.object(mercari, "current_time", return_value=at):
+                await mercari.check_keyword(
+                    FakeMercapi({"test": [item]}),
+                    "test",
+                    [],
+                    seen,
+                    relist_fingerprints,
+                    new_items,
+                    pending_relists=pending_relists,
+                )
+
+        await observe(FakeItem("m1000", "Margiela 초레어 카트소", 20000, seller_id="seller-A"), base)
         self.assertEqual([e["alert_id"] for e in new_items], ["new:m1000"])
 
         # 판매자가 삭제 후 재등록: ID는 바뀌었지만 판매자+제목(공백/기호 차이만 있음)은 동일
-        new_items.clear()
-        api2 = FakeMercapi(
-            {"test": [FakeItem("m2000", "  Margiela  초레어  카트소 ", 20000, seller_id="seller-A")]}
-        )
-        await mercari.check_keyword(api2, "test", [], seen, relist_fingerprints, new_items)
+        relisted = FakeItem("m2000", "  Margiela  초레어  카트소 ", 20000, seller_id="seller-A")
+        await observe(relisted, base + 60)
+        self.assertEqual(new_items, [])          # 아직 판정하지 않습니다
+        self.assertNotIn("m2000", seen)          # 상태도 건드리지 않습니다
 
+        # 확인 창이 지나도록 예전 매물이 한 번도 다시 나타나지 않으면 재출품으로 판정합니다.
+        await observe(relisted, base + 60 + mercari.RELIST_ABSENCE_SECONDS)
         self.assertEqual(new_items, [])  # 재출품이므로 '신규' 알림 없음
         # 예전 ID는 굳이 지우지 않습니다. 지워 버리면 그 매물이 검색에 다시 잡혔을 때
         # 처음 보는 매물로 오인돼 알림이 가기 때문에, 용량 상한에 밀려 자연스럽게 사라지게 둡니다.
         self.assertIn("m1000", seen)
         self.assertEqual(seen["m2000"], {"last_alert_price": 20000, "last_seen_price": 20000})
+        self.assertEqual(pending_relists, {})  # 판정이 끝난 기록은 남지 않습니다
 
         # 재등록하면서 1000엔 이상 더 싸게 올렸다면 가격인하 알림은 정상적으로 와야 함
-        new_items.clear()
-        api3 = FakeMercapi(
-            {"test": [FakeItem("m3000", "Margiela 초레어 카트소", 18000, seller_id="seller-A")]}
-        )
-        await mercari.check_keyword(api3, "test", [], seen, relist_fingerprints, new_items)
+        cheaper = FakeItem("m3000", "Margiela 초레어 카트소", 18000, seller_id="seller-A")
+        start = base + 60 + mercari.RELIST_ABSENCE_SECONDS
+        await observe(cheaper, start + 60)
+        self.assertEqual(new_items, [])
+        await observe(cheaper, start + 60 + mercari.RELIST_ABSENCE_SECONDS)
         self.assertEqual([e["alert_id"] for e in new_items], ["drop:m3000:20000:18000"])
 
     async def test_relist_fallback_to_title_and_exact_price_without_seller_id(self):
         # seller_id를 못 가져오는 경우, 제목+가격이 완전히 같을 때만 재출품으로 판단합니다.
         seen = {}
         relist_fingerprints = {}
+        pending_relists: dict = {}
         new_items: list = []
+        base = datetime.now().timestamp()
 
-        api1 = FakeMercapi({"test": [FakeItem("m1", "Chrome Hearts Tシャツ", 32000)]})
-        await mercari.check_keyword(api1, "test", [], seen, relist_fingerprints, new_items)
+        async def observe(item, at):
+            new_items.clear()
+            with patch.object(mercari, "current_time", return_value=at):
+                await mercari.check_keyword(
+                    FakeMercapi({"test": [item]}),
+                    "test",
+                    [],
+                    seen,
+                    relist_fingerprints,
+                    new_items,
+                    pending_relists=pending_relists,
+                )
+
+        await observe(FakeItem("m1", "Chrome Hearts Tシャツ", 32000), base)
         self.assertEqual([e["alert_id"] for e in new_items], ["new:m1"])
 
-        # 같은 제목, 같은 가격, 다른 ID -> 재출품으로 처리 (알림 없음)
-        new_items.clear()
-        api2 = FakeMercapi({"test": [FakeItem("m2", "Chrome Hearts Tシャツ", 32000)]})
-        await mercari.check_keyword(api2, "test", [], seen, relist_fingerprints, new_items)
+        # 같은 제목, 같은 가격, 다른 ID -> 예전 매물이 다시 나타나지 않는 것을 확인한 뒤
+        # 재출품으로 처리 (알림 없음)
+        second = FakeItem("m2", "Chrome Hearts Tシャツ", 32000)
+        await observe(second, base + 60)
+        self.assertEqual(new_items, [])
+        await observe(second, base + 60 + mercari.RELIST_ABSENCE_SECONDS)
         self.assertEqual(new_items, [])
         self.assertIn("m2", seen)
 
         # 같은 제목이라도 가격이 다르면(단서 부족) 구분 못 하고 신규로 처리 -> 알려진 한계
-        new_items.clear()
-        api3 = FakeMercapi({"test": [FakeItem("m3", "Chrome Hearts Tシャツ", 29000)]})
-        await mercari.check_keyword(api3, "test", [], seen, relist_fingerprints, new_items)
+        await observe(FakeItem("m3", "Chrome Hearts Tシャツ", 29000), base + 1800)
         self.assertEqual([e["alert_id"] for e in new_items], ["new:m3"])
 
     def test_load_state_seeds_legacy_keywords_when_field_missing(self):
@@ -400,7 +430,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         # 예전부터 쓰던 키워드들은 이미 알려진 것으로 간주되어야, 이번 배포로
         # 오래된 키워드까지 신규로 오인해 알림을 생략해버리는 일이 없습니다.
         mercari.SEEN_FILE.write_text(json.dumps({"seen": {"a": 1}, "pending": [], "sent_alerts": []}))
-        _, _, _, _, known_keywords, _ = mercari.load_state()
+        _, _, _, _, known_keywords, _, _ = mercari.load_state()
         self.assertIn("Martin Margiela", known_keywords)
         self.assertIn("Chrome Hearts", known_keywords)
         # 이번에 새로 추가한 키워드는 레거시 시드 목록에 없어야 함(=첫 조회 시 알림 억제 대상)
@@ -423,8 +453,11 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
 
     def test_missing_state_file_still_starts_clean(self):
         # 파일이 아예 없는 건 정상적인 첫 실행입니다. 이때는 멈추면 안 됩니다.
-        seen, pending, sent, fingerprints, _known, checked_at = mercari.load_state()
-        self.assertEqual((seen, pending, sent, fingerprints, checked_at), ({}, [], [], {}, {}))
+        seen, pending, sent, fingerprints, _known, checked_at, pending_relists = mercari.load_state()
+        self.assertEqual(
+            (seen, pending, sent, fingerprints, checked_at, pending_relists),
+            ({}, [], [], {}, {}, {}),
+        )
 
     def test_fingerprints_with_unexpected_values_are_dropped(self):
         # 지문 값에서 item_id와 가격을 꺼내 쓰므로, dict가 아닌 값이 섞이면
@@ -460,6 +493,27 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         state = json.loads(mercari.SEEN_FILE.read_text())
         self.assertEqual(state["pending"], [])
         self.assertEqual(state["sent_alerts"], ["new:ok"])
+
+    async def test_sending_alerts_does_not_erase_pending_relist_judgements(self):
+        """전송 단계도 상태 파일을 통째로 다시 씁니다.
+
+        판정 보류 기록을 들고 다니지 않으면 알림 한 건 보낼 때마다 지워져,
+        확인 중이던 재출품 판정이 매번 처음부터 다시 시작됩니다 —
+        즉 알림이 꾸준히 나가는 동안에는 판정이 영영 끝나지 않습니다.
+        """
+        waiting = {"m-new": {"matched_id": "m-old", "since": 1000.0, "checks": 1, "fresh": True}}
+        mercari.save_state(
+            {}, [{"alert_id": "new:x", "caption": "본문"}], [], {}, set(), {}, waiting
+        )
+
+        with patch.object(mercari, "send_telegram", new=AsyncMock(return_value=(True, None))), patch.object(
+            mercari, "push_state", return_value=True
+        ):
+            await mercari.send_pending()
+
+        state = json.loads(mercari.SEEN_FILE.read_text())
+        self.assertEqual(state["sent_alerts"], ["new:x"])
+        self.assertEqual(state["pending_relists"], waiting)
 
     def test_save_state_removes_duplicate_and_already_sent_alerts(self):
         pending = [
@@ -860,7 +914,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
         )
-        _, _, _, fingerprints, _, _ = mercari.load_state()
+        _, _, _, fingerprints, _, _, _ = mercari.load_state()
         self.assertEqual(list(fingerprints), ["seller:1:title"])
 
 
@@ -885,11 +939,219 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e["alert_id"] for e in new_items], ["new:shop-2"])
 
         # 반대로 예전 매물이 사라진 뒤 같은 제목+가격으로 다시 올라오면 재출품으로 처리합니다.
-        new_items.clear()
+        # (사라졌다는 것은 확인 창이 지나야 인정되므로 두 번 관찰합니다.)
+        pending_relists: dict = {}
+        base = datetime.now().timestamp()
         third = FakeItem("shop-3", "같은 제목 같은 가격", 5000, seller_id="0")
-        api3 = FakeMercapi({"test": [third]})
-        await mercari.check_keyword(api3, "test", [], seen, relist_fingerprints, new_items)
+        for at in (base, base + mercari.RELIST_ABSENCE_SECONDS):
+            new_items.clear()
+            with patch.object(mercari, "current_time", return_value=at):
+                await mercari.check_keyword(
+                    FakeMercapi({"test": [third]}),
+                    "test",
+                    [],
+                    seen,
+                    relist_fingerprints,
+                    new_items,
+                    pending_relists=pending_relists,
+                )
+            self.assertEqual(new_items, [])
+        self.assertIn("shop-3", seen)
+
+    async def test_a_missing_old_listing_is_not_judged_gone_on_the_first_run(self):
+        """'이번 결과에 없다'는 사라졌다는 뜻이 아닙니다.
+
+        키워드당 상위 120건만 보기 때문에 버젓이 올라와 있는 매물도 순위가 밀리면
+        결과에서 빠집니다. 그 한 번을 근거로 판정하면 서로 다른 두 매물이 하나로
+        묶입니다(운영에서 실제로 일어난 일 — README "재출품 감지" 참고).
+        첫 실행에서는 아무것도 판정하지 않고 상태도 건드리지 않아야 합니다.
+        """
+        seen: dict = {}
+        relist_fingerprints = {
+            "seller:A:마르지엘라가방": {
+                "item_id": "m-old",
+                "last_alert_price": 257100,
+                "last_seen_price": 257100,
+            }
+        }
+        pending_relists: dict = {}
+        new_items: list = []
+
+        mercari.process_items(
+            "test",
+            [vars(FakeItem("m-new", "마르지엘라 가방", 47500, seller_id="A"))],
+            seen,
+            relist_fingerprints,
+            new_items,
+            listed_ids={"m-new"},
+            pending_relists=pending_relists,
+            now=1000.0,
+        )
+
+        self.assertEqual(new_items, [])       # 신규 알림도, 인하 알림도 없습니다
+        self.assertEqual(seen, {})            # 상태를 건드리지 않습니다
+        self.assertEqual(relist_fingerprints["seller:A:마르지엘라가방"]["item_id"], "m-old")
+        self.assertEqual(pending_relists["m-new"]["matched_id"], "m-old")
+        self.assertEqual(pending_relists["m-new"]["since"], 1000.0)
+
+    async def test_an_old_listing_that_comes_back_proves_a_separate_item(self):
+        """운영에서 나갔던 틀린 알림의 회귀 테스트.
+
+        2026-09-12 06:26:42, 지문 seller:119903670:maisonmargielaブルゾン…의 주인
+        2JJ4Hj8xGFg7txonvrwDp5이 그 실행의 결과에 없다는 이유로 새 ID가 재출품으로
+        판정됐고, 물려받은 기준가로 `drop:…:257100:47500`이 실제로 전송됐습니다.
+        예전 매물은 그 뒤로도 계속 올라와 있었으므로 둘은 별개의 매물이었습니다.
+
+        확인 창 안에 예전 매물이 다시 나타나면 '별개의 매물'로 결론이 나야 하고,
+        예전 가격을 물려받은 인하 알림이 나가면 안 됩니다.
+        """
+        seen: dict = {}
+        fingerprint = "seller:119903670:maisonmargielaブルゾンその他メンズ古着中古送料無料"
+        relist_fingerprints = {
+            fingerprint: {
+                "item_id": "2JJ4Hj8xGFg7txonvrwDp5",
+                "last_alert_price": 257100,
+                "last_seen_price": 257100,
+            }
+        }
+        pending_relists: dict = {}
+        new_items: list = []
+        # 제목은 운영 기록 그대로입니다. 여기서 나오는 지문이 실제 지문과 같아야
+        # 이 테스트가 그 사고를 재현합니다.
+        title = "Maison Margiela ブルゾン（その他） メンズ 【古着】【中古】【送料無料】"
+        self.assertEqual(mercari.relist_fingerprint("119903670", title, 47500), fingerprint)
+        newcomer = vars(
+            FakeItem("2JTt64sCqodGJdNRSX2tmw", title, 47500, seller_id="119903670")
+        )
+
+        # 1회차: 예전 매물이 결과에 없음 -> 판정 보류
+        mercari.process_items(
+            "test", [newcomer], seen, relist_fingerprints, new_items,
+            listed_ids={"2JTt64sCqodGJdNRSX2tmw"}, pending_relists=pending_relists, now=1000.0,
+        )
         self.assertEqual(new_items, [])
+
+        # 2회차(50초 뒤, 실측 간격): 예전 매물이 다시 결과에 나타남 -> 별개의 매물
+        mercari.process_items(
+            "test", [newcomer], seen, relist_fingerprints, new_items,
+            listed_ids={"2JTt64sCqodGJdNRSX2tmw", "2JJ4Hj8xGFg7txonvrwDp5"},
+            pending_relists=pending_relists, now=1050.0,
+        )
+
+        self.assertEqual([e["alert_id"] for e in new_items], ["new:2JTt64sCqodGJdNRSX2tmw"])
+        self.assertEqual(
+            seen["2JTt64sCqodGJdNRSX2tmw"],
+            {"last_alert_price": 47500, "last_seen_price": 47500},  # 257100을 물려받지 않습니다
+        )
+        self.assertEqual(pending_relists, {})
+
+    async def test_absence_is_not_confirmed_by_a_single_check_however_long_it_took(self):
+        """시간만 보고 판정하면 몇 시간 멈췄다 깨어난 실행 하나가 판정을 끝내 버립니다.
+
+        그 실행이 실제로 확인한 것은 한 번뿐인데, 한 번 안 보이는 것이야말로 이 결함이
+        만들어지는 바로 그 자리입니다(순위가 밀려 결과에서 빠진 매물).
+        시간과 실제 확인 횟수를 함께 봐야 합니다.
+        """
+        seen: dict = {}
+        relist_fingerprints = {
+            "seller:A:t": {"item_id": "m-old", "last_alert_price": 5000, "last_seen_price": 5000}
+        }
+        pending_relists: dict = {}
+        item = vars(FakeItem("m-new", "t", 5000, seller_id="A"))
+
+        def run(now, full_scan=True):
+            mercari.process_items(
+                "test", [item], seen, relist_fingerprints, [],
+                listed_ids={"m-new"}, pending_relists=pending_relists, now=now,
+                can_resolve_relists=full_scan,
+            )
+
+        run(1000.0, full_scan=False)              # 빠른 조회: 보류만 시작, 확인 0회
+        run(1000.0 + 7 * 60 * 60)                 # 7시간 뒤 깨어난 첫 실행: 확인 1회
+        self.assertEqual(seen, {})                # 시간은 넘쳤지만 확인이 한 번뿐입니다
+        self.assertEqual(pending_relists["m-new"]["checks"], 1)
+        run(1000.0 + 7 * 60 * 60 + 60)            # 확인 2회째
+        self.assertIn("m-new", seen)
+
+    async def test_fast_scans_do_not_count_as_absence_checks(self):
+        """빠른 조회(등록순만)는 오래 올라와 있는 매물을 아예 훑지 않습니다.
+
+        거기서 '없다'는 것에는 아무 뜻이 없으므로 확인 횟수로 세면 안 됩니다.
+        반대로 '있다'는 것은 어떤 조회에서든 확실한 증거라 바로 씁니다.
+        """
+        relist_fingerprints = {
+            "seller:A:t": {"item_id": "m-old", "last_alert_price": 5000, "last_seen_price": 5000}
+        }
+        pending_relists: dict = {}
+        seen: dict = {}
+        item = vars(FakeItem("m-new", "t", 5000, seller_id="A"))
+
+        for step in range(20):
+            mercari.process_items(
+                "test", [item], seen, relist_fingerprints, [],
+                listed_ids={"m-new"}, pending_relists=pending_relists,
+                now=1000.0 + step * 60, can_resolve_relists=False,
+            )
+        self.assertEqual(seen, {})  # 빠른 조회만으로는 영영 판정하지 않습니다
+        self.assertEqual(pending_relists["m-new"]["checks"], 0)
+
+        # 같은 상황에서 예전 매물이 결과에 보이면 빠른 조회에서도 바로 판정합니다.
+        new_items: list = []
+        mercari.process_items(
+            "test", [item], seen, relist_fingerprints, new_items,
+            listed_ids={"m-new", "m-old"}, pending_relists=pending_relists,
+            now=1000.0 + 20 * 60, can_resolve_relists=False,
+        )
+        self.assertEqual([e["alert_id"] for e in new_items], ["new:m-new"])
+
+    async def test_a_deferred_listing_is_still_alerted_as_new_after_the_baseline_moved(self):
+        """판정을 미루는 동안 키워드의 조회 기준선은 계속 전진합니다.
+
+        결론이 '별개의 매물'로 났을 때 그 시점의 기준선으로 다시 재면 '오래된 매물'이
+        되어 신규 알림이 조용히 사라집니다. 처음 본 순간의 판단을 들고 가야 합니다.
+        """
+        listed_at = datetime.now()
+        item = vars(FakeItem("m-new", "t", 5000, seller_id="A", created=listed_at))
+        relist_fingerprints = {
+            "seller:A:t": {"item_id": "m-old", "last_alert_price": 5000, "last_seen_price": 5000}
+        }
+        pending_relists: dict = {}
+        seen: dict = {}
+        new_items: list = []
+        base = listed_at.timestamp()
+
+        # 1회차: 갓 올라온 매물이지만 예전 매물이 안 보여 판정 보류
+        mercari.process_items(
+            "test", [item], seen, relist_fingerprints, new_items,
+            created_cutoff=base - 60, listed_ids={"m-new"},
+            pending_relists=pending_relists, now=base,
+        )
+        self.assertEqual(new_items, [])
+
+        # 2회차: 예전 매물이 다시 보여 별개의 매물로 결론. 그사이 기준선이 한참 전진해
+        # 지금 기준으로는 '오래된 매물'이지만, 신규 알림은 나가야 합니다.
+        later = base + 40 * 60
+        mercari.process_items(
+            "test", [item], seen, relist_fingerprints, new_items,
+            created_cutoff=later - 60, listed_ids={"m-new", "m-old"},
+            pending_relists=pending_relists, now=later,
+        )
+        self.assertEqual([e["alert_id"] for e in new_items], ["new:m-new"])
+
+    def test_pending_relists_do_not_pile_up(self):
+        """판정 보류 기록은 그 매물이 다시 조회될 때만 갱신됩니다.
+
+        도중에 팔리거나 검색 창 밖으로 밀려나면 다시 조회되지 않아 영영 남습니다.
+        """
+        now = 100000.0
+        pending_relists = {
+            "sold": {"matched_id": "m-old", "since": now - mercari.PENDING_RELIST_TTL_SECONDS - 1},
+            "judged": {"matched_id": "m-old", "since": now - 60},
+            "live": {"matched_id": "m-old", "since": now - 60},
+            "broken": {"matched_id": "m-old"},
+        }
+        mercari.prune_pending_relists(pending_relists, {"judged": {}}, now)
+        self.assertEqual(sorted(pending_relists), ["live"])
 
     def test_extract_item_id_is_always_a_string(self):
         # 상태 파일은 JSON이라 키가 항상 문자열이 됩니다. 정수 ID가 섞이면 저장 전후로
@@ -1612,25 +1874,18 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
              patch.object(mercari, "current_time", return_value=base):
             await mercari.collect_updates()
 
-        # 2회차(빠른 조회, 1분 뒤): m2가 재출품인지 별개 매물인지 가릴 근거가 없으므로
-        # 상태를 건드리지 않고 판정을 미룹니다.
+        # 2회차(빠른 조회, 1분 뒤): 예전 매물 m1이 이번 실행의 다른 키워드 결과에
+        # 버젓이 들어 있습니다. **있다는 것은 어떤 조회에서든 확실한 증거**이므로
+        # 빠른 조회라도 바로 '별개의 매물'로 판정해 신규 알림을 내보냅니다.
         with patch.object(
             mercari, "Mercapi", return_value=FakeMercapi({"kw-a": [first], "kw-b": [second]})
         ), patch.object(mercari, "current_time", return_value=base + 60):
             await mercari.collect_updates()
 
         state = json.loads(mercari.SEEN_FILE.read_text())
-        self.assertEqual(state["pending"], [])
-        self.assertNotIn("m2", state["seen"])  # 다음 전체 조회에 맡김
-
-        # 3회차(전체 조회, 6분 뒤): 두 매물이 동시에 살아 있음이 확인되므로 새 매물로 알림
-        with patch.object(
-            mercari, "Mercapi", return_value=FakeMercapi({"kw-a": [first], "kw-b": [second]})
-        ), patch.object(mercari, "current_time", return_value=base + 360):
-            await mercari.collect_updates()
-
-        state = json.loads(mercari.SEEN_FILE.read_text())
         self.assertIn("new:m2", [entry["alert_id"] for entry in state["pending"]])
+        self.assertIn("m2", state["seen"])
+        self.assertEqual(state["pending_relists"], {})
 
 
     async def test_checkpoint_waits_when_only_the_new_item_search_fails(self):
@@ -1942,7 +2197,7 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
         )
-        _, _, _, fingerprints, _, _ = mercari.load_state()
+        _, _, _, fingerprints, _, _, _ = mercari.load_state()
         self.assertEqual(sorted(fingerprints), ["seller:777:real", "title:shop:5000"])
 
 
