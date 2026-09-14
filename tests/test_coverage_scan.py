@@ -68,6 +68,27 @@ class CoverageScanTests(unittest.TestCase):
         self.assertEqual(len(inside), coverage_scan.MAX_ITEMS_PER_KEYWORD)
         self.assertEqual(len(outside), 300 - coverage_scan.MAX_ITEMS_PER_KEYWORD)
 
+    def test_listings_newer_than_the_state_snapshot_are_not_misses(self):
+        """상태 파일은 항상 조금 과거입니다 — 그 뒤에 올라온 매물은 없는 게 당연합니다.
+
+        브랜치에서 돌리면 상태 파일이 브랜치를 딴 시점에 멈춰 있고, main에서 돌려도
+        체크아웃 뒤로 시간이 흐릅니다. 그 시차 안에 올라온 매물을 '못 봄'으로 세면
+        스캔을 늦게 돌릴수록 결함이 늘어나는 엉터리 숫자가 됩니다. 2026-09-14 측정에서
+        실제로 '창 안 못 본 것 8건'이 그렇게 나왔습니다(상태 파일 06:43, 스캔 07:03).
+        """
+        now = datetime.now()
+        fresh_after = (now - timedelta(hours=24)).timestamp()
+        checked_at = (now - timedelta(minutes=20)).timestamp()
+        items = [
+            {"id_": "봇이 보고 기록함", "created": now - timedelta(hours=2)},
+            {"id_": "봇이 볼 수 있었는데 없음", "created": now - timedelta(hours=1)},
+            {"id_": "상태 파일 이후 등록", "created": now - timedelta(minutes=5)},
+        ]
+        fresh, missed, after = coverage_scan.count_missed(
+            items, {"봇이 보고 기록함"}, fresh_after, checked_at
+        )
+        self.assertEqual((fresh, missed, after), (3, 1, 1))
+
     def test_only_recent_listings_count_as_missed(self):
         """오래된 매물이 상태 파일에 없는 건 정상입니다.
 
@@ -81,8 +102,8 @@ class CoverageScanTests(unittest.TestCase):
             {"id_": "new-missed", "created": now - timedelta(hours=2)},
             {"id_": "old-missed", "created": now - timedelta(days=30)},
         ]
-        fresh, missed = coverage_scan.count_missed(items, {"new-seen"}, fresh_after)
-        self.assertEqual((fresh, missed), (2, 1))
+        fresh, missed, after = coverage_scan.count_missed(items, {"new-seen"}, fresh_after)
+        self.assertEqual((fresh, missed, after), (2, 1, 0))
 
     def test_items_only_in_the_unfiltered_list_are_the_ones_the_filter_removed(self):
         """필터는 걸러내기만 합니다 — 통과했다면 순위가 앞당겨질 뿐 사라지지 않습니다."""
@@ -213,6 +234,10 @@ class WindowDepthTests(unittest.TestCase):
         fields[1]["id_"] = "seen"
         ages = coverage_scan.missed_ages(fields, {"seen"}, fresh_after, now)
         self.assertEqual(len(ages), 1)
+        # 상태 파일 이후에 올라온 것은 나이 목록에서도 빠집니다.
+        self.assertEqual(
+            coverage_scan.missed_ages(fields, {"seen"}, fresh_after, now, now - 10 * 60), []
+        )
         self.assertAlmostEqual(ages[0], 3, delta=1)
 
     def test_span_is_readable_at_every_scale(self):

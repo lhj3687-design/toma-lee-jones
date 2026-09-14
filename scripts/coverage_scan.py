@@ -46,14 +46,28 @@ from check_mercari import (  # noqa: E402  (경로를 먼저 잡아야 합니다
 PAGE_PAUSE_SECONDS = 1.0  # 봇이 페이지 사이에 두는 간격과 같게 둡니다.
 
 
-def load_seen_ids() -> set:
-    """봇이 지금까지 기록한 매물 ID. 상태 파일을 읽기만 합니다."""
+def load_state() -> tuple[set, dict]:
+    """봇이 기록한 매물 ID와, 키워드별로 마지막으로 조회한 시각.
+
+    조회 시각이 왜 필요한가: 이 스캔은 **체크아웃된 상태 파일**과 **지금 메루카리**를
+    맞대 봅니다. 둘 사이에는 항상 시차가 있습니다(브랜치에서 돌리면 그 브랜치를 딴
+    시점에 멈춰 있고, main에서 돌려도 체크아웃 이후 시간이 흐릅니다). 그 시차 안에
+    올라온 매물은 상태 파일에 없는 게 **당연합니다** — 봇이 아직 볼 기회가 없었으니까요.
+    그걸 '못 봄'으로 세면 스캔을 늦게 돌릴수록 결함이 늘어나는 엉터리 숫자가 됩니다.
+
+    실제로 2026-09-14 측정에서 이것 때문에 '창 안 못 본 것 8건'이 나왔습니다. 상태 파일은
+    06:43, 스캔은 07:03이었고, 여덟 건 전부 그 사이에 올라온 매물이었습니다.
+    """
     if not SEEN_FILE.exists():
         print(f"[경고] {SEEN_FILE}가 없습니다. 전부 '처음 보는 매물'로 집계됩니다", file=sys.stderr)
-        return set()
+        return set(), {}
     data = json.loads(SEEN_FILE.read_text())
     seen = data.get("seen") or {}
-    return set(seen if isinstance(seen, dict) else {str(item): None for item in seen})
+    seen_ids = set(seen if isinstance(seen, dict) else {str(item): None for item in seen})
+    checked_at = data.get("keyword_checked_at") or {}
+    if not isinstance(checked_at, dict):
+        checked_at = {}
+    return seen_ids, checked_at
 
 
 async def walk(api, keyword: str, categories: list, pages: int) -> tuple[list, int]:
@@ -130,15 +144,25 @@ def fresh_only(fields_list: list, fresh_after: float) -> list:
     return [f for f in fields_list if (listing_created_at(f) or 0) >= fresh_after]
 
 
-def count_missed(fields_list: list, seen_ids: set, fresh_after: float) -> tuple[int, int]:
-    """(최근 등록분 개수, 그중 상태 파일에 없는 개수)."""
+def count_missed(
+    fields_list: list, seen_ids: set, fresh_after: float, checked_at: float | None = None
+) -> tuple[int, int, int]:
+    """(최근 등록분, 진짜 못 본 것, 상태 파일 스냅숏 이후에 올라온 것).
+
+    `checked_at`은 봇이 이 키워드를 마지막으로 조회한 시각입니다. 그보다 **뒤에** 올라온
+    매물은 상태 파일에 있을 수가 없으므로 '못 봄'이 아닙니다. 넘기지 않으면 예전처럼
+    전부 '못 봄'으로 셉니다.
+    """
     fresh = [
         fields
         for fields in fields_list
         if (listing_created_at(fields) or 0) >= fresh_after
     ]
-    missed = [fields for fields in fresh if extract_item_id(fields) not in seen_ids]
-    return len(fresh), len(missed)
+    unseen = [fields for fields in fresh if extract_item_id(fields) not in seen_ids]
+    if checked_at is None:
+        return len(fresh), len(unseen), 0
+    after = [f for f in unseen if (listing_created_at(f) or 0) > checked_at]
+    return len(fresh), len(unseen) - len(after), len(after)
 
 
 def age_minutes(fields: dict, now: float) -> float | None:
@@ -249,7 +273,13 @@ def peak_arrivals(fields_list: list, seconds: float) -> int:
     return best
 
 
-def missed_ages(fields_list: list, seen_ids: set, fresh_after: float, now: float) -> list:
+def missed_ages(
+    fields_list: list,
+    seen_ids: set,
+    fresh_after: float,
+    now: float,
+    checked_at: float | None = None,
+) -> list:
     """상태 파일에 없는 최근 매물이 '올라온 지 몇 분 됐는지'를 오래된 순으로.
 
     갓 올라온 매물이 아직 상태 파일에 없는 것은 결함이 아닙니다 — 다음 실행(1분 뒤)에
@@ -260,6 +290,7 @@ def missed_ages(fields_list: list, seen_ids: set, fresh_after: float, now: float
         for fields in fields_list
         if (listing_created_at(fields) or 0) >= fresh_after
         and extract_item_id(fields) not in seen_ids
+        and (checked_at is None or (listing_created_at(fields) or 0) <= checked_at)
     ]
     return sorted((age for age in ages if age is not None), reverse=True)
 
@@ -279,14 +310,21 @@ async def scan(pages: int, fresh_hours: float) -> None:
     from mercapi import Mercapi
 
     api = Mercapi()
-    seen_ids = load_seen_ids()
+    seen_ids, keyword_checked_at = load_state()
     now = datetime.now().timestamp()
     fresh_after = now - fresh_hours * 3600
+    stamps = [v for v in keyword_checked_at.values() if isinstance(v, (int, float))]
+    lag = (now - max(stamps)) / 60 if stamps else None
     print(
         f"봇이 보는 창: 키워드·정렬당 상위 {MAX_ITEMS_PER_KEYWORD}건 / "
         f"이번 조회 깊이: {pages}페이지({pages * MAX_ITEMS_PER_KEYWORD}건) / "
         f"상태 파일 {len(seen_ids):,}건 / '최근'의 기준: {fresh_hours}시간"
     )
+    if lag is not None:
+        print(
+            f"체크아웃된 상태 파일은 {lag:.0f}분 전 것입니다 — 그 뒤에 올라온 매물은"
+            " 봇이 아직 볼 기회가 없었으므로 '못 봄'에서 빼고 따로 셉니다."
+        )
     print()
 
     # 같은 브랜드의 한/영 키워드가 같은 매물을 잡으므로, 합계는 매물 ID 기준으로
@@ -300,14 +338,16 @@ async def scan(pages: int, fresh_hours: float) -> None:
         await asyncio.sleep(PAGE_PAUSE_SECONDS)
 
         inside, outside = split_by_window(filtered)
-        fresh_in, missed_in = count_missed(inside, seen_ids, fresh_after)
-        fresh_out, missed_out = count_missed(outside, seen_ids, fresh_after)
+        checked_at = keyword_checked_at.get(keyword)
+        checked_at = float(checked_at) if isinstance(checked_at, (int, float)) else None
+        fresh_in, missed_in, after_in = count_missed(inside, seen_ids, fresh_after, checked_at)
+        fresh_out, missed_out, after_out = count_missed(outside, seen_ids, fresh_after, checked_at)
         dwell = window_dwell(filtered, now)
         inversions = order_inversions(filtered)
         inversions_updated = order_inversions(filtered, "updated")
         oldest = oldest_in_window(filtered, now)
         beyond_newer = newer_beyond_window(filtered)
-        ages = missed_ages(filtered, seen_ids, fresh_after, now)
+        ages = missed_ages(filtered, seen_ids, fresh_after, now, checked_at)
 
         # 카테고리 필터가 빼는 매물: 같은 깊이에서 필터를 뺀 결과에만 있는 것들입니다.
         # 필터는 매물을 걸러내기만 하므로, 필터 없는 목록의 앞쪽에 있으면서 필터 목록에
@@ -318,16 +358,21 @@ async def scan(pages: int, fresh_hours: float) -> None:
             unfiltered, unfiltered_found = await walk(api, keyword, [], pages)
             await asyncio.sleep(PAGE_PAUSE_SECONDS)
             excluded = excluded_by_filter(filtered, unfiltered)
-            filter_fresh, filter_missed = count_missed(excluded, seen_ids, fresh_after)
+            filter_fresh, filter_missed, _ = count_missed(
+                excluded, seen_ids, fresh_after, checked_at
+            )
             fresh_excluded = fresh_only(excluded, fresh_after)
             excluded_all.extend(fresh_excluded)
             unique["filter_missed"].update(
-                extract_item_id(f) for f in fresh_excluded if extract_item_id(f) not in seen_ids
+                extract_item_id(f) for f in fresh_excluded
+                if extract_item_id(f) not in seen_ids
+                and (checked_at is None or (listing_created_at(f) or 0) <= checked_at)
             )
 
         unique["window_missed"].update(
             extract_item_id(f) for f in fresh_only(outside, fresh_after)
             if extract_item_id(f) not in seen_ids
+            and (checked_at is None or (listing_created_at(f) or 0) <= checked_at)
         )
         unique["fresh"].update(
             extract_item_id(f) for f in fresh_only(filtered, fresh_after)
@@ -366,7 +411,9 @@ async def scan(pages: int, fresh_hours: float) -> None:
             + (f" (필터 없으면 {unfiltered_found:,}건)" if unfiltered_found is not None else "")
             + f" / 훑은 {len(filtered)}건"
             f" | 창 안 최근 {fresh_in}건 중 못 본 것 {missed_in}건"
-            f" | 창 밖 최근 {fresh_out}건 중 못 본 것 {missed_out}건"
+            + (f"(+상태 파일 이후 등록 {after_in}건)" if after_in else "")
+            + f" | 창 밖 최근 {fresh_out}건 중 못 본 것 {missed_out}건"
+            + (f"(+상태 파일 이후 등록 {after_out}건)" if after_out else "")
             + (f" | 필터가 뺀 최근 {filter_fresh}건 중 못 본 것 {filter_missed}건" if categories else "")
         )
         print(
