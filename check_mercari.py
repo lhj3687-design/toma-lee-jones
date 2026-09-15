@@ -1195,8 +1195,14 @@ def confirm_disappearance(
     """
     entry = pending_relists.get(item_id)
     if not isinstance(entry, dict) or entry.get("matched_id") != matched_id:
-        # 처음 보류하거나, 지문의 주인이 그새 바뀐 경우입니다. 다시 셉니다.
-        entry = {"matched_id": matched_id, "since": now, "checks": 0, "fresh": bool(fresh)}
+        # 처음 보류하거나, 지문의 주인이 그새 바뀐 경우입니다. 시계는 다시 셉니다.
+        # 다만 `fresh`는 **매물 자신의 성질**이라 그대로 들고 갑니다 — 질문이 바뀌었다고
+        # '처음 봤을 때 갓 올라온 매물이었다'는 사실이 달라지지 않습니다. 여기서
+        # 떨어뜨리면 지금 다시 잰 값이 쓰이는데, 그때는 기준선이 이미 전진한 뒤라
+        # False가 나와 **신규 알림이 조용히 사라집니다**(아래 was_fresh 주석 참고).
+        carried = bool(entry.get("fresh")) if isinstance(entry, dict) else False
+        entry = {"matched_id": matched_id, "since": now, "checks": 0,
+                 "fresh": bool(fresh) or carried}
         pending_relists[item_id] = entry
     was_fresh = bool(entry.get("fresh")) or bool(fresh)
     entry["fresh"] = was_fresh

@@ -1256,6 +1256,59 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([e["alert_id"] for e in new_items], ["new:m-new"])
 
+    async def test_first_sight_freshness_survives_the_fingerprint_owner_changing(self):
+        """보류 중에 지문의 주인이 바뀌면 시계는 다시 세지만 `fresh`는 들고 가야 합니다.
+
+        `fresh`는 질문('저 예전 매물이 사라졌는가')이 아니라 **매물 자신의 성질**
+        ('처음 봤을 때 갓 올라온 매물이었는가')입니다. 주인이 바뀌었다고 그 사실이
+        달라지지 않습니다. 여기서 떨어뜨리면 그 자리에서 지금 다시 잰 값이 쓰이는데,
+        그때는 기준선이 이미 전진한 뒤라 False가 나와 신규 알림이 조용히 사라집니다.
+
+        실제로 그렇게 됐습니다 — m51322745277은 2026-09-14 10:12 병합에서 fresh 가
+        꺼진 뒤, seen 에는 ¥18,000으로 들어갔는데 알림은 한 건도 나가지 않았습니다.
+        """
+        listed_at = datetime.now()
+        item = vars(FakeItem("m-new", "t", 5000, seller_id="A", created=listed_at))
+        relist_fingerprints = {
+            "seller:A:t": {"item_id": "m-old", "last_alert_price": 5000, "last_seen_price": 5000}
+        }
+        pending_relists: dict = {}
+        seen: dict = {}
+        new_items: list = []
+        base = listed_at.timestamp()
+
+        # 1회차: 갓 올라온 매물인데 예전 매물이 안 보여 판정 보류
+        mercari.process_items(
+            "test", [item], seen, relist_fingerprints, new_items,
+            created_cutoff=base - 60, listed_ids={"m-new"},
+            pending_relists=pending_relists, now=base,
+        )
+        self.assertEqual(new_items, [])
+        self.assertTrue(pending_relists["m-new"]["fresh"])
+
+        # 2회차: 그새 지문의 주인이 다른 매물로 바뀌었습니다. 시계는 다시 세지만
+        # '처음 봤을 때 갓 올라온 매물이었다'는 사실은 남아야 합니다.
+        relist_fingerprints["seller:A:t"]["item_id"] = "m-other"
+        middle = base + 40 * 60
+        mercari.process_items(
+            "test", [item], seen, relist_fingerprints, new_items,
+            created_cutoff=middle - 60, listed_ids={"m-new"},
+            pending_relists=pending_relists, now=middle,
+        )
+        self.assertEqual(pending_relists["m-new"]["matched_id"], "m-other")
+        self.assertEqual(pending_relists["m-new"]["checks"], 0)  # 시계는 다시 셉니다
+        self.assertTrue(pending_relists["m-new"]["fresh"])       # 이 값은 들고 갑니다
+
+        # 3회차: 새 주인이 살아 있는 것이 확인돼 '별개의 매물'로 결론.
+        # 지금 기준선으로는 오래된 매물이지만 신규 알림은 나가야 합니다.
+        later = base + 80 * 60
+        mercari.process_items(
+            "test", [item], seen, relist_fingerprints, new_items,
+            created_cutoff=later - 60, listed_ids={"m-new", "m-other"},
+            pending_relists=pending_relists, now=later,
+        )
+        self.assertEqual([e["alert_id"] for e in new_items], ["new:m-new"])
+
     async def test_lookup_targets_match_what_the_judgment_asks(self):
         """미리 추린 조회 대상이 판정이 실제로 묻는 것과 정확히 같아야 합니다.
 
