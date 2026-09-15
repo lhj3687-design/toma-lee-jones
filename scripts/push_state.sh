@@ -7,6 +7,22 @@ cd "$(git rev-parse --show-toplevel)"
 
 commit_message="${1:-update Mercari alert state}"
 
+# 실행 계수기 꼬리표. check_mercari.py --mode collect 가 남겨 두면 커밋 제목 끝에
+# 붙입니다(check_mercari.py 의 "실행 계수기" 주석 참고).
+#
+# 왜 커밋 메시지인가: 상태 파일에 흔적이 없는 숫자는 실행 로그로만 셀 수 있는데,
+# 봇이 1분마다 도니 하루면 실행이 1,400번이라 로그를 세는 길이 사실상 막혀 있습니다.
+# 커밋 메시지는 `git log`로 공짜로 세지고, 상태 파일을 한 바이트도 불리지 않습니다.
+#
+# **커밋을 만들 때만 지웁니다.** 여기서 미리 지우면, 이 호출이 "상태 변경 없음"으로
+# 끝났을 때 그 실행의 숫자가 통째로 사라집니다(워크플로는 저장 단계를 여러 번
+# 부르므로, 안 지우면 같은 실행의 다음 호출이 대신 실어 갑니다).
+note_file="${STATE_COMMIT_NOTE_FILE:-.state_commit_note}"
+if [ -s "$note_file" ]; then
+  # 줄바꿈이 섞여 들어오면 커밋 제목이 두 줄이 됩니다. 첫 줄만 씁니다.
+  commit_message="$commit_message$(head -n 1 "$note_file")"
+fi
+
 # 브랜치를 main으로 박아 두면, 다른 브랜치에서 돌렸을 때 reset --hard가 엉뚱한 브랜치를
 # 덮어써 버립니다. 지금 체크아웃된 브랜치를 그대로 씁니다(detached HEAD면 main으로 대체).
 branch="$(git rev-parse --abbrev-ref HEAD)"
@@ -49,6 +65,7 @@ for attempt in 1 2 3 4 5; do
     # 커밋은 이미 있고 push만 실패한 상태입니다. 커밋 단계를 건너뛰고 push만 다시 시도합니다.
   else
     git commit -m "$commit_message"
+    rm -f "$note_file"
     unpushed=1
   fi
 
