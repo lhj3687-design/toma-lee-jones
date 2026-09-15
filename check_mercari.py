@@ -822,6 +822,120 @@ def is_fresh_listing(created_at: float | None, cutoff: float | None) -> bool:
     return created_at >= cutoff - NEW_ITEM_GRACE_SECONDS
 
 
+# ---------------------------------------------------------------------------
+# 실행 계수기: 상태 파일에 흔적이 남지 않는 숫자를 커밋 메시지에 실어 보냅니다.
+#
+# 왜 이런 것이 필요한가: 이 저장소에서 "확인 방법을 '실행 로그에서 한 줄 세기'로
+# 잡지 마세요"는 이미 밟은 함정입니다. 봇이 1분마다 도니 하루면 실행이 1,400번이고,
+# 개발 환경에서는 Actions 로그 묶음 내려받기가 막혀 있어 로그를 한 건씩 API로만
+# 꺼낼 수 있습니다. 하루치를 세는 것은 사실상 불가능합니다.
+#
+# 반면 상태 커밋은 `git log`로 공짜로 세집니다. 그래서 **상태 파일에 흔적이 남지 않는
+# 숫자만** 골라 커밋 메시지 끝에 붙입니다. 상태 파일은 한 바이트도 늘지 않습니다.
+#
+# 비용은 재고 붙였습니다(README "못 세는 숫자를 세게 만들었습니다"). 운영 이력의 진짜
+# 커밋 5,512개로 재니 꼬리표 하나당 팩이 **62바이트** 늘어납니다(원문 46.8바이트보다
+# 큽니다 — 값이 매번 달라 같은 제목끼리 걸려 있던 델타가 끊기는 몫입니다). 붙는 실행이
+# 전체의 12.6%(실측)이므로 하루 약 10KB, 저장소 하루 증가분의 0.1% 수준입니다.
+#
+# 그래서 **0일 때는 아무것도 붙이지 않습니다.** 물어볼 자리가 없었던 실행은 예전과
+# 똑같은 커밋 메시지를 남깁니다.
+RUN_NOTE_FILE = Path(os.getenv("STATE_COMMIT_NOTE_FILE", ".state_commit_note"))
+# 다음 페이지 조건(#33)이 발동하지 않았어도 '얼마나 다가섰는지'를 남길 문턱입니다.
+# 실측(2026-09-10 ~ 09-14)에서 한 페이지의 신규 매물은 최대 72건이었고 80건 이상은
+# 한 번도 없었습니다. 그래서 80을 넘는 판만 싣습니다 — 평소에는 조용하고, 실제로
+# 창이 차 오르기 시작하면 그때부터 기록이 남습니다. 발동선(100건)이 빡빡한지
+# 느슨한지는 이 값 없이는 영영 알 수 없습니다(발동이 0회라 실전 기록이 없습니다).
+NEXT_PAGE_NEAR_MISS_FRESH = 80
+
+# 이번 실행에서 모은 숫자들. collect 시작에서 비웁니다.
+run_counters: dict = {}
+
+
+def reset_run_counters() -> None:
+    run_counters.clear()
+
+
+def count_event(key: str, amount: int = 1) -> None:
+    """이번 실행에서 일어난 일을 셉니다(0이면 아무것도 남기지 않습니다)."""
+    if amount:
+        run_counters[key] = int(run_counters.get(key, 0)) + amount
+
+
+def note_max(key: str, value: int) -> None:
+    """이번 실행의 최댓값을 남깁니다(여러 키워드 중 가장 큰 값)."""
+    if value > int(run_counters.get(key, 0)):
+        run_counters[key] = int(value)
+
+
+def note_flag(key: str, value: str) -> None:
+    """숫자가 아닌 표시를 남깁니다(같은 값이 여러 번 와도 한 번만)."""
+    marks = run_counters.setdefault(key, [])
+    if value not in marks:
+        marks.append(value)
+
+
+def run_note_text() -> str:
+    """커밋 메시지 끝에 붙일 꼬리표. 실을 것이 없으면 빈 문자열입니다.
+
+    모양(README에 같은 표가 있습니다):
+
+        (재출품 5: 있음2/없음3/못물어봄0, 다음페이지 1회 신규112, 조회실패 1)
+        (재출품 3/9: 있음1/없음1/못물어봄1 눈금⛔일반)
+
+    `재출품 {물어본 수}/{물어볼 수}`에서 두 값이 다르면 실행당 상한이나 눈금 불신으로
+    **못 물어본 것이 있다**는 뜻입니다. 두 값이 같으면 앞의 하나만 씁니다.
+
+    '못물어봄 0'을 굳이 적는 이유: 0을 생략하면 '0건이었다'와 '이 기능이 아직 배포되지
+    않았다'가 같은 모양이 됩니다. 이 저장소가 두 번 당한 자리라(못 잰 것을 0으로 읽기)
+    분모와 분자를 항상 같이 적습니다.
+    """
+    parts: list[str] = []
+    targets = int(run_counters.get("relist_targets", 0))
+    if targets:
+        asked = int(run_counters.get("relist_asked", 0))
+        scope = f"{targets}" if asked == targets else f"{asked}/{targets}"
+        piece = (
+            f"재출품 {scope}: 있음{int(run_counters.get('relist_alive', 0))}"
+            f"/없음{int(run_counters.get('relist_gone', 0))}"
+            f"/못물어봄{int(run_counters.get('relist_unknown', 0))}"
+        )
+        blocked = run_counters.get("relist_canary_blocked") or []
+        if blocked:
+            piece += " 눈금⛔" + "+".join(blocked)
+        parts.append(piece)
+
+    fired = int(run_counters.get("next_page", 0))
+    if fired:
+        parts.append(f"다음페이지 {fired}회 신규{int(run_counters.get('next_page_fresh', 0))}")
+    elif int(run_counters.get("page_fresh_max", 0)) >= NEXT_PAGE_NEAR_MISS_FRESH:
+        parts.append(f"다음페이지 근접 신규{int(run_counters.get('page_fresh_max', 0))}")
+
+    failures = int(run_counters.get("search_failures", 0))
+    if failures:
+        parts.append(f"조회실패 {failures}")
+
+    return f" ({', '.join(parts)})" if parts else ""
+
+
+def write_run_note() -> None:
+    """꼬리표를 파일로 남깁니다. scripts/push_state.sh가 읽어 커밋 메시지에 붙입니다.
+
+    왜 파일인가: 상태를 커밋하는 것은 워크플로 단계(`push_state.sh`)이고, 숫자를 아는
+    것은 이 스크립트입니다. 상태 파일에 실으면 용량을 먹고 병합 규칙도 하나 늘어납니다.
+    작업 폴더는 실행마다 새로 체크아웃되므로 이 파일이 다음 실행으로 새지 않습니다.
+    """
+    note = run_note_text()
+    try:
+        if note:
+            RUN_NOTE_FILE.write_text(note, encoding="utf-8")
+        elif RUN_NOTE_FILE.exists():
+            RUN_NOTE_FILE.unlink()
+    except OSError as exc:
+        # 꼬리표를 못 남기는 것이 봇을 멈출 이유는 아닙니다.
+        print(f"[계수기] 커밋 꼬리표를 남기지 못했습니다: {exc}", file=sys.stderr)
+
+
 async def _telegram_post(token: str, chat_id: str, method: str, payload: dict):
     """텔레그램 API를 한 번 호출하고 (성공여부, 재시도대기초, 상태코드)를 돌려줍니다."""
     async with httpx.AsyncClient(timeout=30) as client:
@@ -1099,6 +1213,9 @@ async def search_items(
                 else:
                     results = await results.next_page()
             except Exception as exc:
+                # 추천순만 실패한 실행은 상태 파일에 아무 흔적도 남지 않습니다
+                # (조회 시각은 등록순 성공 여부로만 갱신됩니다). 세어 둡니다.
+                count_event("search_failures")
                 print(
                     f"[검색 실패: {keyword} / {pass_name} {page_number + 1}페이지] {exc}",
                     file=sys.stderr,
@@ -1111,6 +1228,18 @@ async def search_items(
                 item_id = extract_item_id(fields)
                 if item_id and item_id not in merged:
                     merged[item_id] = fields
+            # 발동하지 않은 판도 '얼마나 다가섰는지'는 남깁니다. 발동이 0회라
+            # 임계값(100건)이 빡빡한지 느슨한지 볼 실전 기록이 아직 없는데, 이 값이
+            # 없으면 "정지 뒤에도 발동 0회"가 '창이 안 찼다'인지 '문턱이 높다'인지
+            # 영영 구분되지 않습니다. 한 페이지를 가득 채운 등록순 페이지에서만 셉니다.
+            if pass_name == NEW_ITEM_SORT_PASS and len(page) >= MAX_ITEMS_PER_KEYWORD:
+                note_max(
+                    "page_fresh_max",
+                    sum(
+                        1 for fields in page
+                        if is_fresh_listing(listing_created_at(fields), created_cutoff)
+                    ),
+                )
             if not wants_another_page(pass_name, results, page, created_cutoff):
                 pass_completed = True
                 break
@@ -1118,6 +1247,8 @@ async def search_items(
                 1 for fields in page
                 if is_fresh_listing(listing_created_at(fields), created_cutoff)
             )
+            count_event("next_page")
+            note_max("next_page_fresh", fresh_on_page)
             # 건수를 같이 찍습니다. 이 장치가 발동한 적이 한 번도 없어서(예전 조건이
             # 원리상 참이 될 수 없었습니다) 임계값이 맞는지 볼 실전 기록이 없습니다.
             print(f"[{keyword}] 신규 매물이 한 페이지를 가득 채워 다음 페이지도 확인합니다"
@@ -1429,6 +1560,10 @@ async def lookup_survival(
     for shop, canary in canaries.items():
         if await ask_presence(m, canary) is not True:
             untrusted.add(shop)
+            # 눈금이 어긋난 실행은 판정이 통째로 미뤄집니다. 상태 파일에는 그 사실이
+            # '보류가 하나 생겼다'로만 남아 '못 물어봄'과 구분되지 않습니다. 표시를
+            # 남겨 두면 커밋 메시지에서 갈립니다.
+            note_flag("relist_canary_blocked", "숍스" if shop else "일반")
             print(
                 f"[재출품] ⛔ 지금 올라와 있는 것이 확실한 매물 {canary}이(가) '있음'으로"
                 f" 안 나옵니다. {'숍스' if shop else '일반'} 매물의 확인을 이번 실행에서는"
@@ -1449,6 +1584,14 @@ async def lookup_survival(
         if shop in untrusted or shop not in canaries:
             # 눈금을 못 맞춘 엔드포인트입니다. 물어봐도 그 답을 읽을 수 없으므로
             # 아예 묻지 않습니다(조회도 아낍니다).
+            #
+            # 두 가지가 여기로 옵니다. 눈금이 '있음'으로 답하지 않은 경우(위에서 표시를
+            # 남깁니다)와, **이번 검색 결과에 그 엔드포인트의 살아 있는 매물이 한 건도
+            # 없어 눈금 자체를 세울 수 없던 경우**입니다. 뒤쪽은 아무 말도 없이 조용히
+            # 건너뛰던 자리였습니다 — 커밋 메시지에서 '0/3건'만 보이고 이유가 없으면
+            # 다시 로그를 뒤져야 하므로, 둘을 갈라 표시합니다.
+            if shop not in canaries:
+                note_flag("relist_canary_blocked", ("숍스" if shop else "일반") + "없음")
             continue
         survival[item_id] = await ask_presence(m, item_id)
     if len(item_ids) > len(asked):
@@ -2156,6 +2299,7 @@ async def collect_updates() -> None:
         pending_relists,
     ) = load_state()
     forget_removed_keywords(known_keywords, keyword_checked_at)
+    reset_run_counters()
     is_first_run = len(seen) == 0
     new_items: list = []
     now = current_time()
@@ -2208,10 +2352,18 @@ async def collect_updates() -> None:
         if checked:
             lookup_targets |= relist_lookup_targets(items, seen, relist_fingerprints, listed_ids)
     survival = await lookup_survival(mercari, lookup_targets, listed_ids)
+    # 이 세 숫자는 상태 파일에 남지 않습니다. '없어짐'만 지문 주인이 바뀌는 자국으로
+    # 뒤에서 하한을 셀 수 있고, '있음'은 별개의 매물로 끝나 아무 자국도 안 남습니다.
+    # 그래서 '못 물어봄'의 비율을 물을 분모가 없었습니다 — 커밋 메시지에 싣습니다.
+    alive = sum(1 for value in survival.values() if value is True)
+    gone = sum(1 for value in survival.values() if value is False)
+    unknown = len(survival) - alive - gone
+    count_event("relist_targets", len(lookup_targets))
+    count_event("relist_asked", len(survival))
+    count_event("relist_alive", alive)
+    count_event("relist_gone", gone)
+    count_event("relist_unknown", unknown)
     if survival:
-        alive = sum(1 for value in survival.values() if value is True)
-        gone = sum(1 for value in survival.values() if value is False)
-        unknown = len(survival) - alive - gone
         print(f"[재출품] 예전 매물 {len(survival)}건 직접 확인 "
               f"(아직 있음 {alive} / 없어짐 {gone} / 못 물어봄 {unknown})")
 
@@ -2293,6 +2445,7 @@ async def collect_updates() -> None:
         seen, pending, sent_alerts, relist_fingerprints, known_keywords, keyword_checked_at,
         pending_relists,
     )
+    write_run_note()
 
 
 async def send_pending() -> None:

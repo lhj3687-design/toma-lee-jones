@@ -3023,5 +3023,133 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse([i for i in ids if i.startswith("health:feed-ok:")], ids)
 
 
+class RunNoteTests(unittest.IsolatedAsyncioTestCase):
+    """상태 커밋 메시지에 실리는 숫자가 **실제 실행 경로에서** 올라가는지 봅니다.
+
+    형식만 따로 검사하면 '세는 자는 멀쩡한데 아무도 안 올려 주는' 상태를 못 잡습니다.
+    이 저장소가 두 번 당한 자리라(못 잰 것이 0으로 찍힘), 계수기는 붙어 있는 자리에서
+    확인합니다.
+    """
+
+    def setUp(self):
+        mercari.reset_run_counters()
+        self.addCleanup(mercari.reset_run_counters)
+        sleep_patcher = patch.object(mercari.asyncio, "sleep", new=AsyncMock())
+        sleep_patcher.start()
+        self.addCleanup(sleep_patcher.stop)
+
+    @staticmethod
+    def page(fresh_count: int, stale_count: int, now):
+        return [
+            FakeItem(f"fresh-{i}", f"신규 {i}", 1000, created=now - timedelta(minutes=1))
+            for i in range(fresh_count)
+        ] + [
+            FakeItem(f"stale-{i}", f"예전 {i}", 1000, created=now - timedelta(days=30))
+            for i in range(stale_count)
+        ]
+
+    async def test_a_quiet_run_writes_no_note(self):
+        """평소 실행은 예전과 똑같은 커밋 메시지를 남겨야 합니다(용량을 안 먹습니다)."""
+        now = datetime.now()
+        api = FakeMercapi({"test": self.page(72, mercari.MAX_ITEMS_PER_KEYWORD - 72, now)})
+
+        await mercari.search_items(
+            api, "test", [], created_cutoff=(now - timedelta(minutes=5)).timestamp(),
+            sort_passes=["created"],
+        )
+
+        self.assertEqual(mercari.run_note_text(), "")
+
+    async def test_the_next_page_trigger_is_carried_into_the_commit_message(self):
+        """#33은 발동 기록이 로그에만 남아 사실상 못 세고 있었습니다."""
+        now = datetime.now()
+        page1 = self.page(mercari.MAX_ITEMS_PER_KEYWORD, 0, now)
+        page2 = [FakeItem("p2-0", "다음 페이지", 1000, created=now - timedelta(minutes=2))]
+        api = FakeMercapi({"test": page1}, extra_pages_by_keyword={"test": [page2]})
+
+        await mercari.search_items(
+            api, "test", [], created_cutoff=(now - timedelta(minutes=5)).timestamp(),
+            sort_passes=["created"],
+        )
+
+        self.assertIn(f"다음페이지 1회 신규{mercari.MAX_ITEMS_PER_KEYWORD}",
+                      mercari.run_note_text())
+
+    async def test_a_near_miss_is_recorded_even_though_nothing_fired(self):
+        """발동 0회가 '창이 안 찼다'인지 '문턱이 높다'인지 이 값으로만 갈립니다."""
+        near = mercari.NEXT_PAGE_NEAR_MISS_FRESH
+        now = datetime.now()
+        api = FakeMercapi(
+            {"test": self.page(near, mercari.MAX_ITEMS_PER_KEYWORD - near, now)},
+            extra_pages_by_keyword={"test": [[FakeItem("p2-0", "더", 1000, created=now)]]},
+        )
+
+        items, _ok, _coverage = await mercari.search_items(
+            api, "test", [], created_cutoff=(now - timedelta(minutes=5)).timestamp(),
+            sort_passes=["created"],
+        )
+
+        # 발동은 하지 않았는데(다음 페이지를 안 불렀는데) 근접은 남습니다.
+        self.assertNotIn("p2-0", {mercari.extract_item_id(f) for f in items})
+        self.assertIn(f"다음페이지 근접 신규{near}", mercari.run_note_text())
+
+    async def test_a_search_failure_is_counted(self):
+        """추천순만 실패한 실행은 조회 시각도 그대로라 상태 파일에 흔적이 없습니다."""
+        now = datetime.now()
+        api = FakeMercapi({"test": [FakeItem("m1", "신규", 1000, created=now)]},
+                          fail_call_indexes={"test": (1,)})
+
+        await mercari.search_items(api, "test", [], created_cutoff=None)
+
+        self.assertIn("조회실패 1", mercari.run_note_text())
+
+    async def test_a_blocked_canary_is_marked_apart_from_a_lookup_that_answered(self):
+        """눈금이 어긋난 실행은 판정을 통째로 미룹니다. 그 사실이 남지 않으면
+        '못 물어봄'과 구분되지 않습니다."""
+        # ID 형식이 엔드포인트를 가릅니다(m+숫자가 아니면 숍스). 일반 매물로 재려면
+        # 양쪽 다 일반 형식이어야 합니다.
+        api = FakeMercapi({}, live_ids={"m11111111111"},
+                          lookup_status={"m11111111111": 403})
+
+        survival = await mercari.lookup_survival(api, {"m22222222222"}, {"m11111111111"})
+
+        self.assertEqual(survival, {})   # 믿을 수 없으므로 아무것도 안 물어봅니다
+        mercari.count_event("relist_targets", 1)
+        self.assertIn("눈금⛔일반", mercari.run_note_text())
+
+    async def test_a_missing_canary_is_marked_apart_from_a_failing_one(self):
+        """눈금을 **세울 수 없던** 실행은 아무 말 없이 건너뛰던 자리였습니다.
+
+        이번 검색 결과에 그 엔드포인트의 살아 있는 매물이 한 건도 없으면 눈금이 없어
+        전부 미룹니다. 커밋 메시지에 '0/1건'만 찍히고 이유가 없으면 결국 로그를
+        뒤져야 하므로, '어긋남'과 '없음'을 갈라 둡니다.
+        """
+        api = FakeMercapi({}, live_ids={"m11111111111"})
+
+        # 물어볼 것은 숍스 상품인데, 살아 있는 것이 확인된 매물은 일반 매물뿐입니다.
+        survival = await mercari.lookup_survival(
+            api, {"2JVKR8SomeShopProduct"}, {"m11111111111"}
+        )
+
+        self.assertEqual(survival, {})
+        mercari.count_event("relist_targets", 1)
+        self.assertIn("눈금⛔숍스없음", mercari.run_note_text())
+
+    async def test_the_note_file_is_removed_when_there_is_nothing_to_say(self):
+        """지난 실행의 꼬리표가 남아 있으면 이번 실행의 커밋에 남의 숫자가 붙습니다."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note"
+            path.write_text(" (재출품 9: 있음9/없음0/못물어봄0)")
+            with patch.object(mercari, "RUN_NOTE_FILE", path):
+                mercari.write_run_note()
+                self.assertFalse(path.exists())
+
+                mercari.count_event("relist_targets", 2)
+                mercari.count_event("relist_asked", 2)
+                mercari.count_event("relist_gone", 2)
+                mercari.write_run_note()
+                self.assertEqual(path.read_text(), " (재출품 2: 있음0/없음2/못물어봄0)")
+
+
 if __name__ == "__main__":
     unittest.main()

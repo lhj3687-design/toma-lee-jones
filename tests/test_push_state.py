@@ -33,7 +33,9 @@ exec {git} "$@"
 
 
 @unittest.skipIf(shutil.which("git") is None, "git이 없는 환경")
-class PushStateTests(unittest.TestCase):
+class PushStateTestCase(unittest.TestCase):
+    """저장소 두 개(원격/작업본)를 세우는 공통 준비."""
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -85,6 +87,10 @@ class PushStateTests(unittest.TestCase):
     def write_state(self, text: str) -> None:
         (self.work / "seen_items.json").write_text(text)
 
+    @property
+    def note_file(self) -> Path:
+        return self.work / ".state_commit_note"
+
     def git(self, *args, cwd=None):
         return subprocess.run(
             ["git", *args],
@@ -107,11 +113,14 @@ class PushStateTests(unittest.TestCase):
         self.git("commit", "-qm", "concurrent run", cwd=other)
         self.git("push", "-q", "origin", "main", cwd=other)
 
-    def push_state(self, message="queue Mercari alerts", break_fetch=False):
+    def push_state(self, message="queue Mercari alerts", break_fetch=False, note=None):
         path = [str(self.fake_bin)]
         if break_fetch:
             path.insert(0, str(self.fake_git_bin))
         env = dict(self.env, PATH=os.pathsep.join(path + [self.env["PATH"]]))
+        env["STATE_COMMIT_NOTE_FILE"] = str(self.note_file)
+        if note is not None:
+            self.note_file.write_text(note)
         return subprocess.run(
             ["bash", "scripts/push_state.sh", message],
             cwd=str(self.work),
@@ -120,6 +129,10 @@ class PushStateTests(unittest.TestCase):
             text=True,
         )
 
+    def remote_subject(self) -> str:
+        return self.git("log", "-1", "--format=%s", "main", cwd=self.remote).stdout.strip()
+
+class PushStateTests(PushStateTestCase):
     def test_a_failed_fetch_after_a_rejected_push_is_never_reported_as_saved(self):
         self.advance_remote('{"seen": {"theirs": 1}}')
         self.write_state('{"seen": {"mine": 1}}')
@@ -170,6 +183,75 @@ class PushStateTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("fresh", self.remote_state())
+
+
+class RunNoteTests(PushStateTestCase):
+    """실행 계수기 꼬리표가 커밋 제목에 실려 원격까지 가는지 검증합니다.
+
+    이 꼬리표가 이 저장소에서 **유일하게** 셀 수 있는 자리입니다. 봇이 1분마다 도니
+    하루면 실행이 1,400번이라 Actions 로그를 세는 길은 사실상 막혀 있습니다.
+    """
+
+    def test_a_note_is_appended_to_the_commit_subject(self):
+        self.write_state('{"seen": {"shared": 1, "fresh": 1}}')
+
+        result = self.push_state(note=" (재출품 5: 있음2/없음3/못물어봄0)")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            self.remote_subject(),
+            "queue Mercari alerts (재출품 5: 있음2/없음3/못물어봄0)",
+        )
+
+    def test_a_used_note_is_not_carried_into_the_next_commit(self):
+        """다음 커밋에 남의 숫자가 붙으면 한 실행의 결과가 두 번 세집니다."""
+        self.write_state('{"seen": {"shared": 1, "fresh": 1}}')
+        self.push_state(note=" (재출품 5: 있음2/없음3/못물어봄0)")
+        self.assertFalse(self.note_file.exists())
+
+        self.write_state('{"seen": {"shared": 1, "fresh": 2}}')
+        self.push_state("record Mercari alert delivery")
+
+        self.assertEqual(self.remote_subject(), "record Mercari alert delivery")
+
+    def test_a_note_survives_a_call_that_had_nothing_to_commit(self):
+        """워크플로는 저장 단계를 여러 번 부릅니다. 커밋이 없던 호출이 꼬리표를
+        먹어 버리면 그 실행의 숫자가 통째로 사라집니다."""
+        result = self.push_state(note=" (재출품 5: 있음2/없음3/못물어봄0)")
+        self.assertIn("상태 변경 없음", result.stdout)
+        self.assertTrue(self.note_file.exists())
+
+        self.write_state('{"seen": {"shared": 1, "fresh": 1}}')
+        self.push_state("record Mercari alert delivery")
+
+        self.assertEqual(
+            self.remote_subject(),
+            "record Mercari alert delivery (재출품 5: 있음2/없음3/못물어봄0)",
+        )
+
+    def test_a_note_survives_a_rejected_push_and_the_merge_retry(self):
+        """충돌로 커밋이 되감겨도(reset --hard) 숫자는 그대로 실려야 합니다."""
+        self.advance_remote('{"seen": {"shared": 1, "theirs": 1}}')
+        self.write_state('{"seen": {"shared": 1, "mine": 1}}')
+
+        result = self.push_state(note=" (재출품 3/9: 있음1/없음1/못물어봄1 눈금⛔일반)")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            self.remote_subject(),
+            "queue Mercari alerts (재출품 3/9: 있음1/없음1/못물어봄1 눈금⛔일반)",
+        )
+
+    def test_a_multiline_note_never_splits_the_commit_subject(self):
+        """제목이 두 줄이 되면 `git log --format=%s`로 세는 길이 막힙니다."""
+        self.write_state('{"seen": {"shared": 1, "fresh": 1}}')
+
+        self.push_state(note=" (재출품 1: 있음1/없음0/못물어봄0)\n두 번째 줄\n")
+
+        self.assertEqual(
+            self.remote_subject(),
+            "queue Mercari alerts (재출품 1: 있음1/없음0/못물어봄0)",
+        )
 
 
 if __name__ == "__main__":
