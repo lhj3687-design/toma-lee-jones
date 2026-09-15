@@ -65,6 +65,38 @@ class MergeSeenTests(unittest.TestCase):
                                      merge_values=merge.merge_price_record)
         self.assertEqual(merged["x"], 28888)
 
+    def test_a_fingerprint_pointing_at_another_item_never_borrows_its_floor(self):
+        """지문의 주인이 양쪽에서 다르면 기준가를 낮은 쪽으로 합치면 안 됩니다.
+
+        기준가는 **매물 하나에 붙은 값**입니다. `seen`은 키가 곧 매물 ID라 양쪽이 언제나
+        같은 매물이지만, 지문은 주인이 값 안에 들어 있어 두 실행이 서로 다른 매물을
+        가리킬 수 있습니다. 그때 낮은 쪽을 취하면 살아남은 주인이 남의 기준가를
+        물려받고, 그 지문을 이어받는 다음 매물의 인하 알림이 통째로 삼켜집니다.
+
+        운영 기록 그대로입니다(2026-09-15 02:25 UTC, `queue Mercari alerts`):
+        지문이 주인은 a4pPNJ…(¥82,600), 기준가는 직전 주인 2JVKR8…의 ¥40,700을
+        들고 있었습니다.
+        """
+        theirs = {"seller:119903670:hermes": {"item_id": "2JVKR8qmuQv9xX3FR2pyH2",
+                                              "last_alert_price": 40700,
+                                              "last_seen_price": 40700}}
+        mine = {"seller:119903670:hermes": {"item_id": "a4pPNJARPBEuwTDW6Ac5AJ",
+                                            "last_alert_price": 82600,
+                                            "last_seen_price": 82600}}
+        merged = merge.merge_ordered(theirs, mine, limit=10,
+                                     merge_values=merge.merge_price_record)
+        self.assertEqual(merged["seller:119903670:hermes"],
+                         {"item_id": "a4pPNJARPBEuwTDW6Ac5AJ",
+                          "last_alert_price": 82600, "last_seen_price": 82600})
+
+    def test_seen_records_have_no_owner_so_the_lower_floor_still_wins(self):
+        """seen 의 값에는 item_id 가 없습니다. 키가 곧 매물 ID라 언제나 같은 매물입니다."""
+        merged = merge.merge_ordered(
+            {"m1": {"last_alert_price": 28888, "last_seen_price": 28888}},
+            {"m1": {"last_alert_price": 30000, "last_seen_price": 30000}},
+            limit=10, merge_values=merge.merge_price_record)
+        self.assertEqual(merged["m1"]["last_alert_price"], 28888)
+
     def test_fingerprints_carry_the_same_rule(self):
         """지문이 들고 있는 기준가는 재출품이 그대로 물려받습니다.
 
@@ -201,11 +233,48 @@ class MergeSeenTests(unittest.TestCase):
         self.assertTrue(merged["m-new"]["fresh"])
 
     def test_merge_restarts_the_clock_when_the_fingerprint_owner_changed(self):
-        # 지문의 주인이 바뀌었다면 다른 질문을 확인하고 있는 것이므로 합치면 안 됩니다.
+        # 지문의 주인이 바뀌었다면 다른 질문을 확인하고 있는 것이므로 시계를 합치면 안 됩니다.
         theirs = {"m-new": {"matched_id": "m-old", "since": 1000, "checks": 5}}
         mine = {"m-new": {"matched_id": "m-other", "since": 1400, "checks": 1}}
         merged = merge.merge_pending_relists(theirs, mine, seen={})
-        self.assertEqual(merged["m-new"], mine["m-new"])
+        self.assertEqual(merged["m-new"]["matched_id"], "m-other")
+        self.assertEqual(merged["m-new"]["since"], 1400)
+        self.assertEqual(merged["m-new"]["checks"], 1)
+
+    def test_the_side_that_asked_more_recently_wins_when_the_owner_changed(self):
+        """운영에서 두 기록이 16분 동안 13번 번갈아 들어앉았습니다.
+
+        `checked_at`이 그대로 멈춰 있는 것이 증거입니다 — 판정이 건드렸다면 그 실행의
+        시각으로 올라갔을 값입니다. 즉 **그 매물을 이번 실행에서 보지도 않은 쪽**이
+        이기고 있었고, checks 가 1과 0 사이만 오가며 MIN_RELIST_ABSENCE_CHECKS(2)에
+        영영 닿지 못했습니다(2026-09-14 08:19~08:35, 2JLad8SbiagquMjjeCQnYv).
+        """
+        theirs = {"2JLad8SbiagquMjjeCQnYv": {"matched_id": "2JRVKPyGnRLxYjF3WUdYBU",
+                                             "since": 1789373861, "checks": 1,
+                                             "checked_at": 1789373861, "fresh": False}}
+        mine = {"2JLad8SbiagquMjjeCQnYv": {"matched_id": "2JRVKQ2mkq8Z5nqYUgDHki",
+                                           "since": 1789367502, "checks": 0,
+                                           "checked_at": 1789367502, "fresh": False}}
+        merged = merge.merge_pending_relists(theirs, mine, seen={})
+        entry = merged["2JLad8SbiagquMjjeCQnYv"]
+        self.assertEqual(entry["matched_id"], "2JRVKPyGnRLxYjF3WUdYBU")
+        self.assertEqual(entry["checks"], 1)
+        self.assertEqual(entry["checked_at"], 1789373861)
+
+    def test_a_first_sight_freshness_survives_an_owner_change(self):
+        """`fresh`는 질문이 아니라 매물 자신의 성질이라 주인이 바뀌어도 살아남아야 합니다.
+
+        여기서 꺼지면 나중에 '별개의 매물'로 결론이 나도 그때 다시 잰 값은 기준선이
+        전진한 뒤라 False여서 신규 알림이 조용히 사라집니다. 실제로 한 건 그랬습니다
+        (m51322745277 — 병합에서 fresh 가 꺼졌고 seen 에는 들어갔는데 알림은 안 나갔습니다).
+        """
+        theirs = {"m51322745277": {"matched_id": "m95814890477", "since": 1789380000,
+                                   "checks": 1, "checked_at": 1789380000, "fresh": True}}
+        mine = {"m51322745277": {"matched_id": "m34717000788", "since": 1789380600,
+                                 "checks": 0, "checked_at": 1789380600, "fresh": False}}
+        merged = merge.merge_pending_relists(theirs, mine, seen={})
+        self.assertEqual(merged["m51322745277"]["matched_id"], "m34717000788")
+        self.assertTrue(merged["m51322745277"]["fresh"])
 
     def test_merge_drops_pending_relists_already_judged_by_the_other_run(self):
         # 상대 실행이 먼저 판정을 끝내 seen에 들어갔다면 보류 기록은 의미가 없습니다.

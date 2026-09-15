@@ -4,7 +4,9 @@
 - sent_alerts: 합집합으로 보존해 이미 전송된 알림이 대기열에 되살아나도 재전송하지 않습니다.
 - pending: 고유 alert_id(구버전은 caption) 기준으로 합치되 sent_alerts에 있는 항목은 제거합니다.
 - relist_fingerprints: 재출품 감지용 지문 기록도 두 쪽 다 유지합니다(합집합, 최신 쪽 우선).
+  기준가는 **양쪽이 같은 매물을 가리킬 때만** 낮은 쪽을 취합니다(`same_subject`).
 - pending_relists: 판정을 미뤄 둔 재출품 후보도 합칩니다(먼저 시작한 쪽의 시각을 남깁니다).
+  주인이 서로 다르면 시계는 다시 세되 **더 최근에 물어본 쪽**을 남기고, `fresh`는 살립니다.
 - known_keywords: 이미 한 번이라도 조회한 키워드 목록도 합집합으로 유지합니다.
 - keyword_checked_at: 키워드별 마지막 조회 시각은 더 늦은 쪽을 남깁니다.
 """
@@ -105,6 +107,21 @@ def price_floor(record):
     return record if isinstance(record, int) else None
 
 
+def same_subject(theirs, mine) -> bool:
+    """두 기록이 **같은 매물**을 말하고 있는가.
+
+    `seen`의 값에는 매물 ID가 없습니다 — 키가 곧 매물 ID라 양쪽이 언제나 같은 매물입니다.
+    `relist_fingerprints`는 다릅니다. 키는 지문이고 주인(`item_id`)이 값 안에 들어 있어서,
+    두 실행이 **서로 다른 매물**을 그 지문의 주인으로 보고 있을 수 있습니다.
+    """
+    if not isinstance(theirs, dict) or not isinstance(mine, dict):
+        return True
+    theirs_id, mine_id = theirs.get("item_id"), mine.get("item_id")
+    if theirs_id is None or mine_id is None:
+        return True
+    return theirs_id == mine_id
+
+
 def merge_price_record(theirs, mine):
     """같은 매물이 양쪽에 다 있을 때 가격 기록을 합칩니다.
 
@@ -121,7 +138,28 @@ def merge_price_record(theirs, mine):
 
     나머지는 다음 실행이 스스로 되돌리고 `sent_alerts`가 중복을 막습니다. 그래도
     기준이 위로 가는 것은 PR #23이 없앤 바로 그 결함이라, 남은 경로도 막습니다.
+
+    **단, 양쪽이 같은 매물을 말하고 있을 때만입니다.** 기준가는 매물 하나에 붙은 값이라,
+    지문의 주인이 양쪽에서 다르면 낮은 쪽을 취하는 순간 살아남은 매물이 **남의 기준가**를
+    물려받습니다. 실측(PR #34 머지 뒤 8.4시간에 7건 / 지문 3개, 전부 `queue Mercari alerts`
+    커밋이고 머지 전에는 이 모양이 **0건**입니다):
+
+        seller:119903670:hermesカーディガンレディース古着中古送料無料
+          지문  {'item_id': 'a4pPNJARPBEuwTDW6Ac5AJ',
+                 'last_alert_price': 40700, 'last_seen_price': 82600}
+          seen['a4pPNJARPBEuwTDW6Ac5AJ'] = {'last_alert_price': 82600, ...}
+
+    ¥40,700은 **직전 주인**(2JVKR8qmuQv9xX3FR2pyH2)의 기준가입니다. 지문 하나가 기준가와
+    주인을 서로 다른 매물에서 가져온 셈이라, 값이 스스로 모순입니다(한 번도 알린 적 없는
+    가격이 '역대 최저 알림가'로 앉아 있고 그게 마지막 관측가보다 쌉니다). 이 지문을
+    물려받는 다음 매물은 ¥82,600짜리인데 기준가가 ¥40,700이라 ¥39,700 아래로 떨어지기
+    전에는 인하 알림이 **한 건도** 나가지 않습니다 — 조용히 삼켜지는 쪽입니다.
+
+    주인이 다르면 낮은 쪽을 고르지 않고 `mine`을 그대로 씁니다(PR #34 이전 동작).
+    `mine`의 기준가는 `mine`의 주인에게 붙은 값이고, 남는 주인이 그쪽이기 때문입니다.
     """
+    if not same_subject(theirs, mine):
+        return mine
     floors = [value for value in (price_floor(theirs), price_floor(mine))
               if isinstance(value, int)]
     if not floors:
@@ -153,6 +191,19 @@ def merge_ordered(theirs: dict, mine: dict, limit: int, merge_values=None) -> di
     return dict(list(merged.items())[-limit:])
 
 
+def asked_at(entry: dict) -> float:
+    """이 보류 기록을 **마지막으로 물어본 시각**. 없으면 보류를 시작한 시각으로 대신합니다.
+
+    `checked_at`은 '못 물어본 실행에서도 적어 두는' 값이라, 두 기록 중 어느 쪽이 그
+    매물을 더 최근에 들여다봤는지를 그대로 말해 줍니다.
+    """
+    for key in ("checked_at", "since"):
+        value = entry.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return float("-inf")
+
+
 def merge_pending_relists(theirs: dict, mine: dict, seen: dict) -> dict:
     """판정을 미뤄 둔 재출품 후보를 합칩니다.
 
@@ -160,6 +211,32 @@ def merge_pending_relists(theirs: dict, mine: dict, seen: dict) -> dict:
     남깁니다. 늦게 시작한 쪽을 그대로 쓰면 실행이 겹칠 때마다 시계가 0으로 되돌아가,
     직접 조회가 계속 실패할 때 포기하는 자리에 영영 닿지 못합니다
     (checks는 '물어봤는데 답을 못 얻은 횟수'입니다).
+
+    **지문의 주인(matched_id)이 서로 다르면** 두 쪽은 다른 질문을 확인하고 있어 시계를
+    합칠 수 없습니다. 그렇다고 `mine`을 그냥 쓰면, **그 매물을 이번 실행에서 보지도 않은
+    쪽**이 이깁니다. 실측(2026-09-14, 보류에 올라온 96건):
+
+        matched_id 가 바뀐 자리 62건
+          그중 '더 최근에 물어본 쪽'을 버린 자리          27건
+          그중 fresh(처음 봤을 때 갓 올라온 매물) 가 꺼진 자리  1건
+
+    두 기록이 몇 분씩 **번갈아** 들어앉습니다. `checked_at`이 그대로 멈춰 있는 것이
+    증거입니다 — 판정이 건드렸다면 그 실행의 시각으로 올라갔을 값입니다.
+
+        08:19:13  matched 2JRVKPyG…  checks 1  checked_at 08:17:41
+        08:20:33  matched 2JRVKQ2m…  checks 0  checked_at 06:31:42   <- 되돌아감
+        08:21:51  matched 2JRVKPyG…  checks 1  checked_at 08:17:41
+        …16분 동안 13번, checks 는 1과 0 사이만 오갑니다
+
+    `MIN_RELIST_ABSENCE_CHECKS`가 2인데 **한 번도 2에 닿지 못합니다**(실측: 보류 96건의
+    최대 checks 가 {0회 20건, 1회 57건, 2회 19건}). 그래서 주인이 다르면 **더 최근에
+    물어본 쪽**(`checked_at`)을 남깁니다. 고를 수 없으면 예전처럼 `mine`입니다.
+
+    `fresh`만은 어느 쪽을 고르든 **둘 중 하나라도 켜져 있으면 켭니다.** 이 값은 질문이
+    아니라 **매물 자신의 성질**('처음 봤을 때 갓 올라온 매물이었는가')이고, 여기서 꺼지면
+    나중에 '별개의 매물'로 결론이 나도 그때 다시 잰 값은 기준선이 전진한 뒤라 False여서
+    **신규 알림이 조용히 사라집니다.** 실제로 한 건 그렇게 됐습니다(m51322745277 —
+    09-14 10:12 병합에서 fresh 가 꺼졌고, seen 에는 들어갔는데 알림은 나가지 않았습니다).
 
     이미 seen에 들어간 매물의 기록은 버립니다(상대 실행이 먼저 판정을 끝냈다는 뜻).
     """
@@ -171,8 +248,17 @@ def merge_pending_relists(theirs: dict, mine: dict, seen: dict) -> dict:
             if not isinstance(entry, dict) or item_id in seen:
                 continue
             current = merged.get(item_id)
-            if current is None or current.get("matched_id") != entry.get("matched_id"):
+            if current is None:
                 merged[item_id] = dict(entry)
+                continue
+            if current.get("matched_id") != entry.get("matched_id"):
+                # 다른 질문입니다. 시계는 합칠 수 없지만 '누가 더 최근에 봤는가'는
+                # 고를 수 있습니다. 같으면 예전처럼 mine(뒤에 오는 쪽)입니다.
+                winner = entry if asked_at(entry) >= asked_at(current) else current
+                merged[item_id] = {
+                    **winner,
+                    "fresh": bool(current.get("fresh")) or bool(entry.get("fresh")),
+                }
                 continue
             combined = dict(current)
             for key, pick in (("since", min), ("checks", max), ("checked_at", max)):
