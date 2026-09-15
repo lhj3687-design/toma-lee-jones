@@ -629,6 +629,46 @@ def price_record(seen: dict, item_id) -> dict:
     return {"last_alert_price": value, "last_seen_price": value}
 
 
+def relist_baseline(seen: dict, matched: dict | None, matched_id) -> dict | None:
+    """재출품이 물려받을 가격 이력. **지문의 주인이 아직 seen 에 있으면 seen 이 진실입니다.**
+
+    지문 값은 `process_items()`가 그 매물을 관측할 때 `seen[item_id]`에서 그대로 베낀
+    **사본**입니다. 그러니 원본이 아직 있으면 원본을 쓰는 것이 언제나 맞습니다. 사본이
+    낡는 길이 둘 있고, 양쪽으로 다 틀립니다.
+
+    **사본이 비싼 쪽으로 낡는 경우 — 판매자가 값을 내리면서 제목을 고칩니다.**
+    제목이 바뀌면 지문 키(`seller:{판매자}:{정규화한 제목}`)가 새로 생기고 **옛 키가 옛
+    가격을 들고 남습니다.** 그 뒤 인하 알림이 나가 `seen`은 내려가는데 옛 키는 그대로입니다.
+
+        seller:851163117:…ワイドレッグジーンズ          지문 95,000 / seen 85,000
+        seller:851163117:…ワイドレッグジーンズ25サイズ   <- 제목을 고쳐 새로 생긴 키
+
+    실측(2026-09-15): 이런 어긋남이 **178건**이고 **178건 전부** 같은 매물을 주인으로 삼는
+    다른 지문이 따로 있습니다(즉 전부 제목 변경). **177건**은 그 매물에 인하 알림이 나간
+    적이 있습니다. 새 매물이 옛 키에 걸리면 이미 알린 값보다 **비싼** 기준가를 물려받아,
+    PR #23이 없앤 바로 그 결함('역대 최저가'라며 이미 알린 최저가보다 비싼 값을 말하는
+    인하 알림)이 재출품 경로로 되살아납니다. 실제로 걸린 것은 2.5일 동안 물려받은 자리
+    257건 중 **1건**입니다(215,000을 물려줬는데 진짜는 200,000).
+
+    **사본이 싼 쪽으로 낡는 경우 — 병합이 남의 기준가를 얹어 놓습니다(PR #35).**
+    그쪽은 막았지만 이미 얹힌 기록은 되돌아가지 않습니다. 그 사본을 물려받으면 인하
+    알림이 **조용히 삼켜집니다.**
+
+    두 경우 다 `seen[matched_id]`를 보면 풀립니다. **저장된 값을 고치지는 않습니다** —
+    옛 키는 다시 관측될 일이 없어서 고쳐 놓아도 곧 다시 어긋나고, 매 실행 178건이 들락
+    거리면 상태 파일 앞쪽이 통째로 다시 쓰여 용량만 먹습니다(README "저장소 용량 관리").
+    쓰는 순간에만 원본을 봅니다.
+    """
+    if not matched:
+        return None
+    if matched_id is not None and matched_id in seen:
+        return price_record(seen, matched_id)
+    return {
+        "last_alert_price": matched.get("last_alert_price"),
+        "last_seen_price": matched.get("last_seen_price"),
+    }
+
+
 def normalize_title(name) -> str:
     """재출품 판별용으로 제목을 정규화합니다 (공백/기호/전각·반각 차이를 무시)."""
     text = unicodedata.normalize("NFKC", str(name or ""))
@@ -1493,10 +1533,7 @@ def process_items(
             # 어느 쪽이든 새 매물이 아니므로, 예전 가격 이력을 이어받고 '신규' 알림을 보내지 않습니다.
             matched = relist_fingerprints.get(fingerprint) if fingerprint else None
             matched_id = matched.get("item_id") if matched else None
-            restored = {
-                "last_alert_price": matched.get("last_alert_price"),
-                "last_seen_price": matched.get("last_seen_price"),
-            } if matched else None
+            restored = relist_baseline(seen, matched, matched_id)
 
             if matched and matched_id == item_id:
                 # 같은 ID의 지문이 남아 있음 = 예전에 확인했는데 seen에서만 밀려난 매물.

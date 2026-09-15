@@ -1309,6 +1309,70 @@ class MercariStateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([e["alert_id"] for e in new_items], ["new:m-new"])
 
+    async def test_a_relist_takes_the_live_record_over_a_stale_fingerprint_copy(self):
+        """지문 값은 `seen[item_id]`의 **사본**입니다. 원본이 있으면 원본이 진실입니다.
+
+        판매자가 값을 내리면서 제목을 고치면 지문 키가 새로 생기고 **옛 키가 옛 가격을
+        들고 남습니다.** 그 옛 키에 새 매물이 걸리면 이미 알린 값보다 **비싼** 기준가를
+        물려받아, PR #23이 없앤 결함이 재출품 경로로 되살아납니다.
+
+        운영 기록 그대로입니다(2026-09-15): `seller:851163117:…ワイドレッグジーンズ`가
+        지문 ¥95,000 / seen ¥85,000이었고, 이런 어긋남이 178건 전부 제목 변경이었습니다.
+        """
+        relist_fingerprints = {
+            "seller:A:t": {"item_id": "m-old", "last_alert_price": 95000,
+                           "last_seen_price": 95000},
+        }
+        # 예전 매물은 그 뒤 ¥85,000까지 내려가 알림이 나갔습니다(원본은 seen 에 있습니다).
+        seen = {"m-old": {"last_alert_price": 85000, "last_seen_price": 85000}}
+        new_items: list = []
+        item = vars(FakeItem("m-new", "t", 90000, seller_id="A"))
+
+        mercari.process_items(
+            "test", [item], seen, relist_fingerprints, new_items,
+            listed_ids={"m-new"}, survival={"m-old": False}, now=1000.0,
+        )
+        # ¥90,000은 이미 알린 ¥85,000보다 비싸므로 인하 알림이 나가면 안 됩니다.
+        self.assertEqual(new_items, [])
+        self.assertEqual(seen["m-new"]["last_alert_price"], 85000)
+
+    async def test_a_relist_is_not_handed_a_floor_left_by_a_merge(self):
+        """병합이 지문에 남의 기준가를 얹어 놓아도(PR #35 잔여) 물려주면 안 됩니다.
+
+        그쪽으로 낡은 사본을 물려받으면 인하 알림이 **조용히 삼켜집니다.**
+        """
+        relist_fingerprints = {
+            "seller:A:t": {"item_id": "m-old", "last_alert_price": 40700,
+                           "last_seen_price": 82600},
+        }
+        seen = {"m-old": {"last_alert_price": 82600, "last_seen_price": 82600}}
+        new_items: list = []
+        item = vars(FakeItem("m-new", "t", 70000, seller_id="A"))
+
+        mercari.process_items(
+            "test", [item], seen, relist_fingerprints, new_items,
+            listed_ids={"m-new"}, survival={"m-old": False}, now=1000.0,
+        )
+        # 진짜 기준가는 ¥82,600이므로 ¥70,000은 인하 알림이 나가야 합니다.
+        self.assertEqual([e["alert_id"] for e in new_items], ["drop:m-new:82600:70000"])
+
+    async def test_the_fingerprint_copy_is_still_used_when_the_owner_is_gone_from_seen(self):
+        """원본이 없으면(상한에 밀려났거나 처음부터 없음) 사본이 유일한 기록입니다."""
+        relist_fingerprints = {
+            "seller:A:t": {"item_id": "m-old", "last_alert_price": 5000,
+                           "last_seen_price": 5000},
+        }
+        seen: dict = {}
+        new_items: list = []
+        item = vars(FakeItem("m-new", "t", 5000, seller_id="A"))
+
+        mercari.process_items(
+            "test", [item], seen, relist_fingerprints, new_items,
+            listed_ids={"m-new"}, survival={"m-old": False}, now=1000.0,
+        )
+        self.assertEqual(seen["m-new"], {"last_alert_price": 5000, "last_seen_price": 5000})
+        self.assertEqual(new_items, [])  # 재출품이므로 신규 알림은 없습니다
+
     async def test_lookup_targets_match_what_the_judgment_asks(self):
         """미리 추린 조회 대상이 판정이 실제로 묻는 것과 정확히 같아야 합니다.
 
