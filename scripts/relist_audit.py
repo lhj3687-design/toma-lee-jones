@@ -40,8 +40,20 @@ PR #25가 "판정 68건 중 36건이 오판"을 낼 때 쓴 계산을 스크립�
 -----------------------------------
 
 '예전 매물이 그 뒤 다시 관측됐는가'는 **지문의 주인이 그 ID로 되돌아오는 순간**으로만
-읽습니다. 거짓 양성이 없는 신호가 그것뿐이기 때문입니다(dict 순서로 복원하는 방식은
-두 가지 다 거짓 양성이 났습니다 — CLAUDE.md 참고).
+읽습니다. dict 순서로 복원하는 방식은 두 가지 다 거짓 양성이 났습니다(CLAUDE.md 참고).
+
+**그렇다고 이 신호에 거짓 양성이 없는 것은 아닙니다(2026-09-15 반증).** 병합이 주인을
+예전 ID로 되돌려 놓습니다 — `merge_ordered()`가 양쪽에 다 있는 키를 `mine`으로 덮는데
+내 실행이 먼저 시작했으면 그 값은 옛날 주인입니다. 그래서 예전 매물을 다시 본 적이
+없어도 '다시 관측됨'으로 읽힙니다. 아래 '오판'로 찍힌 것은 **후보**이지 결론이 아닙니다.
+가려내는 방법 둘:
+
+  - 예전 매물이 `seen`의 **끝으로 갔는지** 보세요. 관측되면 `remember()`가 끝으로
+    보냅니다. 되돌림이면 제자리에 붙박여 있습니다.
+  - `--list-ids`로 뽑아 Coverage Scan의 `track`에 넣고 **직접 물어보세요.** 2026-09-15
+    실측에서는 이 도구가 '오판 1건'이라고 한 매물이 메루카리에 **없었습니다**(HTTP 403,
+    같은 실행에서 살아 있는 매물 3건은 '있음'으로 답해 차단이 아님을 확인). 실제 오판은
+    0건이었습니다.
 
 대신 **거짓 음성이 있습니다.** `process_items()`는 매물을 등록 시각 오름차순으로
 갱신하므로, 예전 매물과 새 매물이 **같은 실행에서 함께 관측되면** 예전 매물이 먼저
@@ -239,7 +251,7 @@ def audit(since: float, until: float, calibrate: bool, list_ids: bool = False) -
     misjudged = [v for v in verdicts if v["gap"] is not None]
     beyond_window = [v for v in misjudged if v["gap"] > RELIST_ABSENCE_SECONDS]
 
-    print(f"  그중 예전 매물이 뒤에 다시 관측됨 = 오판   {len(misjudged)}건  (하한입니다)")
+    print(f"  그중 예전 매물이 뒤에 다시 관측됨 = 오판 후보 {len(misjudged)}건")
     print(f"    그중 공백이 {RELIST_ABSENCE_SECONDS // 60}분을 넘은 것            "
           f"{len(beyond_window)}건")
     print()
@@ -260,9 +272,12 @@ def audit(since: float, until: float, calibrate: bool, list_ids: bool = False) -
                                       if v["fp"].startswith("seller:"))
         print(f"   판매자별: {dict(sellers)}")
 
-    print("\n※ 오판 건수는 하한이고 공백은 상한입니다. 예전 매물과 새 매물이 같은 실행에서"
-          "\n   함께 관측되면 나중에 갱신되는 새 매물이 지문을 덮어써서, 예전 매물의 관측이"
-          "\n   상태 파일에 흔적을 남기지 않습니다.")
+    print("\n※ '오판 후보'는 결론이 아닙니다. 양쪽으로 다 틀립니다."
+          "\n   - 거짓 음성: 예전 매물과 새 매물이 같은 실행에서 함께 관측되면 나중에 갱신되는"
+          "\n     새 매물이 지문을 덮어써서, 예전 매물의 관측이 상태 파일에 흔적을 남기지 않습니다."
+          "\n   - 거짓 양성: 병합이 지문 주인을 예전 ID로 되돌려 놓습니다(2026-09-15 실측 1건)."
+          "\n     예전 매물이 seen의 끝으로 갔는지 같이 보거나, --list-ids 로 뽑아 Coverage Scan의"
+          "\n     track 에 넣고 직접 물어보세요. 그 1건은 물어보니 없는 매물이었습니다.")
 
     if calibrate:
         ok = (len(inherited) == CALIBRATION["inherited"]
