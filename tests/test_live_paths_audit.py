@@ -142,6 +142,43 @@ class CountingTests(unittest.TestCase):
         self.assertEqual(report["판"], 4)
         self.assertEqual(len(report["실행"]), 2)
 
+    def test_the_cadence_place_uses_the_clock_from_before_this_run(self):
+        """봇이 보는 last_ok 는 **이번 실행이 덮어쓰기 전**의 값입니다.
+
+        이번 판의 값을 쓰면 간격이 0으로 보여 경고 가지가 영영 안 서는 것처럼 세집니다.
+        (도구를 만들면서 실제로 낸 고장입니다 - previous_run 을 먼저 갱신해 버렸습니다.)
+        """
+        report = audit.summarize(snapshots(
+            (BASE, "queue", make_blob(clocks=clock(search=BASE, cadence=BASE - 5000))),
+            (BASE + 700, "queue", make_blob(clocks=clock(search=BASE + 700,
+                                                         cadence=BASE + 700))),
+        ))
+        self.assertEqual(report["경고 자리"]["cadence-slow"], 1)
+
+    def test_a_whole_bot_outage_is_not_counted_as_a_stuck_keyword(self):
+        """봇 전체가 멈췄다 살아난 실행에서는 모든 키워드가 동시에 오래 묵습니다.
+
+        keyword_health_alerts 는 그 실행에서 아무것도 내보내지 않습니다(안 그러면
+        '검색 재개'가 키워드 수만큼 쏟아집니다). 자리도 같은 가드를 써야 합니다.
+        """
+        stale = {"Margiela": BASE - 8 * 3600}
+        report = audit.summarize(snapshots(
+            (BASE, "queue", make_blob(clocks=clock(search=BASE))),
+            # 8시간 뒤에야 살아난 실행 - 키워드도 8시간 묵었습니다
+            (BASE + 8 * 3600, "queue", make_blob(
+                clocks={**clock(search=BASE + 8 * 3600), **stale})),
+        ))
+        self.assertEqual(report["경고 자리"]["keyword-down"], 0)
+
+    def test_one_keyword_stuck_while_the_bot_is_alive_is_a_place(self):
+        """'다른 키워드는 멀쩡한데 이 키워드만' 막힌 자리는 세야 합니다."""
+        report = audit.summarize(snapshots(
+            (BASE, "queue", make_blob(clocks=clock(search=BASE))),
+            (BASE + 60, "queue", make_blob(
+                clocks={**clock(search=BASE + 60), "Margiela": BASE - 2 * 3600})),
+        ))
+        self.assertEqual(report["경고 자리"]["keyword-down"], 1)
+
     def test_a_recovery_without_its_warning_is_reported(self):
         """PR #22가 막은 그 모양 - 알린 적 없는 고장이 나았다는 말."""
         sent = ["health:recovered:1789192141",

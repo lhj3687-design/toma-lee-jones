@@ -68,6 +68,7 @@ MAX_SENT_ALERTS = 20000
 HEALTH_ALERT_AFTER_SECONDS = 10 * 60
 EXPECTED_RUN_INTERVAL_SECONDS = 60
 RUN_INTERVAL_SLACK = 3
+KEYWORD_STUCK_AFTER_SECONDS = 60 * 60
 WATCHDOG_STUCK_AFTER_SECONDS = 15 * 60
 WATCHDOG_STALE_AFTER_SECONDS = 30 * 60
 
@@ -181,7 +182,10 @@ def extract(blob):
         for short, key in CLOCK_KEYS.items():
             value = table.get(key)
             clocks[short] = float(value) if isinstance(value, (int, float)) else None
-        clocks["keywords"] = sum(1 for k in table if not k.startswith("__"))
+        per_keyword = [v for k, v in table.items()
+                       if not k.startswith("__") and isinstance(v, (int, float))]
+        clocks["keywords"] = len(per_keyword)
+        clocks["worst_keyword"] = min(per_keyword) if per_keyword else None
 
     return {
         "seen": count_seen_entries(seen_chunk),
@@ -256,6 +260,13 @@ def summarize(snapshots):
         "seen 최대": None, "지문 최대": None, "전송기록 최대": None,
         "상한 초과": {"seen": 0, "지문": 0, "전송기록": 0},
         "매물0 자리": [], "등록시각 자리": [],
+        # 경고 가지가 실제로 설 수 있었던 실행 수. **복구 가지는 세지 않습니다** -
+        # 그 가지는 봇이 아예 안 돌았을 때도, 지연된 실행이 낡은 체크아웃을 읽었을
+        # 때도 서기 때문에 상태 파일만으로는 분모를 못 셉니다(2026-09-17 실측:
+        # recovered 5건 중 2건이 '다음 실행까지 56초·148초'인 자리에서 나왔습니다 -
+        # 커밋 이력의 간격으로는 설명되지 않습니다).
+        "경고 자리": {"empty-feed": 0, "created-missing": 0,
+                    "cadence-slow": 0, "keyword-down": 0},
     }
     previous_when = None
     previous_run = None
@@ -305,8 +316,12 @@ def summarize(snapshots):
         if previous_run is not None and previous_run["search_ok"] == search_ok:
             continue   # 같은 실행이 여러 번 커밋합니다
         run = {"search_ok": search_ok, "clocks": clocks, "when": when}
-        if previous_run is not None:
-            run["gap"] = search_ok - previous_run["search_ok"]
+        # 직전 실행의 시계는 **다시 덮기 전에** 붙들어 둡니다. 봇이 보는 last_ok 는
+        # 이번 실행이 덮어쓰기 전의 값이라, 여기서 previous_run 을 먼저 갱신하면
+        # 간격이 0으로 보여 경고 가지가 영영 안 서는 것처럼 세집니다.
+        earlier = previous_run
+        if earlier is not None:
+            run["gap"] = search_ok - earlier["search_ok"]
         report["실행"].append(run)
         previous_run = run
 
@@ -314,9 +329,27 @@ def summarize(snapshots):
         items_ok = clocks.get("items_ok")
         if items_ok is not None and search_ok - items_ok > 0.5:
             report["매물0 자리"].append((search_ok, search_ok - items_ok))
+            if search_ok - items_ok >= HEALTH_ALERT_AFTER_SECONDS:
+                report["경고 자리"]["empty-feed"] += 1
         created_ok = clocks.get("created_ok")
         if created_ok is not None and search_ok - created_ok > 0.5:
             report["등록시각 자리"].append((search_ok, search_ok - created_ok))
+            if search_ok - created_ok >= HEALTH_ALERT_AFTER_SECONDS:
+                report["경고 자리"]["created-missing"] += 1
+        # keyword_health_alerts 는 봇 전체가 오래 멈췄던 실행에서는 아무것도 내보내지
+        # 않습니다(안 그러면 살아나는 순간 키워드 수만큼 쏟아집니다). 그 가드를 여기서도
+        # 그대로 겁니다 - 안 걸면 7시간 정지의 복구 실행 하나가 '자리'로 잡힙니다.
+        worst = clocks.get("worst_keyword")
+        bot_was_down = earlier is not None and search_ok - earlier["search_ok"] >= KEYWORD_STUCK_AFTER_SECONDS
+        if worst is not None and not bot_was_down and search_ok - worst >= KEYWORD_STUCK_AFTER_SECONDS:
+            report["경고 자리"]["keyword-down"] += 1
+        # cadence 는 봇이 쓰는 두 조건을 그대로 씁니다 - 간격이 벌어졌고(>기대x3),
+        # 직전 정상 시각이 10분 이상 묵었을 때만 경고 가지에 닿습니다.
+        previous_cadence = (earlier or {}).get("clocks", {}).get("cadence_ok")
+        if ("gap" in run and previous_cadence is not None
+                and search_ok - previous_cadence >= HEALTH_ALERT_AFTER_SECONDS
+                and run["gap"] > EXPECTED_RUN_INTERVAL_SECONDS * RUN_INTERVAL_SLACK):
+            report["경고 자리"]["cadence-slow"] += 1
 
     report["health"] = first_health
     report["health 대기"] = sorted(report["health 대기"] - set(first_health))
@@ -386,49 +419,63 @@ def render(report, out=sys.stdout):
         + (f"  {stamp(runs[0]['search_ok'])} ~ {stamp(runs[-1]['search_ok'])}" if runs else ""))
 
     say("")
-    say("[경로별 자리(분모)와 울림(분자)]")
+    say("[경고 가지가 설 자리(분모)와 실제로 나간 알림(분자)]")
+    say("  ※ 복구(✅) 가지의 분모는 **세지 않습니다** — 그 가지는 봇이 아예 안 돌았을 때도,")
+    say("    지연된 실행이 낡은 체크아웃을 읽었을 때도 서기 때문에 상태 파일만으로는 못 셉니다.")
     grouped = families(report["health"])
     rang = lambda name: len(grouped.get(name, {}))
+    places = report["경고 자리"]
 
-    def line(label, places, alerts, blurb=""):
-        if places is None:
-            say(f"  {label:26s} 자리 ⛔측정없음   울림 {alerts}건  {blurb}")
+    def line(label, place, warn_name, recover_name, blurb=""):
+        warned, recovered = rang(warn_name), rang(recover_name)
+        if place is None:
+            shown = "⛔측정없음"
         else:
-            mark = "" if places else "   ← 자리가 0이면 울림 0은 '이상 없음'이 아닙니다"
-            say(f"  {label:26s} 자리 {places:>6,}회  울림 {alerts}건{mark}  {blurb}")
+            shown = f"{place:,}회"
+        mark = ("   ← 자리 0 = 이 경로는 아직 한 번도 불린 적이 없습니다"
+                if place == 0 and warned == 0 else "")
+        say(f"  {label:24s} 경고 자리 {shown:>9s}  ⚠️{warned}건 / ✅{recovered}건{mark}")
+        if blurb:
+            say(f"    {blurb}")
 
-    places = None if read == 0 else len(report["매물0 자리"])
+    empty = None if read == 0 else places["empty-feed"]
     worst = max((d for _, d in report["매물0 자리"]), default=0)
-    line("empty_feed_alerts", places, rang("empty-feed") + rang("feed-ok"),
+    line("empty_feed_alerts", empty, "empty-feed", "feed-ok",
+         f"검색은 됐는데 매물 0건이던 실행 {len(report['매물0 자리'])}개 "
          f"(가장 길었던 것 {worst:.0f}초 / 임계 {HEALTH_ALERT_AFTER_SECONDS}초)")
-
-    places = None if read == 0 else len(report["등록시각 자리"])
-    line("created_coverage_alerts", places, rang("created-missing") + rang("created-ok"))
+    line("created_coverage_alerts", None if read == 0 else places["created-missing"],
+         "created-missing", "created-ok")
+    line("keyword_health_alerts", None if read == 0 else places["keyword-down"],
+         "keyword-down", "keyword-up")
 
     gaps_between = [r["gap"] for r in runs if "gap" in r]
-    if gaps_between:
-        loose = sum(1 for g in gaps_between
-                    if g > EXPECTED_RUN_INTERVAL_SECONDS * RUN_INTERVAL_SLACK)
-        line("cadence_alerts", loose, rang("cadence-slow") + rang("cadence-ok"),
-             f"(간격 중앙값 {statistics.median(gaps_between):.0f}초 · 최대 {max(gaps_between):.0f}초)")
-    else:
-        line("cadence_alerts", None, rang("cadence-slow") + rang("cadence-ok"))
+    line("cadence_alerts", None if read == 0 else places["cadence-slow"],
+         "cadence-slow", "cadence-ok",
+         (f"실행 간격 중앙값 {statistics.median(gaps_between):.0f}초 · "
+          f"최대 {max(gaps_between):.0f}초 · 180초 초과 "
+          f"{sum(1 for g in gaps_between if g > 180)}회") if gaps_between else "")
 
     over = report["상한 초과"]
-    line("state_capacity_alerts", over["seen"] + over["지문"] + over["전송기록"],
-         rang("state-cap"),
-         f"(seen 최대 {report['seen 최대']:,}/{MAX_SEEN_ITEMS:,} · "
-         f"지문 {report['지문 최대']:,}/{MAX_RELIST_FINGERPRINTS:,} · "
-         f"전송기록 {report['전송기록 최대']:,}/{MAX_SENT_ALERTS:,})"
-         if report["seen 최대"] is not None else "")
+    say(f"  {'state_capacity_alerts':24s} 경고 자리 {over['seen'] + over['지문'] + over['전송기록']:,}회"
+        f"       ⚠️{rang('state-cap')}건"
+        + ("   ← 자리 0 = 아직 한 번도 불린 적이 없습니다"
+           if not (over["seen"] + over["지문"] + over["전송기록"]) and not rang("state-cap") else ""))
+    if report["seen 최대"] is not None:
+        say(f"    seen 최대 {report['seen 최대']:,}/{MAX_SEEN_ITEMS:,} · "
+            f"지문 {report['지문 최대']:,}/{MAX_RELIST_FINGERPRINTS:,} · "
+            f"전송기록 {report['전송기록 최대']:,}/{MAX_SENT_ALERTS:,}")
+    say(f"  {'health_alerts(전량 실패)':24s} 경고 자리 ⛔측정없음  ⚠️{rang('search-down')}건 "
+        f"/ ✅{rang('recovered')}건")
+    say("    전량 실패한 실행은 상태가 바뀌지 않아 커밋도 남기지 않습니다 — 분모가 이력에 없습니다.")
 
     say("")
-    say("[실제로 나간 health 알림]")
+    say("[이 창의 상태 파일에 남아 있는 health 알림]")
+    say("  ※ '처음 보인 판'은 **이 창 안에서** 처음 보인 때입니다 — 알림이 나간 때가 아닙니다.")
     if not grouped:
         say("  없음")
     for name in sorted(grouped):
         first = min(grouped[name].values())
-        say(f"  {name:16s} {len(grouped[name]):3d}건  (처음 보인 판 {stamp(first)})")
+        say(f"  {name:16s} {len(grouped[name]):3d}건  (이 창에서 처음 보인 판 {stamp(first)})")
     if report["health 대기"]:
         say(f"  대기열에 올랐다가 끝내 못 나간 것 {len(report['health 대기'])}건: "
             f"{report['health 대기'][:5]}")
@@ -440,7 +487,7 @@ def render(report, out=sys.stdout):
         note = "  (cadence 가족은 일부러 가드를 걸지 않았습니다)" if recovery == "cadence-ok" else ""
         say(f"  {recovery:12s} {total_of:3d}건 중 짝 없음 {len(loose):3d}건{note}")
         for alert, when in loose:
-            say(f"      {alert}  (처음 보인 판 {stamp(when)})")
+            say(f"      {alert}  (이 창에서 처음 보인 판 {stamp(when)})")
 
 
 # --------------------------------------------------------------------------
@@ -486,6 +533,12 @@ EXPECTED_A = {
     "매물0 자리": 0,
     "등록시각 자리": 0,
     "상한 초과": 0,
+    # 경고 가지의 자리. cadence 만 실제로 섰습니다 - 나머지 셋이 전부 0이라
+    # '자리 0'과 '울림 0'이 뭉개지는 자리가 여기입니다.
+    "경고 자리 empty-feed": 0,
+    "경고 자리 created-missing": 0,
+    "경고 자리 cadence-slow": 11,
+    "경고 자리 keyword-down": 0,
     # seen 과 지문은 슬랩은 같지만 **세는 법이 다릅니다.** 한쪽 공식을 다른 쪽에 쓰면
     # 지문이 정확히 두 배(28,272)가 되고, 반대로 dict 만 세면 seen 이 내려앉습니다.
     # 둘이 **같이** 맞아야 통과입니다 - 둘 다 이 도구를 만들며 실제로 낸 고장입니다.
@@ -521,6 +574,10 @@ def measure(rev, window, repo):
         "최대 간격(초)": int(max(gaps)) if gaps else 0,
         "매물0 자리": len(report["매물0 자리"]),
         "등록시각 자리": len(report["등록시각 자리"]),
+        "경고 자리 empty-feed": report["경고 자리"]["empty-feed"],
+        "경고 자리 created-missing": report["경고 자리"]["created-missing"],
+        "경고 자리 cadence-slow": report["경고 자리"]["cadence-slow"],
+        "경고 자리 keyword-down": report["경고 자리"]["keyword-down"],
         "상한 초과": sum(report["상한 초과"].values()),
         "seen 최대": report["seen 최대"],
         "지문 최대": report["지문 최대"],
