@@ -198,6 +198,78 @@ class CalibrationCatchesFaultsTests(unittest.TestCase):
         self.patch("report", report_with_wrong_denominator)
         self.assert_caught("못 물어봄 비율의 분모")
 
+    # --- 직접 조회에 걸린 시간 칸 (2026-09-17에 새로 켠 칸) ---
+    #
+    # **같은 고장을 이 칸에도 넣습니다.** 지난 라운드의 교훈이 정확히 "한 칸을 고쳤다고
+    # 다른 칸이 덮이지 않는다"였습니다. 자릿수 둘, 누적, 불변식, 통계, 외삽 식까지
+    # 칸마다 하나씩 겁니다.
+
+    def test_a_single_digit_seconds_pattern_is_caught(self):
+        """`직접조회 13.6초`가 3.6초로 세지는 고장. 상한을 올릴지가 이 값으로 갈립니다."""
+        self.patch("LOOKUP_TIME_PATTERN",
+                   re.compile(r"직접조회 (?P<seconds>\d\.\d)초/왕복(?P<trip>\d+\.\d\d)초"))
+        self.assert_caught("걸린 초 자릿수")
+
+    def test_a_single_digit_round_trip_pattern_is_caught(self):
+        """왕복의 **정수 자리**도 자릿수가 있습니다. 1.25까지만 눈금에 두면 안 잡힙니다."""
+        self.patch("LOOKUP_TIME_PATTERN",
+                   re.compile(r"직접조회 (?P<seconds>\d+\.\d)초/왕복(?P<trip>\d\.\d\d)초"))
+        self.assert_caught("왕복 정수 자릿수")
+
+    def test_losing_timing_accumulation_is_caught(self):
+        """시간은 **판마다** 들고 있어야 분포가 나옵니다. 덮어쓰면 봉우리가 사라집니다."""
+
+        class KeepsOnlyTheLastTiming(commit_notes.Tally):
+            def add(self, timestamp, note):
+                super().add(timestamp, note)
+                if note and note.get("lookup_time"):
+                    self.timings = self.timings[-1:]
+
+        self.patch("Tally", KeepsOnlyTheLastTiming)
+        self.assert_caught("시간 판 누적")
+
+    def test_ignoring_the_timing_invariant_is_caught(self):
+        """걸린 초는 조회 사이 간격의 합보다 짧을 수 없습니다(봇이 그만큼은 잠듭니다)."""
+
+        class IgnoresTimingInvariant(commit_notes.Tally):
+            def add(self, timestamp, note):
+                super().add(timestamp, note)
+                self.timing_violations = 0
+
+        self.patch("Tally", IgnoresTimingInvariant)
+        self.assert_caught("걸린 초 불변식")
+
+    def test_pretending_the_invariant_was_checked_is_caught(self):
+        """봇 상수를 못 읽는 환경이면 그 불변식은 **재지 못한 것**입니다.
+        0건 위반을 '성립했다'로 찍으면 못 잡는 도구로 이상 없다고 하는 것입니다."""
+
+        class PretendsItChecked(commit_notes.Tally):
+            def add(self, timestamp, note):
+                super().add(timestamp, note)
+                self.timing_checked = len(self.timings)
+
+        self.patch("Tally", PretendsItChecked)
+        self.assert_caught("불변식을 쟀다고 우기기")
+
+    def test_reporting_the_max_as_p90_is_caught(self):
+        """p90과 최대를 뭉치면 '나쁜 판'과 '제일 나쁜 판'이 같은 값이 됩니다.
+        눈금 값이 넷뿐이던 동안 이 고장이 실제로 통과했습니다."""
+        original = commit_notes.percentiles
+
+        def max_is_p90(values):
+            mid, p90, _maximum = original(values)
+            return mid, p90, p90
+
+        self.patch("percentiles", max_is_p90)
+        self.assert_caught("최대를 p90으로")
+
+    def test_dropping_the_pause_from_the_model_is_caught(self):
+        """외삽 식에서 조회 사이 간격을 빼면 '30건도 된다'는 답이 나옵니다 —
+        실제로는 그 간격이 20초의 대부분입니다."""
+        self.patch("predict_seconds",
+                   lambda count, trip, pause, canaries: trip * (canaries + count))
+        self.assert_caught("외삽 식의 조회 사이 간격")
+
 
 if __name__ == "__main__":
     unittest.main()

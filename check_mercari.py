@@ -104,12 +104,27 @@ MIN_RELIST_ABSENCE_CHECKS = 2
 #
 # 그래도 값을 올리지 않았습니다. 상한을 두는 이유는 조회량이 아니라 **시간**이고
 # (concurrency 때문에 한 실행이 길어지는 동안 봇 전체가 멈춥니다 — README "한 실행이
-# 오래 붙잡고 있지 않게 하는 장치"), 이 환경에서는 조회 한 건의 실제 소요를 잴 길이
-# 없습니다. 아래 초 단위 상한이 **아직 한 번도 안 걸렸다**는 것만 압니다(43.3시간 0회).
-# 올리려면 그 여유가 몇 초인지부터 재야 합니다 — 숫자 없이 문턱을 옮기지 않습니다.
+# 오래 붙잡고 있지 않게 하는 장치"), 조회 한 건의 실제 소요를 잴 길이 없었습니다.
+#
+# **2026-09-17에 그 시간을 재기 시작했습니다.** 이 단계가 몇 초를 썼는지와 조회 한 건의
+# 평균 왕복을 상태 커밋 꼬리표에 싣습니다(`직접조회 13.6초/왕복0.10초` — run_note_text).
+# 며칠 모이면 `scripts/commit_notes.py`가 '20초에 몇 초가 남았는가'와 '상한을 N으로
+# 올리면 몇 초가 되는가'를 갈라 찍습니다. **그 숫자가 나오기 전에는 이 값을 옮기지
+# 않습니다.**
+#
+# 다만 **재지 않아도 이미 아는 것이 하나 있습니다.** 걸린 시간의 대부분은 네트워크가
+# 아니라 아래 조회 사이 간격입니다. 왕복이 0초라고 쳐도 잠든 시간만
+# `RELIST_LOOKUP_PAUSE_SECONDS x (눈금 조회 + N - 2)`라, 20초 안에 들어가는 N은
+# **아무리 좋아야 19건**입니다. 실측 최대치(한 판 30건)에 못 미칩니다. 즉 왕복 시간이
+# 얼마로 나오든 **건수 상한만으로는 그 봉우리를 덮을 수 없습니다** — 그때 볼 곳은
+# 간격(1.0초)이거나, 넘친 자리를 다음 실행이 확실히 다시 보게 만드는 쪽입니다.
 MAX_RELIST_LOOKUPS_PER_RUN = 12
 MAX_RELIST_LOOKUP_SECONDS_PER_RUN = 20
 # 조회 사이 간격. 검색이 페이지 사이에 두는 간격과 같게 둡니다.
+#
+# 이 값이 실은 **초 단위 상한의 진짜 주인**입니다(위 문단). 그런데 줄여도 되는지는
+# 아직 근거가 없습니다 — 메루카리가 어느 속도에서 429를 주는지 재 본 적이 없습니다.
+# 재지 않고 줄이면 '차단이 아니다'라는 지금 결론(눈금⛔ 0회)부터 흔들립니다.
 RELIST_LOOKUP_PAUSE_SECONDS = 1.0
 # '그 매물은 없다'로 읽는 상태 코드입니다. 둘인 이유는 엔드포인트마다 다르기 때문입니다
 # (2026-09-14 실측: 숍스는 404, 없어진 일반 매물은 **403**). 그 밖의 코드는 전부
@@ -855,6 +870,19 @@ def is_fresh_listing(created_at: float | None, cutoff: float | None) -> bool:
 #
 # 그래서 **0일 때는 아무것도 붙이지 않습니다.** 물어볼 자리가 없었던 실행은 예전과
 # 똑같은 커밋 메시지를 남깁니다.
+#
+# **그 62바이트를 '칸을 하나 더 붙이는 값'으로 읽으면 안 됩니다.** 그것은 제목이 전부
+# 똑같던 커밋에 꼬리표를 **새로 만들어 붙일 때**의 값입니다. 이미 꼬리표가 붙어 있는
+# 커밋을 늘리는 것은 다릅니다 — 끊을 델타가 이미 끊겨 있고, 늘어나는 글자의 대부분이
+# 모든 판에 똑같은 고정 문구라 델타가 먹을 것이 오히려 늘어납니다. 2026-09-17에 같은
+# 방식으로 재 봤습니다(꼬리표가 붙은 진짜 커밋 361개, 대조군 차이 0바이트):
+#
+#   직접조회 칸(원문 35 B)을 물어본 판 전부에    팩 -13,733 B (조각당 **-38 B**)
+#   같은 길이의 무작위 문자열을 같은 판에        팩 +13,234 B (조각당 **+37 B**)
+#
+# 길이가 같은데 부호가 뒤집힙니다. 즉 **비싼 것은 길이가 아니라 '매번 다름'**이고,
+# 이 칸은 27바이트가 고정 문구입니다. 그래서 '상한에 걸린 판에만 싣는' 아낌수를
+# 쓰지 않았습니다 — 아끼는 것이 없고 표본만 5회/43시간으로 줄어듭니다.
 RUN_NOTE_FILE = Path(os.getenv("STATE_COMMIT_NOTE_FILE", ".state_commit_note"))
 # 다음 페이지 조건(#33)이 발동하지 않았어도 '얼마나 다가섰는지'를 남길 문턱입니다.
 # 실측(2026-09-10 ~ 09-14)에서 한 페이지의 신규 매물은 최대 72건이었고 80건 이상은
@@ -877,6 +905,19 @@ def count_event(key: str, amount: int = 1) -> None:
         run_counters[key] = int(run_counters.get(key, 0)) + amount
 
 
+def add_seconds(key: str, seconds: float) -> None:
+    """이번 실행에서 **걸린 시간**을 더합니다.
+
+    `count_event`와 나눠 둔 이유는 값이 실수이기 때문입니다. 같은 칸에 섞으면
+    `int()`가 조용히 잘라 0.6초짜리 조회가 **0초**로 세집니다 — 못 잰 것을 0으로
+    읽는 그 함정입니다.
+
+    음수는 0으로 둡니다. 시계가 뒤로 가는 일은 러너에서 사실상 없지만, 음수가 섞이면
+    합이 조용히 작아져 '여유가 많다'는 틀린 결론이 납니다.
+    """
+    run_counters[key] = float(run_counters.get(key, 0.0)) + max(0.0, float(seconds))
+
+
 def note_max(key: str, value: int) -> None:
     """이번 실행의 최댓값을 남깁니다(여러 키워드 중 가장 큰 값)."""
     if value > int(run_counters.get(key, 0)):
@@ -895,11 +936,17 @@ def run_note_text() -> str:
 
     모양(README에 같은 표가 있습니다):
 
-        (재출품 5: 있음2/없음3/못물어봄0, 다음페이지 1회 신규112, 조회실패 1)
-        (재출품 3/9: 있음1/없음1/못물어봄1 눈금⛔일반)
+        (재출품 5: 있음2/없음3/못물어봄0, 직접조회 6.6초/왕복0.12초, 조회실패 1)
+        (재출품 3/9: 있음1/없음1/못물어봄1 눈금⛔일반, 직접조회 4.4초/왕복0.09초)
+        (재출품 12/30: 있음12/없음0/못물어봄0, 직접조회 13.6초/왕복0.10초)
 
     `재출품 {물어본 수}/{물어볼 수}`에서 두 값이 다르면 실행당 상한이나 눈금 불신으로
     **못 물어본 것이 있다**는 뜻입니다. 두 값이 같으면 앞의 하나만 씁니다.
+
+    `직접조회 {걸린 초}/왕복{조회 한 건 평균}`은 그 상한을 올릴 수 있는지를 가르는
+    값입니다. 걸린 초는 **초 단위 상한이 재는 바로 그 값**이라 20초에서 빼면 여유가
+    나오고, 왕복은 상한을 N으로 올렸을 때를 계산하는 데 씁니다. 눈금⛔ 뒤에 두는
+    이유는 그 표시가 쉼표까지 먹기 때문입니다(`commit_notes.py`의 패턴 참고).
 
     '못물어봄 0'을 굳이 적는 이유: 0을 생략하면 '0건이었다'와 '이 기능이 아직 배포되지
     않았다'가 같은 모양이 됩니다. 이 저장소가 두 번 당한 자리라(못 잰 것을 0으로 읽기)
@@ -919,6 +966,28 @@ def run_note_text() -> str:
         if blocked:
             piece += " 눈금⛔" + "+".join(blocked)
         parts.append(piece)
+
+    # 이 단계가 몇 초를 썼는가. **둘을 같이 싣습니다.**
+    #
+    #   걸린 초 : 초 단위 상한(MAX_RELIST_LOOKUP_SECONDS_PER_RUN)이 재는 바로 그 값.
+    #             20초에서 빼면 그 판에 남아 있던 여유입니다.
+    #   왕복    : 조회 **한 건**의 평균 요청 시간(눈금 조회도 포함).
+    #
+    # 왜 하나로 안 되는가: 걸린 초의 대부분은 조회 사이 간격(1초씩)이라 건수만 알면
+    # 그쪽은 계산되지만, 네트워크 왕복은 계산이 안 됩니다. 반대로 왕복만 실으면 그 판에
+    # 눈금 조회가 몇 건 붙었는지를 몰라 걸린 초를 되짚을 수 없습니다. 상한을 N으로
+    # 올렸을 때의 예상 시간은 **두 값이 다 있어야** 나옵니다.
+    #
+    # 나누기를 여기서 하는 이유는 요청 건수를 **여기서만 정확히 알기** 때문입니다
+    # (눈금 조회 1~2건이 꼬리표에 안 실립니다). 밖에서 나누면 건수가 적은 판에서
+    # 오차가 몇 배로 벌어집니다.
+    requests = int(run_counters.get("relist_requests", 0))
+    if requests:
+        trip = float(run_counters.get("relist_request_seconds", 0.0)) / requests
+        parts.append(
+            f"직접조회 {float(run_counters.get('relist_seconds', 0.0)):.1f}초"
+            f"/왕복{trip:.2f}초"
+        )
 
     fired = int(run_counters.get("next_page", 0))
     if fired:
@@ -1518,6 +1587,28 @@ async def ask_presence(m: Mercapi, item_id: str) -> bool | None:
     return answer
 
 
+async def timed_presence(m: Mercapi, item_id: str) -> bool | None:
+    """조회 한 건을 **왕복 시간을 재면서** 묻습니다.
+
+    이 숫자 하나가 없어서 실행당 상한(`MAX_RELIST_LOOKUPS_PER_RUN`)을 올릴지 말지가
+    막혀 있었습니다(README "상한을 올리지 않았습니다 — 잴 수가 없어서입니다").
+    건수 상한이 닿는 것은 봤는데, 같이 걸려 있는 **초 단위 상한에 몇 초가 남았는지**를
+    모르면 얼마나 올려도 되는지를 말할 수 없습니다.
+
+    `MAX_RELIST_LOOKUP_SECONDS_PER_RUN`과 **같은 시계**(`current_time`)로 잽니다.
+    다른 시계로 재면 '남은 초'가 그 상한의 남은 초가 아닙니다.
+
+    실패한 조회도 시간은 씁니다. 그래서 `ask_presence`가 예외를 삼키든 말든
+    `finally`에서 잽니다 — 안 그러면 느린 실패가 계산에서 빠져 여유가 부풀어 보입니다.
+    """
+    started = current_time()
+    try:
+        return await ask_presence(m, item_id)
+    finally:
+        add_seconds("relist_request_seconds", current_time() - started)
+        count_event("relist_requests", 1)
+
+
 def canary_ids(targets: set[str], live_ids: set[str]) -> dict:
     """물어볼 엔드포인트마다 **지금 살아 있는 것이 확실한 매물**을 하나씩 고릅니다.
 
@@ -1573,7 +1664,7 @@ async def lookup_survival(
     canaries = canary_ids(set(asked), live_ids or set())
     untrusted = set()
     for shop, canary in canaries.items():
-        if await ask_presence(m, canary) is not True:
+        if await timed_presence(m, canary) is not True:
             untrusted.add(shop)
             # 눈금이 어긋난 실행은 판정이 통째로 미뤄집니다. 상태 파일에는 그 사실이
             # '보류가 하나 생겼다'로만 남아 '못 물어봄'과 구분되지 않습니다. 표시를
@@ -1608,12 +1699,21 @@ async def lookup_survival(
             if shop not in canaries:
                 note_flag("relist_canary_blocked", ("숍스" if shop else "일반") + "없음")
             continue
-        survival[item_id] = await ask_presence(m, item_id)
+        survival[item_id] = await timed_presence(m, item_id)
+    # 이 단계가 실제로 몇 초를 썼는가. 초 단위 상한이 재는 것과 **같은 값**입니다
+    # (같은 시계, 같은 시작점). 20초에서 이 값을 빼면 그 판에 남아 있던 여유입니다.
+    add_seconds("relist_seconds", current_time() - started)
     if len(item_ids) > len(asked):
+        # "나머지는 다음 실행에서 다시 봅니다"라고 적혀 있던 자리입니다. **틀렸습니다** —
+        # 넘친 매물이 검색 창에서 밀려나면 다시 물을 일이 없어, 보류가 그대로 굳었다가
+        # 24시간 TTL로 결론 없이 사라집니다(2026-09-17 실측: 18건이 17.3시간 동안
+        # `checked_at` 정지). 로그 문구도 같이 고칩니다 — 같은 틀린 전제가 상수 주석에만
+        # 남아 있는 것이 아니라 여기에도 있었습니다.
         print(
             f"[재출품] 직접 확인할 매물 {len(item_ids)}건 중 {len(asked)}건만 물어봤습니다"
-            f" (실행당 상한 {limit}건 / {MAX_RELIST_LOOKUP_SECONDS_PER_RUN}초,"
-            " 나머지는 다음 실행에서 다시 봅니다)",
+            f" (실행당 상한 {limit}건 / {MAX_RELIST_LOOKUP_SECONDS_PER_RUN}초."
+            " 못 물어본 자리는 보류로 남지만, 그 매물이 검색 창에서 밀려나면 다시"
+            " 물을 일이 없어 TTL로 사라집니다)",
             file=sys.stderr,
         )
     return survival

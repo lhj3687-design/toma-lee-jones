@@ -3135,6 +3135,88 @@ class RunNoteTests(unittest.IsolatedAsyncioTestCase):
         mercari.count_event("relist_targets", 1)
         self.assertIn("눈금⛔숍스없음", mercari.run_note_text())
 
+    async def test_the_lookup_stage_carries_its_seconds_into_the_commit_message(self):
+        """상한(12건)을 올릴 수 있는지는 **20초에 몇 초가 남았는가**로 갈리는데, 그
+        숫자가 어디에도 안 남아 있었습니다(README "상한을 올리지 않았습니다").
+
+        시각에 기대지 않도록 시계를 손으로 돌립니다. 부르는 차례는 이렇습니다 —
+        시작 1번, 조회 한 건마다 앞뒤 2번, 두 번째 조회부터 상한 확인 1번, 끝에 1번.
+        """
+        api = FakeMercapi({}, live_ids={"m11111111111"})
+        ticks = [
+            0.0,              # started
+            0.0, 0.3,         # 눈금 조회 (0.3초)
+            1.3, 1.5,         # 첫 조회 (0.2초) — 앞의 1초는 조회 사이 간격
+            1.5,              # 상한 확인
+            2.5, 2.7,         # 둘째 조회 (0.2초)
+            3.0,              # 걸린 초 = 3.0
+        ]
+        with patch.object(mercari, "current_time", side_effect=ticks):
+            survival = await mercari.lookup_survival(
+                api, {"m22222222222", "m33333333333"}, {"m11111111111"})
+
+        self.assertEqual(len(survival), 2)
+        mercari.count_event("relist_targets", 2)
+        # 왕복은 (0.3 + 0.2 + 0.2) / 3건 = 0.2333… 초입니다. 눈금 조회도 같은 요청이라
+        # 같이 셉니다 — 그 건수가 꼬리표에 안 실리므로 나누기를 봇 쪽에서 해야 합니다.
+        self.assertIn("직접조회 3.0초/왕복0.23초", mercari.run_note_text())
+
+    async def test_a_failed_lookup_still_spends_its_seconds(self):
+        """느린 실패가 계산에서 빠지면 '여유가 많다'는 틀린 답이 납니다."""
+        api = FakeMercapi({}, live_ids={"m11111111111"}, fail_lookup_ids={"m22222222222"})
+        ticks = [0.0, 0.0, 0.1, 1.1, 5.1, 5.5]
+        with patch.object(mercari, "current_time", side_effect=ticks):
+            survival = await mercari.lookup_survival(api, {"m22222222222"}, {"m11111111111"})
+
+        self.assertEqual(survival, {"m22222222222": None})   # 답을 못 얻은 조회
+        mercari.count_event("relist_targets", 1)
+        # 실패한 조회가 4.0초를 썼습니다. (0.1 + 4.0) / 2건 = 2.05초.
+        self.assertIn("직접조회 5.5초/왕복2.05초", mercari.run_note_text())
+
+    async def test_the_seconds_on_the_note_are_what_the_time_cap_compares(self):
+        """꼬리표의 '걸린 초'가 **초 단위 상한이 재는 그 값**이어야 합니다.
+
+        다른 시계로 재면 '20초에 몇 초 남았나'라는 물음 자체가 성립하지 않습니다.
+        상한을 넘긴 시계를 물려 주고, 그 실행이 실제로 일찍 끊기는지와 꼬리표에
+        상한 이상이 찍히는지를 같이 봅니다.
+        """
+        api = FakeMercapi({}, live_ids={"m11111111111"})
+        cap = mercari.MAX_RELIST_LOOKUP_SECONDS_PER_RUN
+        ticks = [
+            0.0,              # started
+            0.0, 0.2,         # 눈금
+            0.2, 0.4,         # 첫 조회
+            cap + 1.0,        # 상한 확인 -> 여기서 끊깁니다
+            cap + 1.0,        # 걸린 초
+        ]
+        with patch.object(mercari, "current_time", side_effect=ticks):
+            survival = await mercari.lookup_survival(
+                api, {"m22222222222", "m33333333333"}, {"m11111111111"})
+
+        self.assertEqual(len(survival), 1)   # 둘째 조회는 시간 상한에 끊겼습니다
+        mercari.count_event("relist_targets", 2)
+        self.assertIn(f"직접조회 {cap + 1.0:.1f}초", mercari.run_note_text())
+
+    async def test_a_run_that_asked_nothing_carries_no_seconds(self):
+        """0.0초를 적으면 '쟀는데 0'과 '안 쟀다'가 같은 모양이 됩니다."""
+        mercari.count_event("relist_targets", 3)
+        mercari.count_event("relist_asked", 0)
+        note = mercari.run_note_text()
+        self.assertIn("재출품 0/3", note)
+        self.assertNotIn("직접조회", note)
+
+    async def test_seconds_never_go_backwards(self):
+        """시계가 뒤로 가도 합이 조용히 작아지면 안 됩니다(여유가 부풀어 보입니다)."""
+        mercari.add_seconds("relist_seconds", 4.0)
+        mercari.add_seconds("relist_seconds", -3.0)
+        self.assertEqual(mercari.run_counters["relist_seconds"], 4.0)
+
+    def test_seconds_are_not_truncated_to_whole_numbers(self):
+        """실수 칸을 정수 칸과 섞으면 `int()`가 0.6초짜리 조회를 0초로 만듭니다."""
+        mercari.add_seconds("relist_request_seconds", 0.6)
+        mercari.add_seconds("relist_request_seconds", 0.6)
+        self.assertAlmostEqual(mercari.run_counters["relist_request_seconds"], 1.2)
+
     async def test_the_note_file_is_removed_when_there_is_nothing_to_say(self):
         """지난 실행의 꼬리표가 남아 있으면 이번 실행의 커밋에 남의 숫자가 붙습니다."""
         with tempfile.TemporaryDirectory() as directory:
