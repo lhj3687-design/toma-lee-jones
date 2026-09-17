@@ -37,7 +37,20 @@ class PushStateTestCase(unittest.TestCase):
     """저장소 두 개(원격/작업본)를 세우는 공통 준비."""
 
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
+        # ignore_cleanup_errors 는 없어도 되는 사치가 아닙니다.
+        #
+        # 여기서 만드는 임시 디렉터리 안에는 git 저장소가 둘(원격/작업본) 들어가고
+        # 그 사이로 push·fetch·merge 가 오갑니다. 시험 본문이 다 끝난 뒤 rmtree 가
+        # 훑는 동안에도 git 쪽이 디렉터리를 건드리는 일이 있어서, 정리 단계가
+        # OSError: [Errno 39] Directory not empty 로 터집니다('.git' 과 'objects'
+        # 둘 다 실측). 시험이 확인하려던 것은 이미 전부 통과한 뒤입니다.
+        #
+        # 그런데 봇 워크플로가 **매 실행 전에 이 묶음을 돌리고 실패하면 그 실행의
+        # 조회·전송을 통째로 건너뜁니다.** 그래서 이 정리 실패가 곧 봇의 결행이었고,
+        # 2026-09-14~09-17 사흘 반 동안 실패한 실행 17건 중 15건이 여기였습니다
+        # (하루 약 4건 + 그때마다 텔레그램 '실행 실패' 알림 1건).
+        # 정리 실패는 시험의 결과가 아니므로 실행을 죽이지 않게 합니다.
+        self.directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.directory.cleanup)
         base = Path(self.directory.name)
 
@@ -256,3 +269,47 @@ class RunNoteTests(PushStateTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TeardownNeverStopsTheBotTests(unittest.TestCase):
+    """정리 단계의 실패가 봇의 결행이 되지 않는지 봅니다.
+
+    운영에서 실제로 난 고장입니다. 봇은 매 실행 전에 이 묶음을 돌리고, 실패하면
+    그 실행의 조회·전송을 건너뜁니다. 그래서 '임시 디렉터리를 못 지웠다'가
+    그대로 '이번 1분은 새 매물을 안 본다'가 됩니다.
+
+    고장을 되살려 넣어 확인합니다 - 플래그를 빼면 이 시험이 깨져야 합니다.
+    """
+
+    def _cleanup_under_a_racing_rmdir(self, **kwargs):
+        directory = tempfile.TemporaryDirectory(**kwargs)
+        os.makedirs(Path(directory.name) / "work" / "objects")
+        real_rmdir = os.rmdir
+
+        def racing_rmdir(path, *args, **rest):
+            # git 이 정리 도중에 다시 채워 넣는 상황과 같은 오류입니다.
+            if str(path).endswith("objects"):
+                raise OSError(39, "Directory not empty")
+            return real_rmdir(path, *args, **rest)
+
+        os.rmdir = racing_rmdir
+        try:
+            directory.cleanup()
+            return None
+        except OSError as exc:
+            return exc
+        finally:
+            os.rmdir = real_rmdir
+            shutil.rmtree(directory.name, ignore_errors=True)
+
+    def test_a_racing_rmdir_fails_the_run_without_the_flag(self):
+        """눈금: 플래그가 없으면 실제로 터집니다(이게 운영에서 난 일입니다)."""
+        self.assertIsInstance(self._cleanup_under_a_racing_rmdir(), OSError)
+
+    def test_a_racing_rmdir_does_not_fail_the_run_with_the_flag(self):
+        self.assertIsNone(self._cleanup_under_a_racing_rmdir(ignore_cleanup_errors=True))
+
+    def test_the_fixture_actually_uses_the_flag(self):
+        """위 둘이 다 통과해도 정작 고정물이 안 쓰면 소용없습니다."""
+        source = Path(__file__).read_text(encoding="utf-8")
+        self.assertIn("tempfile.TemporaryDirectory(ignore_cleanup_errors=True)", source)

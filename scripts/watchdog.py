@@ -36,9 +36,23 @@ GitHub API에서 두 상태는 다릅니다.
 같은 관측에서 total_count가 0보다 큰데 배열은 비어 오는 일을 5회 봤습니다.
 **개수를 믿으면 안 되고 배열만 봐야 합니다.**
 
-즉 `?status=queued` 필터만으로 둘이 갈립니다. 다만 정상 실행도 `queued`를 잠깐
-지나가므로(실측 8초 미만) 시간 임계값이 함께 필요합니다. 또 실행이 `queued`와
-`pending`을 오가는 것도 관측됐기 때문에, 취소 직전에 상태를 한 번 더 확인합니다.
+그런데 그 112회 관측이 **전부를 본 것이 아니었습니다(2026-09-17 반증).**
+실행 #7646(id 34749376084)은 2026-09-13 09:22:08에 만들어진 뒤 `?status=queued` 목록에
+**4일 넘게** 들어 있고, 끊기 직전 단건 재조회도 `queued`라고 답합니다. 그런데
+`actions/runs/.../jobs`는 **`total_count: 0`** - 잡 레코드가 아예 없습니다. 위 표대로라면
+그것이 곧 `pending`입니다. GitHub 자신도 취소를 거부합니다.
+
+    gh: Cannot cancel a workflow run that has not been queued yet. (HTTP 409)
+
+즉 **상태 필터만으로는 둘이 갈리지 않습니다.** 갈라 주는 것은 잡 레코드의 유무입니다.
+has_runner()는 '러너가 붙었나'만 보기 때문에 빈 목록을 그대로 통과시켰고(any([]) is False),
+워치독은 2026-09-13 09:37부터 09-17까지 약 500번 이 실행을 끊으려 했습니다. 멀쩡한 대기
+실행을 죽이지 않은 것은 우리 판정이 아니라 **GitHub의 409 덕분**이었습니다. 그래서 이제
+**잡 레코드가 없으면 건드리지 않습니다.**
+
+그래서 관문이 셋입니다. `?status=queued` 로 거르고, 정상 실행도 `queued`를 잠깐
+지나가므로(실측 8초 미만) 시간 임계값을 함께 걸고, 실행이 `queued`와 `pending`을
+오가는 것도 관측됐기 때문에 취소 직전에 상태와 **잡 레코드**를 다시 읽습니다.
 
 무엇을 하는가
 -------------
@@ -160,9 +174,14 @@ def make_api(repo):
 def unstick(api, workflow, now, stuck_after, dry_run):
     """멈춘 실행을 찾아 취소합니다.
 
-    취소한 개수를 돌려주되, **조회 자체에 실패하면 None**을 돌려줍니다. 둘 다 0으로
-    돌려주면 확인하지 못한 것을 "이상 없음"으로 보고하게 됩니다 - 이 저장소에서
-    반복해서 나온 부류의 실수입니다(push_state.sh, notify_failure.sh).
+    (취소한 수, 취소에 실패한 수, pending이라 건드리지 않은 수)를 돌려주되,
+    **조회 자체에 실패하면 None**을 돌려줍니다. 하나의 0으로 뭉치면 확인하지 못한 것을
+    "이상 없음"으로 보고하게 됩니다 - 이 저장소에서 반복해서 나온 부류의 실수입니다
+    (push_state.sh, notify_failure.sh).
+
+    실패를 따로 세는 이유도 같습니다. 예전에는 취소가 실패해도 cancelled가 0이라
+    호출한 쪽이 "[정상] 러너를 기다리다 멈춘 실행이 없습니다"를 찍었습니다 - 끊어야
+    한다고 본 실행이 있었는데 못 끊은 것을 '없다'고 말한 셈입니다(실측 약 500회).
     """
     listing = gh_json(api, f"actions/workflows/{workflow}/runs?status=queued&per_page=50")
     if listing is None:
@@ -171,6 +190,8 @@ def unstick(api, workflow, now, stuck_after, dry_run):
         return None
 
     cancelled = 0
+    failed = 0
+    pending_skipped = 0
     for run, waited in stuck_runs(listing.get("workflow_runs") or [], now, stuck_after):
         run_id = run.get("id")
         minutes = int(waited // 60)
@@ -186,7 +207,16 @@ def unstick(api, workflow, now, stuck_after, dry_run):
         if jobs is None:
             print(f"[건너뜀] #{run.get('run_number')}: 잡 목록을 읽지 못했습니다")
             continue
-        if has_runner(jobs.get("jobs") or []):
+        # 잡 레코드가 없으면 concurrency 관문을 아직 통과하지 못한 것입니다(= pending).
+        # 목록이 `queued`라고 답해도 이쪽을 믿습니다 - 실측에서 GitHub 자신이 그렇게
+        # 답했습니다(#7646, HTTP 409). 여기를 빠뜨리면 정상 역압을 끊게 됩니다.
+        listed_jobs = jobs.get("jobs") or []
+        if not listed_jobs:
+            print(f"[건너뜀] #{run.get('run_number')}: 잡 레코드가 없습니다 "
+                  f"— concurrency 대기(pending)입니다 ({minutes}분째)")
+            pending_skipped += 1
+            continue
+        if has_runner(listed_jobs):
             print(f"[건너뜀] #{run.get('run_number')}: 러너가 이미 붙어 있습니다")
             continue
 
@@ -197,11 +227,39 @@ def unstick(api, workflow, now, stuck_after, dry_run):
 
         if api(f"actions/runs/{run_id}/cancel", "POST") is None:
             print(f"[실패] #{run.get('run_number')} 취소에 실패했습니다", file=sys.stderr)
+            failed += 1
             continue
         print(f"[취소] #{run.get('run_number')}: {minutes}분째 러너를 못 받아 끊었습니다")
         cancelled += 1
 
-    return cancelled
+    return cancelled, failed, pending_skipped
+
+
+def state_commit_age(now, cwd=None):
+    """체크아웃된 저장소의 마지막 커밋이 몇 초 전인지. 읽지 못하면 None.
+
+    왜 둘째 증인이 필요한가
+    -----------------------
+    2026-09-16 13:30:04에 이 워크플로가 이슈 #40을 열었습니다 - "마지막 성공이 4378분
+    전"(=73시간). 그런데 그 순간 봇은 **24초 전에** 성공으로 끝났고, 앞선 40분 동안
+    성공한 실행이 33건이었습니다. 26분 뒤 같은 질의는 "0분 전"으로 돌아왔습니다.
+    `?status=success&per_page=1` 한 번의 답을 그대로 믿은 것이 헛알림의 전부였습니다.
+
+    봇은 성공할 때마다 상태 파일을 main에 커밋하므로, 체크아웃된 저장소의 마지막 커밋
+    시각이 Actions API와 **무관한** 두 번째 증거가 됩니다. 둘이 어긋나면 이슈를 열지
+    않습니다 - 진짜로 멈췄다면 커밋도 같이 멈춰 있으므로 감지가 늦어지지 않습니다.
+    """
+    result = subprocess.run(
+        ["git", "log", "-1", "--format=%ct"], capture_output=True, text=True, cwd=cwd
+    )
+    if result.returncode != 0:
+        print(f"[경고] 상태 커밋 시각을 읽지 못했습니다: {result.stderr.strip()}", file=sys.stderr)
+        return None
+    try:
+        return now - float(result.stdout.strip())
+    except ValueError:
+        print("[경고] 상태 커밋 시각을 숫자로 읽지 못했습니다", file=sys.stderr)
+        return None
 
 
 def open_stale_issue(api, repo, workflow, stale, dry_run):
@@ -264,11 +322,18 @@ def main(argv=None):
     api = make_api(args.repo)
     now = datetime.now(timezone.utc).timestamp()
 
-    cancelled = unstick(api, args.workflow, now, args.stuck_after, args.dry_run)
-    if cancelled is None:
+    outcome = unstick(api, args.workflow, now, args.stuck_after, args.dry_run)
+    if outcome is None:
         print("[보류] 대기 중인 실행 목록을 조회하지 못했습니다")
-    elif cancelled == 0:
-        print("[정상] 러너를 기다리다 멈춘 실행이 없습니다")
+    else:
+        cancelled, failed, pending_skipped = outcome
+        if failed:
+            # 못 끊은 것을 '없다'로 말하지 않습니다.
+            print(f"[주의] 끊어야 한다고 본 실행 {failed}개를 취소하지 못했습니다 "
+                  f"— '이상 없음'이 아닙니다")
+        elif cancelled == 0:
+            note = f" (pending이라 건드리지 않은 것 {pending_skipped}개)" if pending_skipped else ""
+            print(f"[정상] 러너를 기다리다 멈춘 실행이 없습니다{note}")
 
     successes = gh_json(api, f"actions/workflows/{args.workflow}/runs?status=success&per_page=1")
     if successes is None:
@@ -283,7 +348,15 @@ def main(argv=None):
         return 0
 
     if stale >= args.stale_after:
-        print(f"[정지 의심] 마지막 성공이 {int(stale // 60)}분 전입니다")
+        age = state_commit_age(now)
+        if age is not None and age < args.stale_after:
+            # 한쪽만 믿지 않습니다. 이 어긋남 자체가 API가 흔들린다는 신호입니다.
+            print(f"[보류] Actions API는 마지막 성공이 {int(stale // 60)}분 전이라는데 "
+                  f"상태 커밋은 {int(age // 60)}분 전입니다 — 봇은 돌고 있으므로 이슈를 열지 않습니다")
+            return 0
+        witness = (f"상태 커밋도 {int(age // 60)}분 전" if age is not None
+                   else "상태 커밋 시각은 읽지 못함")
+        print(f"[정지 의심] 마지막 성공이 {int(stale // 60)}분 전입니다 ({witness})")
         open_stale_issue(api, args.repo, args.workflow, stale, args.dry_run)
     else:
         print(f"[정상] 마지막 성공이 {int(stale // 60)}분 전입니다")
