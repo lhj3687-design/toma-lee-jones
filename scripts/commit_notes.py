@@ -13,17 +13,32 @@ Actions 로그 묶음 내려받기가 막혀 있어 로그를 한 건씩 API로�
 실행, ② 이 기능이 배포되기 전의 커밋. 그래서 이 도구는 **꼬리표가 붙은 첫 커밋 시각을
 같이 찍습니다.** 그보다 앞 구간의 '0건'은 측정이 아니라 침묵입니다.
 
+**'못 물어봄'과 '아예 못 물어봄'을 섞지 마세요.** 앞쪽은 물어봤는데 답이 안 온 것이라
+차단의 신호이고, 뒤쪽은 실행당 상한에 걸려 **묻지도 못한** 것입니다. 뒤쪽은 다시
+'건수 상한'과 '시간 상한'으로 갈리는데(한 판의 '물어본 것'이 상한과 같으면 건수, 작으면
+시간) 처방이 서로 다릅니다. 이 도구가 셋을 갈라 찍습니다.
+
     python scripts/commit_notes.py --calibrate          # 눈금 먼저
     python scripts/commit_notes.py origin/main --since='2026-09-16 00:00'
+    python scripts/commit_notes.py origin/main --since='2026-09-16 00:00' --by-hour
+
+**눈금을 믿기 전에 고장을 내 보세요.** 2026-09-17에 고장 15개를 넣으니 `--calibrate`가
+8개를 그대로 통과시켰습니다 — 자릿수 고침이 재출품 칸에만 들어 있었고, 눈금이 부르지
+않는 `walk()`·`report()`는 아예 안 지켜지고 있었습니다.
+`tests/test_commit_notes.py`의 `CalibrationCatchesFaultsTests`가 그 고장들을 CI에서
+계속 넣어 봅니다.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import re
 import subprocess
 import sys
+import tempfile
 import types
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -102,6 +117,16 @@ class Tally:
         self.near_miss: list[int] = []
         self.search_failures = 0
         self.search_failure_runs = 0
+        # 생산자 불변식이 깨진 꼬리표 수. `asked`는 `len(survival)`이고 있음·없음·
+        # 못물어봄은 그 survival을 셋으로 가른 것이라(check_mercari.py 2362~2366줄)
+        # 합이 반드시 asked 입니다. 깨지면 **운영 데이터가 이상한 것이 아니라 이 파서가
+        # 칸을 잘못 읽고 있는 것**입니다. 눈금은 만들어 둔 제목만 보지만 이 점검은
+        # 매번 진짜 꼬리표 전부를 봅니다.
+        self.inconsistent = 0
+        self.by_hour: dict[int, Counter] = defaultdict(Counter)
+        # 아예 못 물어본 판의 (물어볼 자리, 물어본 것). 합계로 뭉치면 '건수 상한'과
+        # '시간 상한'이 구분되지 않습니다 — **처방이 다릅니다**(아래 report 참고).
+        self.capped: list[tuple[int, int]] = []
 
     def add(self, timestamp: int, note: dict | None) -> None:
         self.commits += 1
@@ -110,14 +135,25 @@ class Tally:
         self.with_note += 1
         self.first_note_at = min(self.first_note_at or timestamp, timestamp)
         self.last_note_at = max(self.last_note_at or timestamp, timestamp)
+        hour = datetime.fromtimestamp(timestamp, timezone.utc).hour
         relist = note.get("relist")
         if relist:
             self.relist_runs += 1
+            if relist["alive"] + relist["gone"] + relist["unknown"] != relist["asked"]:
+                self.inconsistent += 1
             for key in ("targets", "asked", "alive", "gone", "unknown"):
                 if relist[key]:
                     self.relist[key] += relist[key]
             for mark in relist["blocked"]:
                 self.blocked[mark] += 1
+            bucket = self.by_hour[hour]
+            bucket["runs"] += 1
+            for key in ("targets", "asked", "unknown"):
+                if relist[key]:
+                    bucket[key] += relist[key]
+            if relist["targets"] > relist["asked"]:
+                bucket["skipped"] += relist["targets"] - relist["asked"]
+                self.capped.append((relist["targets"], relist["asked"]))
         fired = note.get("next_page")
         if fired:
             self.next_page_runs += 1
@@ -128,6 +164,7 @@ class Tally:
         if note.get("search_failures"):
             self.search_failure_runs += 1
             self.search_failures += note["search_failures"]
+            self.by_hour[hour]["search_failures"] += note["search_failures"]
 
 
 def stamp(value: int | None) -> str:
@@ -136,7 +173,7 @@ def stamp(value: int | None) -> str:
     return datetime.fromtimestamp(value, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def report(tally: Tally) -> None:
+def report(tally: Tally, by_hour: bool = False) -> None:
     print(f"상태 커밋 {tally.commits:,}개 / 꼬리표가 붙은 커밋 {tally.with_note:,}개")
     print(f"꼬리표 첫 커밋 {stamp(tally.first_note_at)} · 마지막 {stamp(tally.last_note_at)}")
     if not tally.with_note:
@@ -160,6 +197,27 @@ def report(tally: Tally) -> None:
         if targets > asked:
             print(f"  아예 못 물어본 것 {targets - asked:,}건 "
                   "(실행당 상한이거나 눈금 불신 — 아래 줄을 보세요)")
+            # 원인이 셋인데 겉모양이 같습니다. 눈금 불신은 아래 줄이 갈라 주고,
+            # 나머지 둘(건수 상한 / 시간 상한)은 **한 판의 '물어본 것'이 상한과 같은지**로
+            # 갈립니다 — 시간 상한은 상한에 닿기 전에 끊으므로 그보다 작게 나옵니다.
+            # 처방이 다릅니다: 건수 상한은 MAX_RELIST_LOOKUPS_PER_RUN, 시간 상한은
+            # MAX_RELIST_LOOKUP_SECONDS_PER_RUN 을 봐야 합니다.
+            cap = _lookup_cap()
+            worst = max((t for t, _a in tally.capped), default=0)
+            if not cap:
+                print(f"     그런 실행 {len(tally.capped):,}회 · 한 판 최다 물어볼 자리 {worst}건")
+                print("     ⛔ 봇의 실행당 상한 값을 못 읽어 '건수 상한'과 '시간 상한'을"
+                      " 가르지 못합니다 — 처방이 다르므로 이 둘을 뭉친 채로 읽지 마세요.")
+            else:
+                by_count = sum(1 for _targets, asked in tally.capped if asked >= cap)
+                by_time = len(tally.capped) - by_count
+                print(f"     그런 실행 {len(tally.capped):,}회 — 건수 상한({cap}건) {by_count:,}회"
+                      f" / 시간 상한 {by_time:,}회 · 한 판 최다 물어볼 자리 {worst}건")
+                print("     '건수 상한'이면 상한을 올리는 것이 처방이고, '시간 상한'이면"
+                      " 올려도 듣지 않습니다(그 실행은 이미 초를 다 쓴 것입니다).")
+            print("     ⚠ 넘친 자리는 보류로 남는데, **다음 실행이 다시 본다는 보장은"
+                  " 없습니다** — 그 매물이 검색 창에서 밀려나면 보류가 그대로 굳었다가"
+                  " TTL로 사라집니다(2026-09-17 실측: 18건이 17.3시간 동안 안 움직임).")
         if tally.blocked:
             marks = ", ".join(f"{k} {v:,}회" for k, v in sorted(tally.blocked.items()))
             print(f"  ⛔ 눈금을 못 믿어 판정을 통째로 미룬 실행: {marks}")
@@ -170,6 +228,14 @@ def report(tally: Tally) -> None:
                   " 표본 부족입니다. 처방이 다릅니다.")
         else:
             print("  ⛔ 눈금 불신 0회 (지금 살아 있는 매물이 '있음'으로 답한 실행만 셌습니다)")
+        # 진짜 꼬리표 전부에 대는 점검입니다. 눈금(--calibrate)은 만들어 둔 제목만 보므로
+        # 운영에서 형식이 갈리는 것은 여기서만 잡힙니다.
+        if tally.inconsistent:
+            print(f"  ⛔ 있음+없음+못물어봄 ≠ 물어본 수인 꼬리표 {tally.inconsistent:,}개 "
+                  "— 운영 데이터가 아니라 **이 파서가 칸을 잘못 읽고 있다**는 뜻입니다. "
+                  "위 숫자를 읽지 마세요.")
+        else:
+            print(f"  ✅ 있음+없음+못물어봄 = 물어본 수 — 꼬리표 {tally.relist_runs:,}개 전부 성립")
 
     print("\n[다음 페이지 조건 #33]")
     if tally.next_page_runs:
@@ -189,15 +255,43 @@ def report(tally: Tally) -> None:
     print("\n[조회 실패] (추천순만 실패한 실행은 상태 파일에 흔적이 없습니다)")
     print(f"  실패한 페이지 요청 {tally.search_failures:,}건 / 그런 실행 {tally.search_failure_runs:,}회")
 
+    if by_hour:
+        print("\n[시각대별] '못 물어봄'이 특정 대에 몰리면 그건 차단의 모양입니다.")
+        print("  UTC  실행  물어볼자리  물어본것  아예못물어봄  못물어봄  조회실패")
+        for hour in sorted(tally.by_hour):
+            c = tally.by_hour[hour]
+            print(f"  {hour:02d}시 {c['runs']:5,}회 {c['targets']:9,} {c['asked']:9,}"
+                  f" {c['skipped']:11,} {c['unknown']:9,} {c['search_failures']:9,}")
+        print("  ⚠ 꼬리표가 붙는 실행 비율은 시각대마다 다릅니다(실을 것이 0이면 안 붙습니다).")
+        print("    한 줄의 '0'은 '그 대에 아무 일도 없었다'가 아니라 '실을 것이 없었다'일 수"
+              " 있으니, 같은 줄의 '물어본 것'이 0인지부터 보세요.")
 
-# 근접 문턱은 봇 쪽 상수를 그대로 씁니다(두 값이 갈리면 표를 잘못 읽게 됩니다).
-def _near_miss_threshold() -> int:
+
+# 문턱과 상한은 봇 쪽 상수를 그대로 씁니다(두 값이 갈리면 표를 잘못 읽게 됩니다).
+def _bot():
     sys.path.insert(0, str(ROOT))
     sys.modules.setdefault("mercapi", types.ModuleType("mercapi"))
     sys.modules["mercapi"].Mercapi = object  # type: ignore[attr-defined]
     import check_mercari  # noqa: PLC0415
 
-    return int(check_mercari.NEXT_PAGE_NEAR_MISS_FRESH)
+    return check_mercari
+
+
+def _near_miss_threshold() -> int:
+    return int(_bot().NEXT_PAGE_NEAR_MISS_FRESH)
+
+
+def _lookup_cap() -> int:
+    """봇의 실행당 상한. **못 읽으면 0을 돌려줍니다.**
+
+    세는 자는 `git log`만 있으면 돌지만 이 값은 봇 모듈을 읽어야 나옵니다(의존성이
+    없는 환경도 있습니다). 못 읽었는데 아무 숫자나 돌려주면 '건수 상한'과 '시간 상한'을
+    **틀리게** 갈라 찍습니다. 가를 수 없으면 숫자를 내지 말고 못 가른다고 말합니다.
+    """
+    try:
+        return int(_bot().MAX_RELIST_LOOKUPS_PER_RUN)
+    except Exception:  # noqa: BLE001 - 의존성이 없는 환경이면 그냥 못 읽는 것입니다.
+        return 0
 
 
 NEAR_MISS_FRESH = 80
@@ -254,14 +348,22 @@ def calibrate() -> int:
     if got.get("blocked") != ["일반", "숍스없음"]:
         failures.append(f"눈금 표시를 못 읽었습니다: {subject!r} -> {got!r}")
 
-    check_mercari.reset_run_counters()
-    check_mercari.count_event("next_page", 2)
-    check_mercari.note_max("next_page_fresh", 112)
-    check_mercari.count_event("search_failures", 3)
-    subject = "queue Mercari alerts" + check_mercari.run_note_text()
-    parsed = parse_note(subject) or {}
-    if parsed.get("next_page") != {"fired": 2, "fresh": 112} or parsed.get("search_failures") != 3:
-        failures.append(f"다음페이지/조회실패 왕복 불일치: {subject!r} -> {parsed!r}")
+    # 자릿수는 **칸마다** 섞어야 합니다. 재출품 칸에만 두 자리를 넣어 뒀더니
+    # `조회실패 (?P<failures>\d+)`와 `다음페이지 (?P<fired>\d+)회`를 `\d`로 줄여 놓아도
+    # 눈금이 그대로 통과했습니다(2026-09-17 확인). 한 칸을 고쳤다고 다른 칸이 덮이지
+    # 않습니다.
+    for counters, expected_page, expected_fail in (
+        ({"next_page": 2, "search_failures": 3}, {"fired": 2, "fresh": 112}, 3),
+        ({"next_page": 23, "search_failures": 45}, {"fired": 23, "fresh": 112}, 45),
+    ):
+        check_mercari.reset_run_counters()
+        for key, value in counters.items():
+            check_mercari.count_event(key, value)
+        check_mercari.note_max("next_page_fresh", 112)
+        subject = "queue Mercari alerts" + check_mercari.run_note_text()
+        parsed = parse_note(subject) or {}
+        if parsed.get("next_page") != expected_page or parsed.get("search_failures") != expected_fail:
+            failures.append(f"다음페이지/조회실패 왕복 불일치: {subject!r} -> {parsed!r}")
 
     check_mercari.reset_run_counters()
     check_mercari.note_max("page_fresh_max", check_mercari.NEXT_PAGE_NEAR_MISS_FRESH)
@@ -278,6 +380,8 @@ def calibrate() -> int:
         failures.append(
             f"근접 문턱이 갈렸습니다: 봇 {_near_miss_threshold()} vs 도구 {NEAR_MISS_FRESH}"
         )
+    if _lookup_cap() <= 0:
+        failures.append(f"실행당 상한을 못 읽었습니다: {_lookup_cap()!r}")
 
     # ② 거짓 양성
     for subject in (
@@ -298,29 +402,47 @@ def calibrate() -> int:
         failures.append("아무 일도 없었던 구간이 빈 결과가 아닙니다")
 
     # ③ 아는 답
+    #
+    # 눈금 값에 **자릿수·경계·0을 섞습니다.** 그리고 같은 칸에 **여러 판이 더해지도록**
+    # 짭니다 — 한 판만 두면 `+=`를 `=`로 바꿔 놓아도(누적을 잃어도) 합이 같아서
+    # 눈금이 통과합니다(2026-09-17에 조회실패·다음페이지 두 칸이 실제로 그랬습니다).
     fixture = [
-        "queue Mercari alerts (재출품 5: 있음2/없음3/못물어봄0)",
-        "queue Mercari alerts (재출품 3/9: 있음1/없음1/못물어봄1 눈금⛔일반)",
-        "queue Mercari alerts (재출품 34: 있음10/없음11/못물어봄13, 조회실패 2)",
-        "queue Mercari alerts (다음페이지 1회 신규112)",
-        "queue Mercari alerts (다음페이지 근접 신규93)",
-        "queue Mercari alerts",
-        "record Mercari alert delivery",
+        (1_700_000_000, "queue Mercari alerts (재출품 5: 있음2/없음3/못물어봄0)"),
+        (1_700_000_060, "queue Mercari alerts (재출품 3/9: 있음1/없음1/못물어봄1 눈금⛔일반)"),
+        (1_700_000_120, "queue Mercari alerts (재출품 34: 있음10/없음11/못물어봄13, 조회실패 2)"),
+        (1_700_000_180, "queue Mercari alerts (다음페이지 1회 신규112)"),
+        (1_700_000_240, "queue Mercari alerts (다음페이지 근접 신규93)"),
+        (1_700_000_300, "queue Mercari alerts (재출품 12/40: 있음7/없음5/못물어봄0,"
+                        " 다음페이지 23회 신규118, 조회실패 45)"),
+        (1_700_000_360, "queue Mercari alerts"),
+        (1_700_000_420, "record Mercari alert delivery"),
+        # 한 시각대 뒤. 시각대별로 가르는 자리와 '마지막 꼬리표 시각'을 함께 겁니다.
+        (1_700_003_600, "queue Mercari alerts (재출품 2: 있음2/없음0/못물어봄0)"),
     ]
     tally = Tally()
-    for subject in fixture:
-        tally.add(1_700_000_000, parse_note(subject))
+    for timestamp, subject in fixture:
+        tally.add(timestamp, parse_note(subject))
     known = {
-        "with_note": 5,
-        "targets": 48,
-        "asked": 42,
-        "alive": 13,
-        "gone": 15,
+        "with_note": 7,
+        "targets": 90,
+        "asked": 56,
+        "alive": 22,
+        "gone": 20,
         "unknown": 14,
         "blocked": 1,
-        "fired": 1,
+        "fired": 24,
+        "fresh_max": 118,
         "near_miss": 1,
-        "search_failures": 2,
+        "search_failures": 47,
+        "search_failure_runs": 2,
+        # 이 둘이 '0건'과 '아직 측정이 없음'을 가르는 값입니다. 눈금에 안 걸어 두면
+        # min을 max로 바꿔 놓아도 통과합니다(2026-09-17 확인).
+        "first_note_at": 1_700_000_000,
+        "last_note_at": 1_700_003_600,
+        "inconsistent": 0,
+        "hours": [22, 23],
+        "hour22_targets": 88,
+        "hour23_targets": 2,
     }
     got = {
         "with_note": tally.with_note,
@@ -331,18 +453,120 @@ def calibrate() -> int:
         "unknown": tally.relist["unknown"],
         "blocked": sum(tally.blocked.values()),
         "fired": tally.next_page["fired"],
+        "fresh_max": tally.next_page["fresh_max"],
         "near_miss": len(tally.near_miss),
         "search_failures": tally.search_failures,
+        "search_failure_runs": tally.search_failure_runs,
+        "first_note_at": tally.first_note_at,
+        "last_note_at": tally.last_note_at,
+        "inconsistent": tally.inconsistent,
+        "hours": sorted(tally.by_hour),
+        "hour22_targets": tally.by_hour[22]["targets"],
+        "hour23_targets": tally.by_hour[23]["targets"],
     }
     if got != known:
-        failures.append(f"아는 답 불일치: {got} != {known}")
+        diff = {k: (got[k], known[k]) for k in known if got.get(k) != known[k]}
+        failures.append(f"아는 답 불일치(값: 받은 것/기대): {diff}")
+
+    # ④ 보고가 내는 문장까지 봅니다.
+    #
+    # 여기까지 안 오면 `unknown / asked`를 `unknown / targets`로 바꿔 놓아도 눈금이
+    # 통과합니다 — 이 요청의 결론 숫자가 바로 그 비율입니다.
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        report(tally, by_hour=True)
+    text = printed.getvalue()
+    for needle in (
+        "못 물어봄 비율 25.00%",   # 14/56. targets(90)로 나누면 15.56%가 됩니다.
+        "아예 못 물어본 것 34건",  # 90 - 56
+        "있음+없음+못물어봄 = 물어본 수",
+        "[시각대별]",
+        "22시",
+        "23시",
+    ):
+        if needle not in text:
+            failures.append(f"보고에 '{needle}'가 없습니다")
+
+    empty_out = io.StringIO()
+    with contextlib.redirect_stdout(empty_out):
+        report(Tally())
+    if "측정이 없는 것" not in empty_out.getvalue():
+        failures.append("꼬리표가 하나도 없는 구간을 '0건'으로 찍고 있습니다")
+
+    # ⑤ 불변식 점검이 **깨진 것을 깨졌다고 하는가.**
+    broken = Tally()
+    broken.add(1_700_000_000,
+               parse_note("queue Mercari alerts (재출품 12/40: 있음7/없음5/못물어봄1)"))
+    if broken.inconsistent != 1:
+        failures.append("있음+없음+못물어봄 ≠ 물어본 수인 꼬리표를 그냥 지나갑니다")
+
+    # 상한의 두 원인이 갈리는가. 뭉치면 '상한을 올리면 된다'와 '올려도 안 된다'가
+    # 같은 숫자로 보입니다.
+    cap = _lookup_cap()
+    split = Tally()
+    split.add(1_700_000_000, parse_note(
+        f"queue Mercari alerts (재출품 {cap}/40: 있음{cap}/없음0/못물어봄0)"))       # 건수
+    split.add(1_700_000_060, parse_note(
+        f"queue Mercari alerts (재출품 {cap - 3}/40: 있음{cap - 3}/없음0/못물어봄0)"))  # 시간
+    if split.capped != [(40, cap), (40, cap - 3)]:
+        failures.append(f"상한에 걸린 판을 못 모았습니다: {split.capped!r}")
+    capped_out = io.StringIO()
+    with contextlib.redirect_stdout(capped_out):
+        report(split)
+    if f"건수 상한({cap}건) 1회 / 시간 상한 1회" not in capped_out.getvalue():
+        failures.append("건수 상한과 시간 상한을 갈라 찍지 않습니다")
+
+    # 상한 값을 못 읽는 환경이면 **틀린 갈래를 찍지 말고 못 가른다고** 해야 합니다.
+    blind = io.StringIO()
+    saved = globals()["_lookup_cap"]
+    globals()["_lookup_cap"] = lambda: 0
+    try:
+        with contextlib.redirect_stdout(blind):
+            report(split)
+    finally:
+        globals()["_lookup_cap"] = saved
+    if "가르지 못합니다" not in blind.getvalue() or "건수 상한(" in blind.getvalue():
+        failures.append("상한 값을 못 읽었는데도 건수/시간을 갈라 찍었습니다")
+
+    # ⑥ `walk()`가 **--first-parent로 걷는가.**
+    #
+    # 빼면 PR 브랜치의 커밋이 섞여 들어옵니다. 그 커밋들의 꼬리표는 브랜치를 딴 시점의
+    # 것이라 같은 숫자를 두 번 세거나 없던 숫자를 만들어 냅니다(README "운영 이력을
+    # 훑을 때"). 인자 목록을 눈으로 확인하는 대신 **진짜 저장소를 하나 만들어** 겁니다.
+    with tempfile.TemporaryDirectory() as tmp:
+        sandbox = Path(tmp)
+        git = ["git", "-C", str(sandbox), "-c", "user.email=c@x", "-c", "user.name=c"]
+        try:
+            subprocess.run(["git", "init", "-q", str(sandbox)], check=True, capture_output=True)
+            subprocess.run([*git, "commit", "-q", "--allow-empty", "-m",
+                            "queue Mercari alerts (재출품 5: 있음5/없음0/못물어봄0)"],
+                           check=True, capture_output=True)
+            subprocess.run([*git, "checkout", "-q", "-b", "side"], check=True, capture_output=True)
+            subprocess.run([*git, "commit", "-q", "--allow-empty", "-m",
+                            "queue Mercari alerts (재출품 99: 있음99/없음0/못물어봄0)"],
+                           check=True, capture_output=True)
+            subprocess.run([*git, "checkout", "-q", "-"], check=True, capture_output=True)
+            subprocess.run([*git, "merge", "-q", "--no-ff", "side", "-m", "Merge side"],
+                           check=True, capture_output=True)
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            failures.append(f"--first-parent 점검용 저장소를 못 만들었습니다: {exc}")
+        else:
+            side = Tally()
+            for timestamp, subject in walk(["HEAD"], sandbox):
+                side.add(timestamp, parse_note(subject))
+            if side.relist["asked"] != 5:
+                failures.append(
+                    "walk()가 --first-parent로 걷지 않습니다: 가지 커밋의 꼬리표까지 "
+                    f"세었습니다(물어본 것 {side.relist['asked']}건, 5여야 합니다)"
+                )
 
     if failures:
         print("눈금 실패:")
         for line in failures:
             print(f"  - {line}")
         return 1
-    print("눈금 통과 — 왕복 7개 / 거짓 양성 6개 / 아는 답 10개")
+    print("눈금 통과 — 왕복 9개 / 거짓 양성 6개 / 아는 답 18개 / 보고 7개"
+          " / 불변식 1개 / 상한 갈래 3개 / --first-parent 1개")
     return 0
 
 
@@ -351,6 +575,8 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--calibrate", action="store_true",
                         help="세는 자를 아는 답과 자체 점검에 대 보고 끝냅니다(어긋나면 1).")
+    parser.add_argument("--by-hour", action="store_true",
+                        help="시각대별로 갈라 찍습니다('못 물어봄'이 한 대에 몰리는지).")
     parser.add_argument("--repo", default=str(ROOT))
     parser.add_argument("rev", nargs="*", default=["origin/main"],
                         help="git log 에 그대로 넘길 인자 (예: origin/main --since='2026-09-16')")
@@ -362,7 +588,7 @@ def main() -> int:
     tally = Tally()
     for timestamp, subject in walk(args.rev or ["origin/main"], Path(args.repo)):
         tally.add(timestamp, parse_note(subject))
-    report(tally)
+    report(tally, by_hour=args.by_hour)
     return 0
 
 
