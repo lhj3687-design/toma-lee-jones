@@ -4,8 +4,19 @@
 **틀렸을 때 틀렸다고 말하는지**를 먼저 봅니다 — 만드는 동안 실제로 한 번 통과했습니다.
 눈금 숫자를 전부 한 자리로 적어 두는 바람에 `\\d+`를 `\\d`로 줄여 놓아도 자체 점검이
 통과했습니다(두 자리 값을 섞어서 고쳤습니다).
+
+**그 고침이 한 칸에만 들었습니다.** 2026-09-17에 고장 15개를 다시 넣어 보니 눈금이
+**8개를 그대로 통과**시켰습니다 — 재출품 칸에만 두 자리를 섞어 뒀던 터라 `조회실패`와
+`다음페이지 N회`는 여전히 `\\d`로 줄여도 통과했고, 누적(`+=`)을 덮어쓰기(`=`)로 바꿔도,
+'꼬리표 첫 커밋 시각'을 망가뜨려도, `--first-parent`를 빼도, 비율의 분모를 바꿔도
+통과했습니다. 아래 `CalibrationCatchesFaultsTests`가 **그 고장들을 CI에서 계속 넣어
+봅니다** — 눈금이 있다는 것과 잡는다는 것은 다릅니다.
 """
+import contextlib
+import copy
 import importlib
+import io
+import re
 import sys
 import types
 import unittest
@@ -96,7 +107,96 @@ class WriterReaderAgreementTests(unittest.TestCase):
         self.assertEqual(note["relist"]["asked"], 124)
 
     def test_the_tools_own_calibration_passes(self):
-        self.assertEqual(commit_notes.calibrate(), 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(commit_notes.calibrate(), 0)
+
+
+class CalibrationCatchesFaultsTests(unittest.TestCase):
+    """눈금에 **고장을 넣어 보고** 1로 끝나는지 봅니다.
+
+    이 클래스가 이 파일의 요점입니다. 눈금을 넣어 둔 것만으로는 부족하다는 것을
+    이 저장소가 두 번 겪었습니다(2026-09-15에 한 번, 2026-09-17에 여덟 번).
+    """
+
+    def assert_caught(self, what: str):
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            result = commit_notes.calibrate()
+        self.assertEqual(result, 1, f"눈금이 '{what}' 고장을 그대로 통과시켰습니다")
+        self.assertIn("눈금 실패", printed.getvalue())
+
+    def patch(self, name, value):
+        original = getattr(commit_notes, name)
+        setattr(commit_notes, name, value)
+        self.addCleanup(setattr, commit_notes, name, original)
+
+    def test_a_single_digit_search_failure_pattern_is_caught(self):
+        """`조회실패 45`가 4로 세지는 고장. 눈금 값이 한 자리뿐이면 안 잡힙니다."""
+        self.patch("SEARCH_FAIL_PATTERN", re.compile(r"조회실패 (?P<failures>\d)"))
+        self.assert_caught("조회실패 자릿수")
+
+    def test_a_single_digit_next_page_pattern_is_caught(self):
+        self.patch("NEXT_PAGE_PATTERN",
+                   re.compile(r"다음페이지 (?P<fired>\d)회 신규(?P<fresh>\d+)"))
+        self.assert_caught("다음페이지 발동 횟수 자릿수")
+
+    def test_losing_accumulation_is_caught(self):
+        """여러 판의 값을 더하지 않고 덮어쓰는 고장. 눈금에 그 칸을 한 판만 두면
+        합이 같아서 안 잡힙니다."""
+
+        class DoesNotAccumulate(commit_notes.Tally):
+            def add(self, timestamp, note):
+                super().add(timestamp, note)
+                if note and note.get("search_failures"):
+                    self.search_failures = note["search_failures"]
+
+        self.patch("Tally", DoesNotAccumulate)
+        self.assert_caught("조회실패 누적")
+
+    def test_losing_the_first_note_timestamp_is_caught(self):
+        """'꼬리표 첫 커밋 시각'은 **'0건'과 '아직 측정이 없음'을 가르는 값**입니다."""
+
+        class ForgetsFirstNote(commit_notes.Tally):
+            def add(self, timestamp, note):
+                super().add(timestamp, note)
+                self.first_note_at = self.last_note_at
+
+        self.patch("Tally", ForgetsFirstNote)
+        self.assert_caught("꼬리표 첫 커밋 시각")
+
+    def test_ignoring_the_producer_invariant_is_caught(self):
+        """있음+없음+못물어봄 = 물어본 수. 봇이 그렇게 세므로 깨지면 파서가 틀린 것입니다."""
+
+        class IgnoresInvariant(commit_notes.Tally):
+            def add(self, timestamp, note):
+                super().add(timestamp, note)
+                self.inconsistent = 0
+
+        self.patch("Tally", IgnoresInvariant)
+        self.assert_caught("생산자 불변식")
+
+    def test_walking_without_first_parent_is_caught(self):
+        """`--first-parent`를 빼면 PR 브랜치의 옛 꼬리표가 섞여 들어옵니다."""
+        original = commit_notes.walk
+
+        def walk_all(rev_args, repo):
+            return original(["--all", *rev_args] if rev_args == ["HEAD"] else rev_args, repo)
+
+        self.patch("walk", walk_all)
+        self.assert_caught("--first-parent")
+
+    def test_reading_the_ratio_against_the_wrong_denominator_is_caught(self):
+        """'못 물어봄 비율'의 분모는 **물어본 것**입니다. 물어볼 자리로 나누면
+        상한에 걸린 판이 섞여 비율이 낮게 나옵니다 — 이 요청의 결론 숫자입니다."""
+        original = commit_notes.report
+
+        def report_with_wrong_denominator(tally, by_hour=False):
+            swapped = copy.copy(tally)
+            swapped.relist = commit_notes.Counter(tally.relist)
+            swapped.relist["asked"] = tally.relist["targets"]
+            original(swapped, by_hour=by_hour)
+
+        self.patch("report", report_with_wrong_denominator)
+        self.assert_caught("못 물어봄 비율의 분모")
 
 
 if __name__ == "__main__":
