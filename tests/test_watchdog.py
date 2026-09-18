@@ -196,13 +196,27 @@ esac
 """
 
 
+# 상태 커밋 시각을 읽는 둘째 증인을 시험에서 조종하기 위한 가짜 git 입니다.
+FAKE_GIT = """#!/usr/bin/env bash
+if [ -n "${FAKE_GIT_FAIL:-}" ]; then echo "fatal: simulated" >&2; exit 128; fi
+if [ "$1" = "log" ]; then echo "${FAKE_COMMIT_EPOCH}"; exit 0; fi
+exec /usr/bin/git "$@"
+"""
+
+
 def _iso(seconds_ago):
     stamp = datetime.now(timezone.utc).timestamp() - seconds_ago
     return datetime.fromtimestamp(stamp, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-class ScriptTests(unittest.TestCase):
-    """가짜 gh를 PATH에 얹고 스크립트를 그대로 실행합니다."""
+class ScriptHarness(unittest.TestCase):
+    """가짜 gh·git을 PATH에 얹고 스크립트를 그대로 실행하는 공통 준비.
+
+    시험은 두 묶음이 같은 준비를 씁니다 - 실제 동작을 보는 ScriptTests 와,
+    일부러 고장을 넣어 그 시험이 잡는지 보는 FaultsAreCaughtTests 입니다.
+    준비만 여기 두는 이유는, 한쪽이 다른 쪽을 상속하면 같은 시험이 두 번
+    돌기 때문입니다(봇이 매 실행 전에 돌리는 묶음이라 시간이 그대로 비용입니다).
+    """
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -213,6 +227,9 @@ class ScriptTests(unittest.TestCase):
         fake = binary / "gh"
         fake.write_text(FAKE_GH)
         fake.chmod(0o755)
+        fake_git = binary / "git"
+        fake_git.write_text(FAKE_GIT)
+        fake_git.chmod(0o755)
 
         self.log = self.tmp / "gh.log"
         self.env = dict(os.environ)
@@ -225,6 +242,8 @@ class ScriptTests(unittest.TestCase):
         self.set_run(dict(STUCK_RUN, status="queued"))
         self.set_success([{"updated_at": _iso(30)}])
         self.set_issues([])
+        # 기본값은 "상태 커밋도 오래됐다" - 정지 감지 시험들이 서는 자리입니다.
+        self.set_commit_age(3 * 3600)
 
     def _write(self, name, payload):
         path = self.tmp / name
@@ -247,6 +266,10 @@ class ScriptTests(unittest.TestCase):
     def set_issues(self, issues):
         self._write("FAKE_ISSUES_FILE", issues)
 
+    def set_commit_age(self, seconds_ago):
+        stamp = datetime.now(timezone.utc).timestamp() - seconds_ago
+        self.env["FAKE_COMMIT_EPOCH"] = str(int(stamp))
+
     def run_watchdog(self, *extra):
         return subprocess.run(
             ["python3", str(ROOT / "scripts" / "watchdog.py"),
@@ -256,6 +279,10 @@ class ScriptTests(unittest.TestCase):
 
     def calls(self):
         return self.log.read_text() if self.log.exists() else ""
+
+
+class ScriptTests(ScriptHarness):
+    """실제 동작을 봅니다."""
 
     # -- 끊어야 하는 경우 ---------------------------------------------------
 
@@ -349,6 +376,42 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("[보류]", result.stdout)
         self.assertNotIn("[정상] 러너를 기다리다 멈춘 실행이 없습니다", result.stdout)
 
+    def test_a_queued_run_without_a_job_record_is_never_cancelled(self):
+        """실측(#7646): 목록도 단건 재조회도 `queued`인데 잡 레코드가 0개입니다.
+
+        README 표대로면 잡 레코드가 없는 것이 곧 `pending`입니다. has_runner()는
+        `any([]) is False`라 이것을 그대로 통과시켰고, 워치독은 2026-09-13 09:37부터
+        약 500번 이 실행을 끊으려 했습니다. 멀쩡한 대기 실행을 죽이지 않은 것은 우리
+        판정이 아니라 GitHub의 HTTP 409 덕분이었습니다.
+        """
+        stuck = dict(STUCK_RUN, run_number=7646,
+                     run_started_at=_iso(4 * 24 * 3600), created_at=_iso(4 * 24 * 3600))
+        self.set_queued([stuck])
+        self.set_run(stuck)
+        self.set_jobs([])                     # total_count: 0 — 실제로 오는 모양입니다
+
+        result = self.run_watchdog()
+
+        self.assertNotIn("/cancel", self.calls())
+        self.assertIn("잡 레코드가 없습니다", result.stdout)
+        self.assertIn("pending", result.stdout)
+
+    def test_a_failed_cancel_is_never_reported_as_all_clear(self):
+        """취소에 실패한 것을 "멈춘 실행이 없습니다"로 말하면 안 됩니다.
+
+        목록 조회 실패에는 이미 같은 가드가 있었는데(위), 취소 실패에는 없었습니다.
+        cancelled가 0이라 그대로 [정상]으로 떨어졌습니다.
+        """
+        stuck = dict(STUCK_RUN, run_started_at=_iso(7 * 3600), created_at=_iso(7 * 3600))
+        self.set_queued([stuck])
+        self.set_run(stuck)
+        self.env["FAKE_CANCEL_FAIL"] = "1"
+
+        result = self.run_watchdog()
+
+        self.assertIn("[주의]", result.stdout)
+        self.assertNotIn("[정상] 러너를 기다리다 멈춘 실행이 없습니다", result.stdout)
+
     def test_a_failed_cancel_does_not_crash_the_watchdog(self):
         stuck = dict(STUCK_RUN, run_started_at=_iso(7 * 3600), created_at=_iso(7 * 3600))
         self.set_queued([stuck])
@@ -370,6 +433,38 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("issue-create", self.calls())
         self.assertIn(f"title={watchdog.ISSUE_MARKER}", self.calls())
         self.assertIn("[정지 의심]", result.stdout)
+
+    def test_a_fresh_state_commit_blocks_the_stale_issue(self):
+        """실측(이슈 #40): API가 "마지막 성공 4378분 전"이라고 했지만 봇은 24초 전에
+        성공했고 앞선 40분에 성공이 33건이었습니다. 한 번의 답만 믿으면 헛알림입니다."""
+        self.set_success([{"updated_at": _iso(73 * 3600)}])
+        self.set_commit_age(30)
+
+        result = self.run_watchdog()
+
+        self.assertNotIn("issue-create", self.calls())
+        self.assertIn("[보류]", result.stdout)
+        self.assertNotIn("[정지 의심]", result.stdout)
+
+    def test_an_old_state_commit_still_opens_the_issue(self):
+        """진짜로 멈추면 커밋도 같이 멈춰 있으므로 감지가 늦어지지 않아야 합니다."""
+        self.set_success([{"updated_at": _iso(3 * 3600)}])
+        self.set_commit_age(3 * 3600)
+
+        result = self.run_watchdog()
+
+        self.assertIn("issue-create", self.calls())
+        self.assertIn("[정지 의심]", result.stdout)
+
+    def test_an_unreadable_state_commit_still_opens_the_issue(self):
+        """둘째 증인을 못 읽는다고 놓치는 쪽으로 가면 안 됩니다(하나 더 여는 쪽이 낫습니다)."""
+        self.set_success([{"updated_at": _iso(3 * 3600)}])
+        self.env["FAKE_GIT_FAIL"] = "1"
+
+        result = self.run_watchdog()
+
+        self.assertIn("issue-create", self.calls())
+        self.assertIn("읽지 못함", result.stdout)
 
     def test_a_recent_success_opens_nothing(self):
         self.set_success([{"updated_at": _iso(30)}])
@@ -420,7 +515,8 @@ class ScriptTests(unittest.TestCase):
     def test_the_watchdog_never_fails_its_own_run(self):
         """감시 도구가 빨간불이 되면 그것대로 잡음이 됩니다. 모든 경로에서 0으로 끝나야 합니다."""
         for broken in ("FAKE_QUEUED_FAIL", "FAKE_SUCCESS_FAIL", "FAKE_ISSUES_FAIL",
-                       "FAKE_JOBS_FAIL", "FAKE_CANCEL_FAIL", "FAKE_ISSUE_CREATE_FAIL"):
+                       "FAKE_JOBS_FAIL", "FAKE_CANCEL_FAIL", "FAKE_ISSUE_CREATE_FAIL",
+                       "FAKE_GIT_FAIL"):
             with self.subTest(broken=broken):
                 self.setUp()
                 stuck = dict(STUCK_RUN, run_started_at=_iso(7 * 3600), created_at=_iso(7 * 3600))
@@ -433,3 +529,96 @@ class ScriptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FaultsAreCaughtTests(ScriptHarness):
+    """시험이 고장을 정말로 잡는지, 고장을 내서 확인합니다.
+
+    이 저장소에서 네 라운드 연속으로 자체 점검이 고장을 그대로 통과시켰습니다.
+    "시험이 있다"는 것과 "시험이 잡는다"는 것은 다릅니다. 아래는 이번 라운드에
+    실제로 운영에서 났던 고장을 그대로 되살려 넣습니다.
+    """
+
+    def patched(self, *substitutions):
+        """watchdog.py를 고쳐 놓은 사본을 만들어 돌립니다."""
+        source = (ROOT / "scripts" / "watchdog.py").read_text(encoding="utf-8")
+        for old, new in substitutions:
+            self.assertIn(old, source, f"고장을 넣을 자리를 찾지 못했습니다: {old[:40]}")
+            source = source.replace(old, new, 1)
+        broken = self.tmp / "broken_watchdog.py"
+        broken.write_text(source, encoding="utf-8")
+        return subprocess.run(
+            ["python3", str(broken), "--repo", "o/r", "--workflow", "mercari-check.yml"],
+            capture_output=True, text=True, env=self.env, cwd=str(ROOT),
+        )
+
+    def stuck_without_jobs(self):
+        stuck = dict(STUCK_RUN, run_number=7646,
+                     run_started_at=_iso(4 * 24 * 3600), created_at=_iso(4 * 24 * 3600))
+        self.set_queued([stuck])
+        self.set_run(stuck)
+        self.set_jobs([])
+
+    def test_dropping_the_empty_jobs_guard_is_caught(self):
+        """잡 레코드가 없는 실행(=pending)을 다시 끊으려 들면 잡혀야 합니다."""
+        self.stuck_without_jobs()
+        result = self.patched(("        if not listed_jobs:", "        if False:"))
+        self.assertIn("/cancel", self.calls(), "pending을 끊었는데 시험이 잡지 못했습니다")
+        self.assertNotIn("잡 레코드가 없습니다", result.stdout)
+
+    def test_treating_a_missing_runner_key_as_no_runner_is_caught(self):
+        """독스트링이 경고한 그 고장입니다 - runner_id는 **0**이지 없는 키가 아닙니다."""
+        stuck = dict(STUCK_RUN, run_started_at=_iso(7 * 3600), created_at=_iso(7 * 3600))
+        self.set_queued([stuck])
+        self.set_run(stuck)
+        self.set_jobs([HEALTHY_JOB])
+        result = self.patched((
+            'return any(job.get("runner_id") for job in jobs)',
+            'return any("runner_id" not in job for job in jobs)',
+        ))
+        self.assertIn("/cancel", self.calls(), "러너가 붙은 실행을 끊었는데 못 잡았습니다")
+        self.assertNotIn("러너가 이미 붙어", result.stdout)
+
+    def test_folding_a_failed_cancel_back_into_all_clear_is_caught(self):
+        """취소 실패를 '이상 없음'으로 뭉치는 그 고장입니다."""
+        stuck = dict(STUCK_RUN, run_started_at=_iso(7 * 3600), created_at=_iso(7 * 3600))
+        self.set_queued([stuck])
+        self.set_run(stuck)
+        self.set_jobs([STUCK_JOB])
+        self.env["FAKE_CANCEL_FAIL"] = "1"
+        result = self.patched(("        if failed:", "        if False:"))
+        self.assertIn("[정상] 러너를 기다리다 멈춘 실행이 없습니다", result.stdout)
+        self.assertNotIn("[주의]", result.stdout)
+
+    def test_dropping_the_second_witness_is_caught(self):
+        """이슈 #40을 만든 그 고장입니다 - API 한 번의 답만 믿는 것."""
+        self.set_success([{"updated_at": _iso(73 * 3600)}])
+        self.set_commit_age(30)
+        result = self.patched((
+            "        if age is not None and age < args.stale_after:",
+            "        if False:",
+        ))
+        self.assertIn("issue-create", self.calls(), "헛이슈가 열렸는데 시험이 잡지 못했습니다")
+        self.assertIn("[정지 의심]", result.stdout)
+
+    def test_reading_an_unreadable_commit_time_as_zero_is_caught(self):
+        """못 잰 것을 0으로 읽으면 '방금 커밋함'이 되어 진짜 정지를 삼킵니다."""
+        self.set_success([{"updated_at": _iso(3 * 3600)}])
+        self.env["FAKE_GIT_FAIL"] = "1"
+        result = self.patched((
+            '        print(f"[경고] 상태 커밋 시각을 읽지 못했습니다: {result.stderr.strip()}", file=sys.stderr)\n        return None',
+            '        return 0',
+        ))
+        self.assertNotIn("issue-create", self.calls(), "진짜 정지를 삼켰는데 못 잡았습니다")
+        self.assertIn("[보류]", result.stdout)
+
+    def test_flipping_the_sign_of_the_commit_age_is_caught(self):
+        """now - 커밋시각을 뒤집으면 늘 음수라 이슈가 영영 안 열립니다."""
+        self.set_success([{"updated_at": _iso(3 * 3600)}])
+        self.set_commit_age(3 * 3600)
+        result = self.patched((
+            "        return now - float(result.stdout.strip())",
+            "        return float(result.stdout.strip()) - now",
+        ))
+        self.assertNotIn("issue-create", self.calls(), "부호 뒤집힘을 못 잡았습니다")
+        self.assertIn("[보류]", result.stdout)
