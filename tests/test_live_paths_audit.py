@@ -392,3 +392,224 @@ class CalibrationCatchesFaultsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CadenceRulerCatchesFaultsTests(unittest.TestCase):
+    """cadence 의 자(尺)를 세는 칸에 고장을 넣고, 값이 **어긋나는지** 봅니다.
+
+    이 칸이 왜 따로 필요한가: PR #44가 "봇이 잰 간격이 실제보다 8.6배 자주 180초를
+    넘었다"를 냈고, PR #45가 그 원인(체크아웃이 실행 **만들어질 때**의 sha)을 고쳤습니다.
+    고침이 들었는지는 '부풀림 배수'가 1.0으로 내려오는가로만 확인할 수 있습니다.
+
+    운영 눈금(창 A)이 못 지키는 자리가 둘 있어 합성 판이 맡습니다.
+
+      1. `참 초과`와 `정지(참 초과)`는 운영 이력에서 **언제나 같은 값**입니다. 봇이
+         읽는 값은 직전 실행의 것이거나 더 옛날 것이라 봇의 간격이 참 간격보다 작을
+         수 없기 때문입니다(전 구간 6,304쌍에 예외 0건). 같은 값 둘을 나란히 두면
+         둘을 뭉개는 고장이 그대로 통과하므로, 여기서는 그 '나올 수 없는 판'을
+         일부러 놓고 ⛔가 서는지 봅니다.
+      2. 간격이 **정확히 180초**인 판이 운영 눈금 창에 없습니다. `>` 를 `>=` 로
+         바꾸는 경계 고장이 안 잡히므로 여기에 그 판을 둡니다.
+
+    눈금 숫자는 자릿수를 섞고(2 / 14 / 7 / 3 / 4) 서로 **다르게** 둡니다 - 두 칸이
+    같은 값이면 이름표를 뒤바꾸는 고장이 통과합니다.
+    """
+
+    EXPECTED = {
+        "실행": 24,
+        "측정 없음": 2,
+        "전진": 14,
+        "정지": 7,
+        "정지(참 초과)": 3,
+        "정지(부풀림)": 4,
+        "참 초과": 3,
+        "참 초과 인데 전진": 0,
+    }
+
+    # (참 간격, cadence 시계 모양). "advance"=이번 실행 시각으로 옮김,
+    # "freeze"=옛 값 그대로, None=`__last_cadence_ok__` 가 아예 없던 옛 판.
+    #
+    # 측정 없음 쪽에 간격 400초짜리를 하나 둡니다 - 시계가 없는 판까지 `참 초과`로
+    # 세는 고장이 여기서 걸립니다(3이 4가 됩니다).
+    PLAN = [
+        (400, None), (60, None),                                   # 측정 없음 2
+        (60, "advance"), (75, "advance"), (90, "advance"),
+        (110, "advance"), (125, "advance"), (140, "advance"),
+        (150, "advance"), (160, "advance"), (170, "advance"),
+        (175, "advance"), (178, "advance"), (179, "advance"),
+        (180, "advance"),                                          # 경계: 180 은 초과가 아닙니다
+        (65, "advance"),                                           # 전진 14
+        (181, "freeze"), (300, "freeze"), (600, "freeze"),         # 정지(참 초과) 3
+        (60, "freeze"), (100, "freeze"), (150, "freeze"),
+        (180, "freeze"),                                           # 정지(부풀림) 4
+    ]
+
+    def board(self, plan=None, impossible=False):
+        specs = []
+        search = BASE
+        frozen_at = BASE          # 얼어 있는 동안 들고 있는 옛 값
+        # 첫 실행은 앞 판이 없어 간격이 없습니다(어느 칸에도 안 들어갑니다).
+        specs.append((search + 40, "queue",
+                      make_blob(clocks=clock(search=search, cadence=search))))
+        for gap, shape in (plan or self.PLAN):
+            search += gap
+            if shape is None:
+                clocks = clock(search=search)
+            elif shape == "advance":
+                clocks = clock(search=search, cadence=search)
+                frozen_at = search
+            else:
+                clocks = clock(search=search, cadence=frozen_at)
+            # 커밋은 조회보다 늦게 올라옵니다. 지연을 판마다 다르게 두어, 참 간격을
+            # 커밋 시각 차이로 재는 고장이 잡히게 합니다.
+            specs.append((search + 40 + (gap % 17), "queue", make_blob(clocks=clocks)))
+        if impossible:
+            # 나올 수 없는 판: 참 간격은 넘었는데 시계는 전진했습니다.
+            search += 500
+            specs.append((search + 40, "queue",
+                          make_blob(clocks=clock(search=search, cadence=search))))
+        return snapshots(*specs)
+
+    def measured(self, **kwargs):
+        report = audit.summarize(self.board(**kwargs))
+        ruler = report["cadence 자"]
+        return {"실행": len(report["실행"]), **{k: ruler[k] for k in self.EXPECTED if k != "실행"}}
+
+    def assert_board_passes(self):
+        self.assertEqual(self.measured(), self.EXPECTED)
+
+    def assert_board_fails(self, message):
+        self.assertNotEqual(self.measured(), self.EXPECTED, message)
+
+    def patch(self, name, replacement):
+        original = getattr(audit, name)
+        setattr(audit, name, replacement)
+        self.addCleanup(setattr, audit, name, original)
+
+    # -- 눈금 자신이 맞는지 먼저 ------------------------------------------
+
+    def test_the_board_itself_is_right(self):
+        self.assert_board_passes()
+
+    def test_an_impossible_advance_is_counted_apart(self):
+        """참 간격이 넘었는데 시계가 전진한 판은 따로 셉니다.
+
+        운영에서는 나올 수 없습니다. 나오면 판을 잘못 붙였다는 뜻이고, 그때
+        `참 초과`와 `정지(참 초과)`가 **갈립니다**(4 vs 3) - 둘을 뭉개는 고장이
+        여기서만 잡힙니다.
+        """
+        got = self.measured(impossible=True)
+        self.assertEqual(got["참 초과 인데 전진"], 1)
+        self.assertEqual(got["참 초과"], 4)
+        self.assertEqual(got["정지(참 초과)"], 3)
+
+    # -- 고장을 넣어 봅니다 -----------------------------------------------
+
+    def test_treating_a_missing_cadence_clock_as_frozen_is_caught(self):
+        """실제로 냈던 고장입니다 - 계기 배포 전 998판이 통째로 '정지'가 됩니다."""
+        def broken(gap, search_ok, cadence_ok):
+            over = gap > audit.EXPECTED_RUN_INTERVAL_SECONDS * audit.RUN_INTERVAL_SLACK
+            if cadence_ok is None or abs(cadence_ok - search_ok) >= 0.5:
+                return ("정지(참 초과)" if over else "정지(부풀림)"), over
+            return "전진", over
+        self.patch("cadence_verdict", broken)
+        self.assert_board_fails("시계가 없던 판을 '정지'로 세는 고장을 눈금이 통과시켰습니다")
+
+    def test_treating_a_missing_cadence_clock_as_advanced_is_caught(self):
+        def broken(gap, search_ok, cadence_ok):
+            over = gap > audit.EXPECTED_RUN_INTERVAL_SECONDS * audit.RUN_INTERVAL_SLACK
+            if cadence_ok is None:
+                return "전진", over
+            if abs(cadence_ok - search_ok) < 0.5:
+                return "전진", over
+            return ("정지(참 초과)" if over else "정지(부풀림)"), over
+        self.patch("cadence_verdict", broken)
+        self.assert_board_fails("시계가 없던 판을 '전진'으로 세는 고장을 눈금이 통과시켰습니다")
+
+    def test_swapping_the_two_freeze_reasons_is_caught(self):
+        """'자가 부풀려서 정지'와 '참으로 느려서 정지'를 뒤바꾸면 결론이 정반대가 됩니다."""
+        original = audit.cadence_verdict
+        def broken(gap, search_ok, cadence_ok):
+            label, over = original(gap, search_ok, cadence_ok)
+            if label == "정지(참 초과)":
+                return "정지(부풀림)", over
+            if label == "정지(부풀림)":
+                return "정지(참 초과)", over
+            return label, over
+        self.patch("cadence_verdict", broken)
+        self.assert_board_fails("정지 이유 둘을 뒤바꾸는 고장을 눈금이 통과시켰습니다")
+
+    def test_using_the_expected_interval_without_the_slack_is_caught(self):
+        """문턱을 기대x3(180초)이 아니라 기대(60초)로 잡는 고장입니다."""
+        self.patch("RUN_INTERVAL_SLACK", 1)
+        self.assert_board_fails("문턱에서 여유를 빠뜨리는 고장을 눈금이 통과시켰습니다")
+
+    def test_making_the_threshold_inclusive_is_caught(self):
+        """`>` 를 `>=` 로 바꾸는 경계 고장. 간격이 정확히 180초인 판이 갈라 줍니다."""
+        def broken(gap, search_ok, cadence_ok):
+            over = gap >= audit.EXPECTED_RUN_INTERVAL_SECONDS * audit.RUN_INTERVAL_SLACK
+            if cadence_ok is None:
+                return "측정 없음", over
+            if abs(cadence_ok - search_ok) < 0.5:
+                return "전진", over
+            return ("정지(참 초과)" if over else "정지(부풀림)"), over
+        self.patch("cadence_verdict", broken)
+        self.assert_board_fails("180초 경계를 포함시키는 고장을 눈금이 통과시켰습니다")
+
+    def test_counting_the_true_gap_on_runs_without_a_clock_is_caught(self):
+        """시계가 없는 판까지 `참 초과`로 세면 3이 4가 됩니다."""
+        original = audit.cadence_verdict
+        def broken(gap, search_ok, cadence_ok):
+            label, over = original(gap, search_ok, cadence_ok)
+            return ("전진" if label == "측정 없음" else label), over
+        self.patch("cadence_verdict", broken)
+        self.assert_board_fails("시계 없는 판을 참 초과로 세는 고장을 눈금이 통과시켰습니다")
+
+    def test_flooring_the_counts_to_tens_is_caught(self):
+        """자릿수 고장. 14 -> 10 이 되고 7 · 3 · 4 는 전부 0으로 뭉개집니다."""
+        report = audit.summarize(self.board())
+        floored = {k: (v // 10) * 10 for k, v in report["cadence 자"].items()}
+        self.assertNotEqual(
+            {k: floored[k] for k in self.EXPECTED if k != "실행"},
+            {k: self.EXPECTED[k] for k in self.EXPECTED if k != "실행"},
+            "십 단위 내림을 눈금이 통과시켰습니다")
+
+    def test_reading_the_previous_runs_clock_instead_of_this_ones_is_caught(self):
+        """'직전 실행의 시계'를 읽으면 전진/정지가 한 판씩 밀립니다."""
+        board = self.board()
+        shifted = []
+        previous = None
+        for when, subject, values in board:
+            copy = dict(values)
+            copy["clocks"] = dict(values.get("clocks") or {})
+            if previous is not None:
+                copy["clocks"]["cadence_ok"] = previous
+            previous = (values.get("clocks") or {}).get("cadence_ok")
+            shifted.append((when, subject, copy))
+        ruler = audit.summarize(shifted)["cadence 자"]
+        self.assertNotEqual({k: ruler[k] for k in self.EXPECTED if k != "실행"},
+                            {k: self.EXPECTED[k] for k in self.EXPECTED if k != "실행"},
+                            "한 판 밀려 읽는 고장을 눈금이 통과시켰습니다")
+
+    def test_render_reports_the_inflation_and_does_not_invent_it(self):
+        """눈금이 부르지 않는 코드는 눈금이 못 지킵니다 - render 도 불러 봅니다."""
+        import io
+        out = io.StringIO()
+        audit.render(audit.summarize(self.board()), out=out)
+        text = out.getvalue()
+        self.assertIn("자가 부풀려서 정지한 것 4", text)
+        self.assertIn("부풀림 배수 2.3배", text)     # 정지 7 / 참 초과 3
+        self.assertNotIn("⛔ 참 간격이 넘었는데", text)
+
+        out = io.StringIO()
+        audit.render(audit.summarize(self.board(impossible=True)), out=out)
+        self.assertIn("⛔ 참 간격이 넘었는데 시계가 전진한 판 1건", out.getvalue())
+
+    def test_render_says_measurement_is_missing_rather_than_zero(self):
+        """잰 판이 0이면 0을 찍지 말고 '측정이 없다'고 말해야 합니다."""
+        import io
+        out = io.StringIO()
+        audit.render(audit.summarize(self.board(plan=[(60, None), (400, None)])), out=out)
+        text = out.getvalue()
+        self.assertIn("⛔ 잰 판이 0입니다", text)
+        self.assertNotIn("부풀림 배수", text)

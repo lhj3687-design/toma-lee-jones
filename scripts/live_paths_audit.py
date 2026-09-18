@@ -250,6 +250,27 @@ def iter_snapshots(rev, since=None, until=None, repo="."):
 # 3. 세기
 # --------------------------------------------------------------------------
 
+def cadence_verdict(gap, search_ok, cadence_ok):
+    """이 실행에서 봇이 cadence 시계를 옮겼는지, **참** 간격은 넘었는지 가릅니다.
+
+    봇(`cadence_alerts`)은 **자기가 본** 간격이 기대x3 이하일 때만
+    `__last_cadence_ok__` 를 이번 실행 시각으로 옮깁니다. 그래서 커밋된 그 시계가
+    이번 실행의 `__last_search_ok__` 와 같은가가 곧 '봇이 본 간격 <= 180 인가' 입니다.
+    `gap` 은 커밋 이력이 말하는 **참** 간격(직전 실행의 `__last_search_ok__` 와의 차)
+    이므로, 둘을 맞대면 자가 얼마나 부풀었는지가 나옵니다.
+
+    `__last_cadence_ok__` 가 아예 없던 옛 판(2026-09-12 18:49 이전)은 '정지'가 아니라
+    **측정 없음**입니다. 섞으면 그 구간 998판이 통째로 '정지'로 세집니다 - 이 도구를
+    만들면서 실제로 낸 고장입니다.
+    """
+    over = gap > EXPECTED_RUN_INTERVAL_SECONDS * RUN_INTERVAL_SLACK
+    if cadence_ok is None:
+        return "측정 없음", over
+    if abs(cadence_ok - search_ok) < 0.5:
+        return "전진", over
+    return ("정지(참 초과)" if over else "정지(부풀림)"), over
+
+
 def summarize(snapshots):
     """뽑은 값들을 받아 경로별 '자리'와 '울림'을 셉니다. git 을 타지 않습니다."""
     report = {
@@ -267,6 +288,15 @@ def summarize(snapshots):
         # 커밋 이력의 간격으로는 설명되지 않습니다).
         "경고 자리": {"empty-feed": 0, "created-missing": 0,
                     "cadence-slow": 0, "keyword-down": 0},
+        # cadence 가 **무엇과 비교했는가**. 봇은 자기가 본 간격이 기대x3 이하일 때만
+        # `__last_cadence_ok__` 를 이번 실행 시각으로 옮기므로, 커밋된 그 시계가 이번
+        # 실행의 `__last_search_ok__` 와 같은가가 곧 '봇이 본 간격 <= 180 인가' 입니다.
+        # 그것을 커밋 이력이 말하는 **참 간격**과 맞대면 자가 얼마나 부풀었는지 나옵니다.
+        # `__last_cadence_ok__` 가 없던 옛 판(2026-09-12 18:49 이전)은 '정지'가 아니라
+        # **측정 없음**입니다 - 섞으면 그 구간이 통째로 '정지'로 세집니다(실제로 냈던 고장).
+        "cadence 자": {"측정 없음": 0, "전진": 0, "정지": 0,
+                     "정지(참 초과)": 0, "정지(부풀림)": 0, "참 초과": 0,
+                     "참 초과 인데 전진": 0},
     }
     previous_when = None
     previous_run = None
@@ -343,6 +373,23 @@ def summarize(snapshots):
         bot_was_down = earlier is not None and search_ok - earlier["search_ok"] >= KEYWORD_STUCK_AFTER_SECONDS
         if worst is not None and not bot_was_down and search_ok - worst >= KEYWORD_STUCK_AFTER_SECONDS:
             report["경고 자리"]["keyword-down"] += 1
+        # cadence 의 자: 봇이 커밋한 시계가 이번 실행 시각과 같은가(= 봇이 본 간격이
+        # 기대x3 이하였는가)를, 커밋 이력이 말하는 **참** 간격과 맞댑니다.
+        if "gap" in run:
+            ruler = report["cadence 자"]
+            label, over = cadence_verdict(run["gap"], search_ok, clocks.get("cadence_ok"))
+            ruler[label] += 1
+            if label.startswith("정지"):
+                ruler["정지"] += 1
+            if label != "측정 없음" and over:
+                ruler["참 초과"] += 1
+                if label == "전진":
+                    # 봇이 읽는 값은 직전 실행의 것이거나 그보다 **더 옛날** 것이라,
+                    # 봇이 본 간격은 참 간격보다 작을 수 없습니다. 그래서 '참 간격이
+                    # 넘었는데 시계는 전진' 은 나올 수 없는 판입니다 - 나오면 이 도구가
+                    # 판을 잘못 붙였다는 뜻이고, render 가 ⛔로 찍습니다.
+                    ruler["참 초과 인데 전진"] += 1
+
         # cadence 는 봇이 쓰는 두 조건을 그대로 씁니다 - 간격이 벌어졌고(>기대x3),
         # 직전 정상 시각이 10분 이상 묵었을 때만 경고 가지에 닿습니다.
         previous_cadence = (earlier or {}).get("clocks", {}).get("cadence_ok")
@@ -481,6 +528,30 @@ def render(report, out=sys.stdout):
             f"{report['health 대기'][:5]}")
 
     say("")
+    say("[cadence 의 자(尺)]  = 봇이 '무엇과' 비교했는가")
+    ruler = report["cadence 자"]
+    measured = ruler["전진"] + ruler["정지"]
+    say(f"  __last_cadence_ok__ 가 없던 옛 판 {ruler['측정 없음']:,}  ← '정지'가 아니라 **측정 없음**입니다")
+    if measured == 0:
+        say("  ⛔ 잰 판이 0입니다 — 아래를 0으로 읽지 마세요, 측정이 없는 것입니다")
+    else:
+        say(f"  잰 판 {measured:,}  ·  시계 전진 {ruler['전진']:,}  ·  시계 정지 {ruler['정지']:,}"
+            f" ({ruler['정지'] / measured:.2%})")
+        say(f"  커밋 이력이 말하는 **참 간격**이 {EXPECTED_RUN_INTERVAL_SECONDS * RUN_INTERVAL_SLACK}초를"
+            f" 넘은 판 {ruler['참 초과']:,} ({ruler['참 초과'] / measured:.2%})")
+        say(f"    정지 중 참 간격도 넘은 것 {ruler['정지(참 초과)']:,}"
+            f"  ·  **자가 부풀려서 정지한 것 {ruler['정지(부풀림)']:,}**")
+        if ruler["참 초과"]:
+            say(f"    부풀림 배수 {ruler['정지'] / ruler['참 초과']:.1f}배"
+                "   (1.0 이면 자가 맞습니다)")
+        else:
+            say("    참 초과가 0이라 배수를 못 냅니다 — '자가 맞다'는 뜻이 아닙니다")
+    if ruler["참 초과 인데 전진"]:
+        say(f"  ⛔ 참 간격이 넘었는데 시계가 전진한 판 {ruler['참 초과 인데 전진']:,}건 — 나올 수 없는 값입니다.")
+        say("     봇이 읽는 값은 직전 실행의 것이거나 더 옛날 것이라 봇의 간격은 참 간격보다"
+            " 작을 수 없습니다. 판을 잘못 붙였다는 뜻이니 위 표를 읽지 마세요.")
+
+    say("")
     say("[경고 없이 나간 복구 알림]  = 알린 적 없는 고장이 나았다는 말")
     for recovery, loose in unpaired_recoveries(report["health"]).items():
         total_of = rang(recovery)
@@ -545,6 +616,20 @@ EXPECTED_A = {
     "seen 최대": 15695,
     "지문 최대": 14136,
     "전송기록 최대": 8885,
+    # cadence 의 자. 이 창은 `__last_cadence_ok__` 배포(2026-09-12 18:49) **경계를
+    # 걸치고** 있어서, 앞 998판을 '정지'로 세는 고장이 여기서 걸립니다(그 고장을 실제로
+    # 냈습니다). 그리고 정지 88 = 참 초과 20 + 부풀림 68 이라 셋 중 둘을 뭉개는
+    # 고장도 갈립니다 - 자릿수도 2/2/3/4 자리로 섞여 있습니다.
+    #
+    # `참 초과`는 따로 눈금에 두지 않습니다. 봇이 읽는 값은 직전 실행의 것이거나 더
+    # 옛날 것이라 봇의 간격은 참 간격보다 작을 수 없고, 그래서 운영 이력에서는
+    # `참 초과`와 `정지(참 초과)`가 **언제나 같은 값**입니다(전 구간 실측 0건 예외).
+    # 같은 값 둘을 나란히 두면 둘을 뭉개는 고장이 그대로 통과합니다 - 그 자리는
+    # 합성 판을 쓰는 tests/test_live_paths_audit.py 가 맡습니다.
+    "cadence 측정없음": 998,
+    "cadence 전진": 2411,
+    "cadence 정지": 88,
+    "cadence 정지(부풀림)": 68,
 }
 
 EXPECTED_B = {
@@ -553,6 +638,12 @@ EXPECTED_B = {
     "15분 이상 간격": 11,     # 여기서 두 문턱이 갈립니다
     "30분 이상 간격": 1,
     "최대 간격(초)": 2260,
+    # 시계 자체가 없던 창입니다. 넷 다 0이어야 하고, 0이 아니면 이 도구가 '못 잰 것'을
+    # 값으로 지어낸 것입니다.
+    "cadence 측정없음": 0,
+    "cadence 전진": 0,
+    "cadence 정지": 0,
+    "cadence 정지(부풀림)": 0,
 }
 
 # 이 이력에서 recovered 와 created-ok 는 **id 집합이 완전히 같습니다**(늘 같은 실행에서
@@ -582,6 +673,10 @@ def measure(rev, window, repo):
         "seen 최대": report["seen 최대"],
         "지문 최대": report["지문 최대"],
         "전송기록 최대": report["전송기록 최대"],
+        "cadence 측정없음": report["cadence 자"]["측정 없음"],
+        "cadence 전진": report["cadence 자"]["전진"],
+        "cadence 정지": report["cadence 자"]["정지"],
+        "cadence 정지(부풀림)": report["cadence 자"]["정지(부풀림)"],
     }
     for name in ("recovered", "created-ok", "feed-ok", "cadence-slow", "cadence-ok",
                  "search-down", "created-missing", "empty-feed", "keyword-down", "state-cap"):
